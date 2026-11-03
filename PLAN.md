@@ -13,7 +13,8 @@ Conventions:
 ## What you need
 
 - A USB stick of 2 GB or more.
-- A wired network connection for the target (Ethernet, DHCP). Wi-Fi is not planned.
+- A wired network connection for the target (Ethernet, DHCP) for the install and setup. If the corporate network does not allow a new device, do the install at home.
+- Later, a USB Wi-Fi dongle that supports access point mode (see section 8). It is not needed for the install.
 - A keyboard and a monitor for the install only. After that the target is headless.
 - The Logitech C170 and a tripod.
 - Rufus or balenaEtcher on the PC to write the USB stick.
@@ -88,6 +89,44 @@ Installer choices (text installer, "Install", not graphical):
 | Software selection | **Untick** "Debian desktop environment" and "GNOME". **Tick** "SSH server" and "standard system utilities". |
 | Bootloader (GRUB) | Install to the disk's boot device. |
 
+### If "Install the base system" fails
+
+Read the installer log. The installer has virtual consoles:
+
+| Keys | Shows |
+|---|---|
+| Alt+F1 (or Ctrl+Alt+F1) | The installer menus |
+| Alt+F2, then Enter | A shell (busybox) |
+| Alt+F3 | Main installer log |
+| Alt+F4 | Live system log (syslog) |
+
+Try Alt+Fn first; if nothing happens, use Ctrl+Alt+Fn. On some keyboards you also need to hold Fn.
+
+If you are stuck in the menus, another way is through the menu itself:
+1. On the error screen choose **Go Back**, and keep going back until the main installer menu list appears.
+2. Choose **Execute a shell** (or **Save debug logs** to copy the logs to a USB stick or the network).
+
+In the shell, run:
+
+```
+date                                                   # a wrong year breaks package signature checks
+grep -i -E "error|fail|W:|E:" /var/log/syslog | tail -30
+free -m
+cat /proc/partitions
+```
+
+To go back to the installer, type `exit`, or press Alt+F1.
+
+Likely causes:
+
+| Cause | Sign | Fix |
+|---|---|---|
+| Wrong date (dead BIOS battery) | `Release file ... is not valid yet`, old year in `date` | Set it in the BIOS, or `date -s "YYYY-MM-DD HH:MM"` in the shell |
+| Network or mirror blocked (corporate proxy) | `Failed to retrieve`, `Release`, `404` or timeouts | Install at home, or pick another mirror |
+| Bad USB write, stick or port | I/O errors, corrupt package | Re-write in DD mode, use another stick or port |
+| Disk too small or faulty | `No space left`, disk I/O errors | Check `/proc/partitions`, partition again |
+| Too little RAM | `Out of memory`, `killed` | Check `free -m` |
+
 When the installer finishes, remove the USB stick and reboot.
 Check the target boots into a login prompt and note its IP address (`ip -br a`).
 
@@ -128,6 +167,18 @@ Alternative: set a static address in `/etc/network/interfaces` (the Debian minim
 Optionally add a line to the PC's hosts file so `nicochess` resolves to the reserved address.
 
 ### 3.3 Packages
+
+The script `scripts/target-setup.sh` does this step and gathers the facts the plan needs (CPU flags, RAM, disk errors, camera formats and controls, Wi-Fi AP support) into `~/nicochess-findings-<date>.txt`.
+Copy it to the target on a USB key, with the network cable connected, then run:
+
+```
+bash target-setup.sh                   # packages + report
+bash target-setup.sh --wifi-firmware   # also non-free Wi-Fi dongle firmware
+bash target-setup.sh --report-only     # report only, install nothing
+```
+
+It installs `openssh-server`, `v4l-utils`, `usbutils`, `pciutils`, `rsync`, `curl`, `iw`, `hostapd` and `dnsmasq`, adds the user to the `video` group, and limits the journal to 50 MB. `hostapd` and `dnsmasq` are installed but left disabled.
+Manual equivalent:
 
 Keep the install minimal.
 
@@ -348,6 +399,62 @@ The target is ready for development when all of these are true:
 - [ ] The systemd service starts at boot and restarts after a crash.
 - [ ] The preview is reachable from the PC browser.
 
+## 8. Later: Wi-Fi access point for phone or tablet
+
+Goal: a USB Wi-Fi dongle makes the target expose its own Wi-Fi network. A phone or tablet joins it and opens the HTTP page served by NicoChess to start a game and see the board.
+This is done after the base install, and it is not needed for the first milestones.
+
+Everything in this section is from memory and must be verified.
+
+### 8.1 Choose the dongle
+
+- The driver must support **access point (AP) mode**. On the target with the dongle plugged in:
+  ```
+  iw list | grep -A 12 "Supported interface modes"     # "AP" must be listed
+  ```
+- Atheros AR9271 (driver `ath9k_htc`) is the chipset I recall as most reliable for AP mode on Linux. 2.4 GHz only, which is enough for a phone.
+- Careful with the TP-Link TL-WN722N: only version 1 uses that chip. Versions 2 and 3 use a Realtek chip.
+- Many dongles need non-free firmware from Debian (for example `firmware-atheros`). Add the `non-free-firmware` component to `/etc/apt/sources.list` and install it while the target still has Ethernet.
+- Check what is detected with `lsusb`, `dmesg | tail`, and `ip -br link`.
+
+### 8.2 Software
+
+```
+sudo apt install hostapd dnsmasq iw
+```
+
+Network layout (example, to adapt):
+
+| Item | Value |
+|---|---|
+| SSID | `NicoChess` |
+| Security | WPA2 with a passphrase (8 characters or more) |
+| Band and channel | 2.4 GHz, channel 6 |
+| Country code | Set it (for example `FR`) |
+| Target address on Wi-Fi | `192.168.4.1/24`, static |
+| DHCP range for phones | `192.168.4.10` to `192.168.4.50` (`dnsmasq`) |
+| Name | `nicochess.lan` points to `192.168.4.1` (`dnsmasq`) |
+
+Steps:
+1. Give the Wi-Fi interface a static address (in `/etc/network/interfaces` or a systemd-networkd file).
+2. Write `/etc/hostapd/hostapd.conf` with the SSID, channel, country, WPA2 passphrase, and `hw_mode=g`.
+3. Write a `dnsmasq` config limited to that interface (`interface=wlan0`, `dhcp-range=...`, `address=/nicochess.lan/192.168.4.1`).
+4. Unmask and enable the services: `sudo systemctl unmask hostapd`, then `sudo systemctl enable --now hostapd dnsmasq`.
+5. Make NicoChess listen on `0.0.0.0:80` (or 8080) and open `http://192.168.4.1` from a phone.
+
+Keep the Ethernet interface as it is. Do not enable IP forwarding between the Wi-Fi and Ethernet: the phone only needs to reach the target.
+
+### 8.3 Design implications
+
+- Send the board state to the phone as JSON or SVG. Do not stream camera video to the phone, as it would load the N270 too much.
+- A "start game", "set position" and "correct a square" interface on the phone replaces a local GUI.
+- The page must work on a phone browser without Internet access (no external fonts, scripts or CDNs).
+
+### 8.4 Security and policy
+
+- Use a WPA2 passphrase, not an open network.
+- Do not switch it on inside the corporate building without IT's agreement, as an unmanaged access point can be flagged as a rogue access point. Test and use it at home.
+
 ## Open questions
 
 - Actual RAM and storage of the unit (not yet known).
@@ -355,3 +462,5 @@ The target is ready for development when all of these are true:
 - Whether the C170 exposes manual exposure and white balance on Linux.
 - Which cross-compile route (`cargo-zigbuild`, WSL2, Docker) works with the chosen crates.
 - Exact Debian 12 support dates for i386.
+- Which Wi-Fi dongle supports AP mode with a Debian 12 driver, and whether it needs non-free firmware.
+- Whether the corporate network allows the target to connect, otherwise the install is done at home.

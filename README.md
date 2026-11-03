@@ -8,6 +8,8 @@ An old webcam on a tripod looks at the board at about 45° vertical tilt and abo
 Software on a PC captures frames and works out the position and the moves played.
 Implementation language: Rust if possible.
 
+The target machine runs headless. A USB Wi-Fi dongle will expose its own access point, so a phone or tablet can join it, open a simple HTTP page, start a game and see the board state.
+
 ## Documents
 
 - [Design](docs/design.md): feasibility, approach, pipeline, Rust stack, milestones.
