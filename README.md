@@ -11,6 +11,7 @@ Implementation language: Rust if possible.
 ## Documents
 
 - [Design](docs/design.md): feasibility, approach, pipeline, Rust stack, milestones.
+- [Plan](PLAN.md): what to install and configure on the target, and how.
 - [Target hardware](docs/target-hardware.md): INEOS 600 (Atom N270) constraints, Linux choice, checks to run.
 
 ## Status
