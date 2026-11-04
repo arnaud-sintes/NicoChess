@@ -34,10 +34,12 @@ done
 # ---- Root and user ----------------------------------------------------------
 
 if [ "$(id -u)" -ne 0 ]; then
-  if command -v sudo >/dev/null 2>&1; then
+  if command -v sudo >/dev/null 2>&1 && sudo -v; then
     exec sudo -E bash "$0" "$@"
   fi
-  echo "This script needs root. Run it with: su -c 'bash $0'   (or install sudo first)"
+  echo "This script needs root, and sudo is not available for this user."
+  echo "Become root with:  su -     then run:  bash $0 $*"
+  echo "To give your user sudo: as root, run  usermod -aG sudo <user>  and log in again."
   exit 1
 fi
 
