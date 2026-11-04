@@ -189,4 +189,4 @@ fi
 echo "Logs:      journalctl -u nicochess -f"
 echo "Settings:  $CONFIG"
 echo "Games:     $DATA_DIR/games"
-echo "The report of this machine is in the folder of the user that ran this script (nicochess-findings-*.txt)."
+echo "The report of this machine: nicochess-findings-*.txt, in /root or in the home of the first user (see \"Report saved in\" above)."

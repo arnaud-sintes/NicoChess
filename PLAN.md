@@ -528,6 +528,44 @@ What was tested, and what was not:
 - **Not tested:** starting the service under a real systemd, the access point on a real dongle, and everything with the real camera. Each of these is the first thing to check on the target.
 - The key replaces section 3.3 (packages) and section 6 (deploy and service) for a machine with no network. With a network, `scripts/deploy.ps1 -Target user@host` copies a new build and restarts the service.
 
+## 11. Testing the camera on this PC, before the target
+
+Docker Desktop does not hand USB devices to containers by itself, so a webcam plugged into the PC is not visible in the container.
+It can be done with `usbipd-win`, which hands a USB device to WSL (the machine Docker Desktop runs in).
+On this PC the WSL kernel (6.18) already contains the webcam driver (`uvcvideo`) and the USB/IP client as loadable modules, so only `usbipd-win` is missing.
+
+```
+winget install --exact dorssel.usbipd-win     (administrator PowerShell, once)
+usbipd list                                    find the webcam, note its BUSID (for example 2-4)
+usbipd bind --busid 2-4                        (administrator, once per device)
+usbipd attach --wsl --busid 2-4                hand it to WSL
+wsl                                            then, in the WSL window:   sudo modprobe uvcvideo ; ls /dev/video*
+```
+
+**Administrator rights are needed** for `winget install` and for `usbipd bind` (once per device). Check that the console really is elevated: `whoami` must print the administrator account, and the title bar says "Administrator".
+On a company-managed PC where your own account is not a local administrator, binding a USB device (it installs a driver) is for IT to approve. `usbipd attach` itself should then work without administrator rights (not verified).
+If that is not possible, skip this section: the same camera checks (`--probe`, calibration, a real game) are done on the target itself.
+
+Then, from the project folder:
+
+```
+.\scripts\test-camera-docker.ps1 -Probe        formats, sizes and controls of the camera
+.\scripts\test-camera-docker.ps1               the program with the camera, page on http://localhost:8080
+```
+
+What this tests: the real V4L2 code (format choice, YUYV, MJPEG or NV12 conversion, the exposure and focus controls), calibration on a real picture,
+and the move detection if you put a real board in front of the camera. It runs the same 32-bit program as the target.
+
+Limits and cautions:
+
+- **The built-in webcam of a laptop has a different lens, resolution and controls than the C170 or the Yealink.** It proves the code works, not that the target camera is good enough.
+  The same steps work for the C170 or the Yealink plugged into the PC.
+- **A 32-bit program on this PC's 64-bit kernel** goes through the kernel's compatibility layer for the camera calls. The Atom has a 32-bit kernel, which does not. If it works here it very likely works there, but the reverse is not guaranteed.
+- While the camera is attached to WSL, Windows programs (Teams, the Camera app) cannot use it. Give it back with `usbipd detach --busid 2-4`.
+- The laptop may expose more than one camera (an infrared one for Windows Hello). Pick the one that shows a normal picture.
+- Not covered: the systemd service and the access point (a container has no systemd), and the speed of the Atom.
+- Games recorded in the container are lost when it stops (no volume is mounted). That is fine for a test.
+
 ## Open questions
 
 - Actual RAM and storage of the unit (not yet known).

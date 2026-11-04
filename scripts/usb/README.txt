@@ -29,7 +29,8 @@ On the target
       journalctl -u nicochess -f                    the program's messages (lines starting "camera:")
 
 6. Take the key back with the results:
-      cp /root/nicochess-findings-*.txt /mnt/       the report of the machine
+      cp /root/nicochess-findings-*.txt /home/*/nicochess-findings-*.txt /mnt/ 2>/dev/null
+                                                    the report of the machine (in the home of the first user)
       cp /var/lib/nicochess/games/*.json /mnt/      the recorded games (if any)
       umount /mnt                                   always, before pulling the key out
 

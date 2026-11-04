@@ -160,11 +160,17 @@ if command -v v4l2-ctl >/dev/null 2>&1; then
   found=0
   for dev in /dev/video*; do
     [ -e "$dev" ] || continue
-    if v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null | grep -q 'Pixel Format'; then
+    # A capture node lists its formats as lines like:  [0]: 'MJPG' (Motion-JPEG, compressed)
+    # (other nodes, such as the metadata node of a camera, list none).
+    if v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null | grep -Eq '^[[:space:]]*\[[0-9]+\]:'; then
       found=1
       printf '\n-- %s --\n' "$dev"
       run v4l2-ctl -d "$dev" --list-formats-ext
       run v4l2-ctl -d "$dev" --list-ctrls
+      if [ -x /opt/nicochess/nicochess ]; then
+        echo "$ /opt/nicochess/nicochess --probe --device $dev"
+        /opt/nicochess/nicochess --probe --device "$dev" 2>&1
+      fi
     fi
   done
   [ "$found" -eq 1 ] || echo "No capture device found: is the webcam plugged in? (check lsusb above)"
