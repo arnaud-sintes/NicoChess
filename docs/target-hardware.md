@@ -93,6 +93,42 @@ After milestone 3 (occupancy overlay), judge whether detection holds up in the r
 Camera fallback: if detection is unreliable, switch to a 720p camera such as the Logitech C270 (fixed focus, UVC, 1280×720).
 No design change is needed, only a re-calibration of the 4 corners.
 
+## Webcam option: Yealink UVC30 Room
+
+A second camera is available: the Yealink UVC30 Room, a meeting-room camera.
+Sources: the [Yealink product page](https://www.yealink.com/en/product-detail/camera-uvc30-room) and retailer listings.
+Retailer listings disagree with each other on several points, so they are treated as unconfirmed.
+
+| Point | What is known |
+|---|---|
+| Resolutions | Confirmed by Yealink: 4K at 30 fps, 1080p at 30 fps, 720p at 30 fps. Listings add 1080p at 60 fps |
+| Field of view | Confirmed by Yealink: 120° (diagonal) |
+| Auto framing | Confirmed by Yealink: it follows faces, so it may crop or zoom the picture on its own. It must be off |
+| Digital zoom, e-PTZ | Listings only: 3x digital zoom |
+| USB | **Unconfirmed.** Listings say USB 3.0 (or 3.2) with a USB 3.0 cable, one says USB 2.0 and UVC 1.0 |
+| UVC (works without a driver on Linux) | **Unconfirmed** by Yealink's page; very likely, since it works as a plain USB camera with Teams and Zoom rooms |
+| Pixel formats (MJPEG, YUYV, NV12, H.264) | **Unknown** |
+| Focus (fixed or auto) | **Unknown** |
+
+Verdict: **probably compatible, and far better than the C170 for the resolution**, but it needs a test with the real device.
+
+What it changes:
+
+- **Resolution.** For a board 45 cm wide at about 50 cm from the camera, my estimate (a calculation that ignores lens distortion and the tilt) is a near-side square of about 48 px at 720p, 72 px at 1080p and 144 px at 4K. The C170 gives about 30 px. This makes detection much more comfortable.
+- **Wide angle.** At 120° the lens bends straight lines, especially near the edges. The calibration is a homography from 4 corners, which cannot model that bend, so the squares near the edges can be a few pixels off. The program reads the middle of each square, which tolerates some error. Keep the board near the centre of the picture and do not fill the frame with it.
+- **USB and decoding.** The INEOS 600 only has USB 2.0, which cannot carry 4K, and decoding MJPEG at 1080p is heavy for the Atom. On the Atom use 1280x720 (`--width 1280 --height 720`). On a laptop, 1080p is fine.
+- **Auto framing and autofocus.** Both change the picture by themselves and would break the calibration. The program turns autofocus off with the other locks. Auto framing may only be switchable with Yealink's own software: check that the picture stays still, and use `--zoom` if the camera exposes a zoom control.
+
+What the program now does for this camera:
+
+- Tries MJPEG first for sizes above 640x480 and YUYV first below, and also accepts NV12.
+- Logs every format and size the camera offers (`camera: offers ...` lines).
+- Turns autofocus off, and has `--focus`, `--zoom`, `--exposure` and `--white-balance` options.
+- `./nicochess --probe` (Linux) prints the camera's formats, frame sizes and controls with their ranges, then exits. This is the first thing to run with the Yealink.
+- MJPEG frames from some cameras lack the tables a JPEG decoder needs. If `bad MJPEG frame` appears, use a size where the camera offers YUYV or NV12.
+
+First test with the Yealink (Linux): `v4l2-ctl --list-devices`, `./nicochess --probe --device /dev/videoN` for the capture node, then `./nicochess --width 1280 --height 720` and look at the Calibrate tab.
+
 ## Build targets to set up
 
 - `i686-unknown-linux-gnu` for Debian.

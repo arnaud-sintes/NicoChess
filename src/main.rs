@@ -42,6 +42,10 @@ OPTIONS:
     --no-lock-controls       do not turn off auto exposure / white balance
     --exposure <N>           manual exposure time (units of 100 us)
     --white-balance <K>      manual white balance temperature (Kelvin)
+    --focus <N>              manual focus position (turns autofocus off)
+    --zoom <N>               zoom level of the camera (for cameras that crop or zoom on their own)
+    --probe                  print the formats and controls of the camera, then exit
+    --open                   open the page in this computer’s browser once the server is up
     --max-viewers <N>        open pages allowed at once          [default: 8]
     --idle-timeout <SECS>    controller released after this silence, outside a game  [default: 60]
     --game-timeout <MINS>    ... and during a game               [default: 30]
@@ -85,6 +89,10 @@ fn run() -> Result<()> {
     let lock_controls = !args.contains("--no-lock-controls");
     let exposure: Option<i64> = args.opt_value_from_str("--exposure")?;
     let white_balance: Option<i64> = args.opt_value_from_str("--white-balance")?;
+    let focus: Option<i64> = args.opt_value_from_str("--focus")?;
+    let zoom: Option<i64> = args.opt_value_from_str("--zoom")?;
+    let probe = args.contains("--probe");
+    let open = args.contains("--open");
     let max_viewers: usize = args.opt_value_from_str("--max-viewers")?.unwrap_or(8);
     let idle_secs: u64 = args.opt_value_from_str("--idle-timeout")?.unwrap_or(60);
     let game_mins: u64 = args.opt_value_from_str("--game-timeout")?.unwrap_or(30);
@@ -101,6 +109,10 @@ fn run() -> Result<()> {
     let rest = args.finish();
     if !rest.is_empty() {
         bail!("unknown arguments: {rest:?} (see --help)");
+    }
+    if probe {
+        print!("{}", camera::probe(&device)?);
+        return Ok(());
     }
     if !(fps > 0.0 && fps <= 30.0) {
         bail!("--fps must be between 0 and 30");
@@ -119,6 +131,8 @@ fn run() -> Result<()> {
             lock_controls,
             exposure,
             white_balance,
+            focus,
+            zoom,
         }),
         "demo" => SourceSpec::Demo { move_interval: Duration::from_secs_f32(demo_secs) },
         "synthetic" => SourceSpec::Synthetic,
@@ -142,5 +156,25 @@ fn run() -> Result<()> {
     engine.spawn_capture(camera::factory(spec, interval))?;
 
     // Event streams each hold a connection, so leave room for ordinary requests too.
-    http::serve(&listen, max_viewers + 16, server::handler(engine, max_viewers))
+    let on_ready: Option<Box<dyn FnOnce()>> = if open {
+        let url = format!("http://{}", listen.replace("0.0.0.0", "localhost"));
+        Some(Box::new(move || open_browser(&url)))
+    } else {
+        None
+    };
+    http::serve(&listen, max_viewers + 16, server::handler(engine, max_viewers), on_ready)
+}
+
+/// Opens an address in the default browser of this computer.
+fn open_browser(url: &str) {
+    use std::process::Command;
+    #[cfg(windows)]
+    let started = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    #[cfg(target_os = "macos")]
+    let started = Command::new("open").arg(url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let started = Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = started {
+        eprintln!("cannot open the browser ({e}); open {url} by hand");
+    }
 }

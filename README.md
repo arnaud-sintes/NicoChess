@@ -50,9 +50,20 @@ Open http://localhost:8080. The demo source plays a whole game (Morphy's "Opera 
 
 Open the same address from a second browser or a phone on the same network: it is a viewer and cannot start anything.
 Other sources: `--source synthetic` (the starting position only) or `--source some-image.jpg`.
+`--open` opens the page in this computer’s browser once the server is up (handy when the target is a laptop).
 
 `cargo test` runs the 46 tests, including a full game recorded from the demo camera to a PGN.
 `cargo run -- --help` lists all the options.
+
+## Cameras
+
+- Logitech C170 (VGA): the fallback, marginal at 640x480.
+- Yealink UVC30 Room (4K, 120°): the better candidate, not tried yet. The program accepts MJPEG, YUYV and NV12, turns autofocus off, and
+  `./nicochess --probe` (Linux) lists what a camera offers. Details and open points in [docs/target-hardware.md](docs/target-hardware.md).
+
+## Under study
+
+A laptop as the target (own screen, 64-bit, faster) and engine analysis with Stockfish: see "Under study" in [docs/requirements.md](docs/requirements.md).
 
 ## Build for the target (Debian 12, 32-bit)
 

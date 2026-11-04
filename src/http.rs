@@ -102,10 +102,18 @@ impl Reply {
 pub type Handler = Arc<dyn Fn(Request) -> Reply + Send + Sync>;
 
 /// Serves forever. At most `max_connections` connections are handled at once;
-/// the others get a 503.
-pub fn serve(addr: &str, max_connections: usize, handler: Handler) -> Result<()> {
+/// the others get a 503. `on_ready` runs once the port is open.
+pub fn serve(
+    addr: &str,
+    max_connections: usize,
+    handler: Handler,
+    on_ready: Option<Box<dyn FnOnce()>>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("cannot listen on {addr}"))?;
     eprintln!("http: listening on http://{addr}");
+    if let Some(on_ready) = on_ready {
+        on_ready();
+    }
     let active = Arc::new(AtomicUsize::new(0));
 
     for stream in listener.incoming() {
@@ -284,7 +292,7 @@ mod tests {
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
         let a = addr.clone();
-        thread::spawn(move || serve(&a, 8, handler).unwrap());
+        thread::spawn(move || serve(&a, 8, handler, None).unwrap());
         for _ in 0..50 {
             if TcpStream::connect(&addr).is_ok() {
                 break;
@@ -381,7 +389,7 @@ mod tests {
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
         let a = addr.clone();
-        thread::spawn(move || serve(&a, 1, handler).unwrap());
+        thread::spawn(move || serve(&a, 1, handler, None).unwrap());
         thread::sleep(Duration::from_millis(150));
 
         let mut first = TcpStream::connect(&addr).unwrap();

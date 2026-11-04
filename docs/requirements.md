@@ -70,10 +70,49 @@ records the game, and shows it live and in replay on a phone or tablet.
 
 ## Out of scope for now
 
-- Engine analysis, a chess clock, saving camera snapshots per move, streaming video.
+- A chess clock, saving camera snapshots per move, streaming video. (Engine analysis is under study, see below.)
 - Recognising piece types by vision. Types come from the game state.
 - Seeing captured pieces beside the board: possible later, so the warp keeps a margin around the board.
 - A tournament feature that counts points automatically (the data to support it is stored).
+
+## Under study (added 2026-11-04)
+
+### Targets: the INEOS 600 or a laptop
+
+The target may become a regular laptop, which has its own screen. What changes:
+
+| | INEOS 600, headless (now) | Laptop |
+|---|---|---|
+| Screen | A phone or tablet through the Wi-Fi access point | The laptop screen, with the page opened locally. Phones can still join as viewers |
+| Wi-Fi dongle and access point | Needed | Not needed (the laptop has Wi-Fi, and can share it as a hotspot) |
+| Build | 32-bit, in a Debian 12 i386 container | Native 64-bit |
+| Camera, resolution and speed | VGA or 720p, 3 fps, USB 2.0 | 1080p and more, 5 to 10 fps |
+| Engine analysis | Slow, after the game only | Comfortable, even live |
+| Operating system | Debian 12 i386 | Linux or Windows |
+
+- **Linux laptop:** nothing changes in the program. Build natively (needs `clang`, `libclang-dev` and `linux-libc-dev` for the camera bindings).
+  Run `nicochess --listen 127.0.0.1:8080 --open`: the laptop's own browser opens the page and, being the first to connect, is the controller.
+- **Windows laptop:** not planned. The server, the page, the tracker and the game store already build and run on Windows (the tests run there), but camera capture only uses V4L2, so a Windows backend (Media Foundation) would have to be written first.
+- `--open` opens the default browser of the computer once the server is up; use F11 there for full screen.
+- Decided (2026-11-04): if the target becomes a laptop, it runs Linux, the same distribution as the INEOS 600 (Debian). No Windows camera backend is needed. A 64-bit Debian can be a newer release than 12, since the 32-bit limit only applies to the Atom.
+
+### Engine analysis with Stockfish
+
+A user asked whether Stockfish could run on the target for game analysis. It is feasible, with limits:
+
+- **Builds.** Stockfish's official build instructions list 32-bit x86 targets (`x86-32`, `x86-32-sse2`, `x86-32-sse41-popcnt`), see the [Stockfish wiki](https://github.com/official-stockfish/Stockfish/wiki/Compiling-from-source).
+  The Atom N270 has SSE2, SSE3 and SSSE3 but, to my knowledge, no SSE4.1 or popcnt: the setup script now reports those flags so the right build can be chosen.
+  It also needs its NNUE network file (tens of megabytes, to check) next to the program or built in.
+- **Speed on the Atom.** Not measured, but expect it to be slow: a single in-order 1.6 GHz core. It would suit analysis of a finished game with a limited depth or a time per move, not real-time analysis, and never while a game is recorded.
+- **Speed on a laptop.** No problem, and live analysis during a game becomes possible.
+- **How it would plug in.** NicoChess starts Stockfish as a separate program and talks to it with the UCI protocol (`--engine PATH`). An **Analyse** button on a finished game would evaluate each position in the background and store the result next to the game file.
+  The replay page would show an evaluation graph, the best move, and the moves that lost a lot (inaccuracy, mistake, blunder), and the PGN export would add `[%eval ...]` comments, which Lichess understands.
+- **Licence.** Stockfish is GPL v3. Running it as a separate program is fine. If its binary were ever distributed with NicoChess, its source must be offered too.
+- Decided (2026-11-04): not now. Kept here as a design for later.
+
+### Cameras
+
+- The C170 stays the fallback. The Yealink UVC30 Room is the better candidate: see [target-hardware.md](target-hardware.md). The program already supports it as far as can be done without the device (NV12, autofocus off, zoom and focus options, `--probe`).
 
 ## Open questions
 

@@ -135,10 +135,10 @@ run timedatectl
 
 section "CPU"
 run lscpu
-for flag in pae sse2 sse3 lm; do
+for flag in pae sse2 sse3 ssse3 sse4_1 popcnt lm; do
   if grep -qw "$flag" /proc/cpuinfo; then echo "flag $flag: present"; else echo "flag $flag: absent"; fi
 done
-echo "(expected on an Atom N270: pae present, sse2 present, lm absent = 32-bit only)"
+echo "(expected on an Atom N270: pae, sse2, sse3 and ssse3 present; sse4_1, popcnt and lm absent = 32-bit only)"
 
 section "Memory and storage"
 run free -m

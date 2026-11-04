@@ -113,6 +113,33 @@ pub fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
     RgbImage::from_raw(width, height, out).context("bad RGB buffer size")
 }
 
+/// Converts NV12 (a full-size Y plane, then interleaved half-size U and V) to RGB,
+/// BT.601 full range. Many room and laptop cameras offer it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
+    let (w, h) = (width as usize, height as usize);
+    let needed = w * h + (w * h) / 2;
+    if w % 2 != 0 || h % 2 != 0 || data.len() < needed {
+        bail!("NV12 frame has the wrong size: {} bytes for {width}x{height}", data.len());
+    }
+    let (luma, chroma) = data[..needed].split_at(w * h);
+    let clamp = |v: i32| v.clamp(0, 255) as u8;
+    let mut out = vec![0u8; w * h * 3];
+    for row in 0..h {
+        let uv_row = &chroma[(row / 2) * w..(row / 2) * w + w];
+        for col in 0..w {
+            let y = luma[row * w + col] as i32;
+            let u = uv_row[col & !1] as i32 - 128;
+            let v = uv_row[col | 1] as i32 - 128;
+            let o = (row * w + col) * 3;
+            out[o] = clamp(y + ((359 * v) >> 8));
+            out[o + 1] = clamp(y - (((88 * u) >> 8) + ((183 * v) >> 8)));
+            out[o + 2] = clamp(y + ((454 * u) >> 8));
+        }
+    }
+    RgbImage::from_raw(width, height, out).context("bad RGB buffer size")
+}
+
 /// Settings for the real camera.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -127,10 +154,20 @@ pub struct CameraSettings {
     pub exposure: Option<i64>,
     /// Manual white balance temperature in Kelvin, if wanted.
     pub white_balance: Option<i64>,
+    /// Manual focus position, if wanted (turns autofocus off).
+    pub focus: Option<i64>,
+    /// Zoom level of the camera, if wanted (a wide camera may crop or zoom by itself).
+    pub zoom: Option<i64>,
 }
 
 #[cfg(target_os = "linux")]
-pub use v4l_camera::V4lCamera;
+pub use v4l_camera::{V4lCamera, probe};
+
+/// Prints what a camera offers. Only available on Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn probe(_path: &str) -> Result<String> {
+    bail!("--probe is only available on Linux")
+}
 
 #[cfg(target_os = "linux")]
 mod v4l_camera {
@@ -148,6 +185,9 @@ mod v4l_camera {
     const CID_EXPOSURE_AUTO: u32 = 0x009a_0901;
     const CID_EXPOSURE_ABSOLUTE: u32 = 0x009a_0902;
     const CID_EXPOSURE_AUTO_PRIORITY: u32 = 0x009a_0903;
+    const CID_FOCUS_ABSOLUTE: u32 = 0x009a_090a;
+    const CID_FOCUS_AUTO: u32 = 0x009a_090c;
+    const CID_ZOOM_ABSOLUTE: u32 = 0x009a_090d;
     /// Value of `CID_EXPOSURE_AUTO` for manual mode.
     const EXPOSURE_MANUAL: i64 = 1;
 
@@ -155,6 +195,67 @@ mod v4l_camera {
     enum PixelFormat {
         Yuyv,
         Mjpeg,
+        Nv12,
+    }
+
+    /// The formats to try, best first. Large frames go over USB as MJPEG, which is
+    /// compact; small frames are better as YUYV, which needs no decoding.
+    fn preference(width: u32, height: u32) -> [(&'static [u8; 4], PixelFormat); 3] {
+        if u64::from(width) * u64::from(height) > 640 * 480 {
+            [(b"MJPG", PixelFormat::Mjpeg), (b"YUYV", PixelFormat::Yuyv), (b"NV12", PixelFormat::Nv12)]
+        } else {
+            [(b"YUYV", PixelFormat::Yuyv), (b"MJPG", PixelFormat::Mjpeg), (b"NV12", PixelFormat::Nv12)]
+        }
+    }
+
+    /// One line per pixel format: the frame sizes the camera offers.
+    fn describe_formats(device: &Device) -> Vec<String> {
+        let mut lines = Vec::new();
+        let Ok(formats) = device.enum_formats() else { return lines };
+        for format in formats {
+            let mut sizes: Vec<String> = Vec::new();
+            for size in device.enum_framesizes(format.fourcc).unwrap_or_default() {
+                match size.size {
+                    v4l::framesize::FrameSizeEnum::Discrete(d) => sizes.push(format!("{}x{}", d.width, d.height)),
+                    v4l::framesize::FrameSizeEnum::Stepwise(s) => {
+                        sizes.push(format!("{}x{} to {}x{}", s.min_width, s.min_height, s.max_width, s.max_height))
+                    }
+                }
+            }
+            sizes.dedup();
+            lines.push(format!("{} ({}): {}", format.fourcc, format.description, sizes.join(", ")));
+        }
+        lines
+    }
+
+    /// Everything useful to know about a camera, as text: used by `--probe`.
+    pub fn probe(path: &str) -> Result<String> {
+        let device = Device::with_path(path).with_context(|| format!("cannot open {path}"))?;
+        let mut out = String::new();
+        if let Ok(caps) = device.query_caps() {
+            out.push_str(&format!("{path}: {} (driver {}, {})\n", caps.card, caps.driver, caps.bus));
+        }
+        out.push_str("\nFormats and frame sizes:\n");
+        let formats = describe_formats(&device);
+        if formats.is_empty() {
+            out.push_str("  none: this is probably not the video capture node, try the next /dev/video*\n");
+        }
+        for line in formats {
+            out.push_str(&format!("  {line}\n"));
+        }
+        out.push_str("\nControls (name, id, range):\n");
+        match device.query_controls() {
+            Ok(controls) => {
+                for c in controls {
+                    out.push_str(&format!(
+                        "  {} (0x{:08x}): {:?}, {} to {}, step {}, default {}\n",
+                        c.name, c.id, c.typ, c.minimum, c.maximum, c.step, c.default
+                    ));
+                }
+            }
+            Err(e) => out.push_str(&format!("  cannot list the controls: {e}\n")),
+        }
+        Ok(out)
     }
 
     pub struct V4lCamera {
@@ -174,9 +275,11 @@ mod v4l_camera {
             let device = Device::with_path(&settings.device)
                 .with_context(|| format!("cannot open {}", settings.device))?;
 
-            // Prefer YUYV, which needs no decoding; fall back to MJPEG.
+            for line in describe_formats(&device) {
+                eprintln!("camera: offers {line}");
+            }
             let mut chosen = None;
-            for (code, pixel_format) in [(b"YUYV", PixelFormat::Yuyv), (b"MJPG", PixelFormat::Mjpeg)] {
+            for (code, pixel_format) in preference(settings.width, settings.height) {
                 let wanted = v4l::Format::new(settings.width, settings.height, FourCC::new(code));
                 match device.set_format(&wanted) {
                     Ok(got) if got.fourcc == FourCC::new(code) => {
@@ -188,7 +291,7 @@ mod v4l_camera {
                 }
             }
             let (format, pixel_format) =
-                chosen.context("the camera offers neither YUYV nor MJPEG at this size")?;
+                chosen.context("the camera offers none of YUYV, MJPEG or NV12 at this size (see the \"offers\" lines, or run --probe)")?;
             eprintln!(
                 "camera: {} {}x{} {:?}",
                 settings.device, format.width, format.height, pixel_format
@@ -219,6 +322,15 @@ mod v4l_camera {
             wanted.push(("auto white balance off", CID_AUTO_WHITE_BALANCE, Value::Boolean(false)));
             wanted.push(("manual exposure", CID_EXPOSURE_AUTO, Value::Integer(EXPOSURE_MANUAL)));
             wanted.push(("exposure auto priority off", CID_EXPOSURE_AUTO_PRIORITY, Value::Boolean(false)));
+            // Autofocus hunting would change the picture while a game is played.
+            wanted.push(("autofocus off", CID_FOCUS_AUTO, Value::Boolean(false)));
+        }
+        if let Some(zoom) = settings.zoom {
+            wanted.push(("zoom", CID_ZOOM_ABSOLUTE, Value::Integer(zoom)));
+        }
+        if let Some(focus) = settings.focus {
+            wanted.push(("autofocus off", CID_FOCUS_AUTO, Value::Boolean(false)));
+            wanted.push(("focus position", CID_FOCUS_ABSOLUTE, Value::Integer(focus)));
         }
         if let Some(kelvin) = settings.white_balance {
             wanted.push(("white balance temperature", CID_WHITE_BALANCE_TEMPERATURE, Value::Integer(kelvin)));
@@ -252,6 +364,7 @@ mod v4l_camera {
                 let data = &buffer[..used];
                 let image = match self.pixel_format {
                     PixelFormat::Yuyv => yuyv_to_rgb(data, self.width, self.height)?,
+                    PixelFormat::Nv12 => nv12_to_rgb(data, self.width, self.height)?,
                     PixelFormat::Mjpeg => {
                         image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
                             .context("bad MJPEG frame")?
@@ -387,6 +500,30 @@ mod tests {
         let img = yuyv_to_rgb(&[255, 128, 0, 128], 2, 1).unwrap();
         assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255]);
         assert_eq!(img.get_pixel(1, 0).0, [0, 0, 0]);
+    }
+
+    #[test]
+    fn nv12_gray_and_extremes() {
+        // 2x2 frame: four luma values, then one U and one V sample for the whole block.
+        let img = nv12_to_rgb(&[255, 0, 128, 128, 128, 128], 2, 2).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 0]);
+        assert!(img.get_pixel(0, 1).0.iter().all(|&c| (c as i32 - 128).abs() <= 1));
+    }
+
+    #[test]
+    fn nv12_colour_is_shared_by_a_block() {
+        // Strong red chroma (V high, U low) with mid luma: red up and blue down, in all four pixels.
+        let img = nv12_to_rgb(&[128, 128, 128, 128, 90, 220], 2, 2).unwrap();
+        for px in img.pixels() {
+            assert!(px[0] > 200 && px[2] < 100, "{px:?}");
+        }
+    }
+
+    #[test]
+    fn nv12_rejects_bad_sizes() {
+        assert!(nv12_to_rgb(&[0u8; 5], 2, 2).is_err());
+        assert!(nv12_to_rgb(&[0u8; 20], 3, 2).is_err(), "odd width");
     }
 
     #[test]

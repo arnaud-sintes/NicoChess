@@ -347,7 +347,7 @@ The 32-bit binary has already been run in a Debian 12 i386 container on the PC, 
 First tests on the target, in this order:
 
 1. **No camera.** `./nicochess --source demo`, then open `http://<target-ip>:8080` from the PC and from a phone. Calibrate with the corners shown in the README, start a game, and watch the demo play 33 moves. This tests the server, the page and the Atom's speed (watch `top` while it plays).
-2. **The camera alone.** `./nicochess` (source `camera`, device `/dev/video0`). Read the `camera:` lines in the output: the format chosen, and which controls were applied (white balance off, manual exposure). Then use the Calibrate tab and look at the picture.
+2. **The camera alone.** First `./nicochess --probe` (add `--device /dev/videoN` if needed): it lists the formats, frame sizes and controls the camera offers. Then `./nicochess` (source `camera`, device `/dev/video0`) and read the `camera:` lines in the output: the format chosen, and which controls were applied (white balance off, manual exposure, autofocus off). Then use the Calibrate tab and look at the picture. With the Yealink UVC30 Room, see the Webcam section of `docs/target-hardware.md`.
 3. **A real game.** Set up the pieces, calibrate, press Start, and play a few moves. If moves are missed or wrong, see the tuning flags in `./nicochess --help` and the notes in `docs/requirements.md`.
 
 ## 6. Deploy and run
@@ -478,6 +478,27 @@ Keep the Ethernet interface as it is. Do not enable IP forwarding between the Wi
 
 - Use a WPA2 passphrase, not an open network.
 - Do not switch it on inside the corporate building without IT's agreement, as an unmanaged access point can be flagged as a rogue access point. Test and use it at home.
+
+## 9. Alternative target: a laptop
+
+If the target becomes a regular laptop, most of this plan is not needed: sections 1 to 4 (installing Debian i386 on the Atom), the i386 container build, and section 8 (Wi-Fi access point) become optional.
+The reasoning is in `docs/requirements.md`, "Targets".
+
+**Linux laptop**
+1. Install the build tools: `sudo apt install build-essential clang libclang-dev linux-libc-dev pkg-config curl`, and Rust with `rustup`.
+2. Build on the laptop: `cargo build --release` (native 64-bit, no container).
+3. Check the camera: `./target/release/nicochess --probe --device /dev/videoN`.
+4. Run it with the page on the laptop's own screen: `./target/release/nicochess --listen 127.0.0.1:8080 --open --width 1920 --height 1080 --fps 5`.
+   The laptop's browser is the first to connect, so it is the controller. Use `--listen 0.0.0.0:8080` instead to let phones on the same network follow as viewers.
+5. Optional: start it at login with a systemd user service or a desktop autostart entry, and put the browser in full screen (F11) or kiosk mode.
+
+**Windows laptop**
+- Not planned: the laptop would run Linux, like the INEOS 600. Camera capture is implemented with V4L2 only, so Windows would need a new camera backend first.
+  Everything else runs on Windows already, which is how the program is developed: `cargo run --release -- --source demo --open` plays the demo game in the local browser.
+
+**Both**
+- Raise the resolution and the frame rate: the Atom limits (640x480, 3 fps, no heavy decoding) no longer apply.
+- Engine analysis becomes comfortable on a laptop (see "Engine analysis with Stockfish" in `docs/requirements.md`).
 
 ## Open questions
 
