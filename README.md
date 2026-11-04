@@ -55,6 +55,16 @@ Other sources: `--source synthetic` (the starting position only) or `--source so
 `cargo test` runs the 46 tests, including a full game recorded from the demo camera to a PGN.
 `cargo run -- --help` lists all the options.
 
+## Go to the target with a USB key
+
+```
+.\scripts\make-usb-bundle.ps1
+```
+
+builds `usb\`: the program, an installer, the Debian packages for an offline install, a Wi-Fi access point script and a README.
+Copy its content to a FAT32 key and follow `README.txt` on the target. Details in [PLAN.md](PLAN.md) section 10.
+`scripts\deploy.ps1 -Target user@host` updates the program over SSH when a network is available.
+
 ## Cameras
 
 - Logitech C170 (VGA): the fallback, marginal at 640x480.

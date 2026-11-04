@@ -136,7 +136,8 @@ run timedatectl
 section "CPU"
 run lscpu
 for flag in pae sse2 sse3 ssse3 sse4_1 popcnt lm; do
-  if grep -qw "$flag" /proc/cpuinfo; then echo "flag $flag: present"; else echo "flag $flag: absent"; fi
+  name="$flag"; [ "$flag" = sse3 ] && name=pni   # Linux calls SSE3 "pni"
+  if grep -qw "$name" /proc/cpuinfo; then echo "flag $flag: present"; else echo "flag $flag: absent"; fi
 done
 echo "(expected on an Atom N270: pae, sse2, sse3 and ssse3 present; sse4_1, popcnt and lm absent = 32-bit only)"
 
@@ -148,7 +149,7 @@ echo "Storage errors in the kernel log (should be empty):"
 dmesg 2>/dev/null | grep -i -E "I/O error|medium error|EXT4-fs error|ata[0-9.]+: .*(error|exception)" | tail -20
 
 section "Network"
-run ip -br a
+if command -v ip >/dev/null 2>&1; then run ip -br a; else echo "(the ip command is not installed)"; fi
 
 section "USB devices"
 run lsusb

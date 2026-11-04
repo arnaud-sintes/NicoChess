@@ -500,6 +500,34 @@ The reasoning is in `docs/requirements.md`, "Targets".
 - Raise the resolution and the frame rate: the Atom limits (640x480, 3 fps, no heavy decoding) no longer apply.
 - Engine analysis becomes comfortable on a laptop (see "Engine analysis with Stockfish" in `docs/requirements.md`).
 
+## 10. The USB key: everything in one folder
+
+`scripts/make-usb-bundle.ps1` prepares the folder `usb\` (git-ignored, about 71 MB), to copy onto a FAT32 USB key:
+
+| In the folder | What it is |
+|---|---|
+| `nicochess` | The 32-bit program, built in the container |
+| `install.sh` | Installs the packages from the key (no network), the program in `/opt/nicochess`, the user `nicochess`, and the service; writes a report of the machine |
+| `debs/` | 141 Debian 12 i386 packages with their dependencies, as a small offline apt repository (includes the Wi-Fi firmware) |
+| `setup-ap.sh` | Wi-Fi access point with `hostapd` and `dnsmasq`, on its own systemd service |
+| `target-setup.sh` | Report on the machine (CPU flags, memory, disk, camera formats, Wi-Fi) |
+| `README.txt` | The steps, on the key itself |
+| `docs/`, `SHA256SUMS` | Reference documents, and checksums that `install.sh` verifies |
+
+```
+.\scripts\make-usb-bundle.ps1          # build everything (Docker Desktop must be running)
+```
+
+Then copy the **content** of `usb\` to the root of the key. On the target: `su -`, mount the key, `bash /mnt/install.sh --demo`.
+Use `--demo` first to try the page without the camera, then edit `/etc/default/nicochess` to use the camera.
+
+What was tested, and what was not:
+
+- **Tested:** the installation from the key in a fresh Debian 12 i386 container **with the network disabled**. The packages (and the Wi-Fi firmware) install, the user is created, the program is installed and runs.
+  The access point script was run with `--dry-run` and its files read.
+- **Not tested:** starting the service under a real systemd, the access point on a real dongle, and everything with the real camera. Each of these is the first thing to check on the target.
+- The key replaces section 3.3 (packages) and section 6 (deploy and service) for a machine with no network. With a network, `scripts/deploy.ps1 -Target user@host` copies a new build and restarts the service.
+
 ## Open questions
 
 - Actual RAM and storage of the unit (not yet known).

@@ -1,0 +1,11 @@
+openssh-server
+v4l-utils
+usbutils
+pciutils
+rsync
+curl
+ca-certificates
+iw
+rfkill
+hostapd
+dnsmasq
