@@ -1,2 +1,5 @@
 downloads/
 target/
+dist/
+/data/
+/calibration.json

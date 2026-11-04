@@ -53,10 +53,10 @@ Auto-detecting corners with pieces on the board is fragile, so manual 4-click ca
 
 | Need | Crate |
 |---|---|
-| Camera capture | `nokhwa` (V4L2 on Linux, Media Foundation on Windows) |
+| Camera capture | `v4l` (V4L2 on Linux), used directly. `nokhwa` was considered but also wraps `v4l`, so it brings no benefit on the target |
 | Image processing and homography | `imageproc` + `image` (pure Rust), or `opencv` (needs an OpenCV install) |
-| Chess rules, legal moves, FEN/PGN | `shakmaty` |
-| UI and preview | `eframe`/`egui` on a desktop, or a small web server (`axum`) on the target machine |
+| Chess rules, legal moves, FEN/PGN | `shakmaty` (not added yet) |
+| UI and preview | A small synchronous web server (`tiny_http`) on the target machine; `axum` was considered but is heavier for a single-core Atom |
 | Optional ML later | `ort` (ONNX Runtime) or `tract` |
 
 `imageproc` provides `Projection::from_control_points` and `warp`, so the pure-Rust route covers the homography.
@@ -71,7 +71,7 @@ Start pure Rust and add `opencv` only if automatic corner detection is wanted.
 
 ## Milestones
 
-1. Live camera preview with `nokhwa`.
+1. Live camera preview (`v4l`).
 2. Click 4 corners, warp, and display the top-down grid.
 3. Occupancy and color detection with an overlay.
 4. Stability gate and legal-move matching with `shakmaty`.

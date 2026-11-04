@@ -261,8 +261,8 @@ v4l2-ctl -d /dev/video0 --set-ctrl=white_balance_temperature=4600
 ```
 
 These settings are often reset when the camera is unplugged or the device closed.
-The NicoChess program should therefore apply them itself every time it opens the camera (`nokhwa` exposes camera controls) **(verify)**.
-This is a design requirement to add to `docs/design.md` once confirmed.
+NicoChess therefore applies them itself every time it opens the camera: auto white balance off, manual exposure, auto exposure priority off (`--no-lock-controls` disables this; `--exposure` and `--white-balance` set values).
+This is implemented but **not yet tested on the C170**: check the `camera:` lines in the program's log to see which controls the camera accepted.
 
 ### 4.3 Test capture
 
@@ -288,7 +288,20 @@ Once the position is chosen, do not move it. Any move means re-calibrating the 4
 
 ## 5. Build toolchain on the PC
 
-Cross-compile from the PC. Do not build on the target.
+Build on the PC. Do not build on the target.
+
+**What the project uses:** a Debian 12 i386 container, driven by `scripts/build-target.ps1` (Docker Desktop must be running).
+The `v4l` camera crate generates its V4L2 bindings at build time (`bindgen`), which needs `libclang` and the Linux kernel headers.
+A Windows host does not have them, so the musl and Zig route below fails for this project: `cargo zigbuild` stops with `'linux/videodev2.h' file not found`.
+The container also has the same glibc as the target, so the binary runs there.
+
+```
+.\scripts\build-target.ps1          # writes dist\nicochess
+```
+
+The first run builds the image (about 1 GB, a few minutes) **(not run yet)**.
+
+The musl and Zig route below is kept for code that does not use `v4l`. It did build a hello program for the target.
 
 ### 5.0 Use the portable tools
 
@@ -324,25 +337,31 @@ Rust needs a Linux-capable linker. Options, in order of preference **(verify eac
 2. **WSL2 with Debian**: install the Rust toolchain inside WSL and build there. Simplest if `cargo-zigbuild` fails on this project's dependencies.
 3. **Docker with an `i386/debian:12` image**: builds in the same environment as the target, which gives the best binary compatibility. Slower to set up.
 
-If the camera crate (`nokhwa`, via the `v4l` crate) pulls in C libraries that do not cross-compile with musl, fall back to option 3 and the `i686-unknown-linux-gnu` target **(verify)**.
+The camera crate (`v4l`) did turn out not to cross-compile this way, so option 3 (the container) is the route in use.
 
 ### 5.3 First proof
 
-Before any chess code, cross-compile a trivial "hello" program and a minimal `nokhwa` capture program, copy them to the target and run them.
-This confirms the toolchain, the camera crate and the 32-bit target all work together, which is the main technical risk.
+Build `nicochess` with `scripts/build-target.ps1` and copy `dist/nicochess` to the target (section 6.1).
+The 32-bit binary has already been run in a Debian 12 i386 container on the PC, with the demo source, so the build, the 32-bit runtime and the server are known to work. The real camera and the INEOS 600 have not been tried.
+
+First tests on the target, in this order:
+
+1. **No camera.** `./nicochess --source demo`, then open `http://<target-ip>:8080` from the PC and from a phone. Calibrate with the corners shown in the README, start a game, and watch the demo play 33 moves. This tests the server, the page and the Atom's speed (watch `top` while it plays).
+2. **The camera alone.** `./nicochess` (source `camera`, device `/dev/video0`). Read the `camera:` lines in the output: the format chosen, and which controls were applied (white balance off, manual exposure). Then use the Calibrate tab and look at the picture.
+3. **A real game.** Set up the pieces, calibrate, press Start, and play a few moves. If moves are missed or wrong, see the tuning flags in `./nicochess --help` and the notes in `docs/requirements.md`.
 
 ## 6. Deploy and run
 
 ### 6.1 Copy the binary
 
 ```
-scp target/i686-unknown-linux-musl/release/nicochess nico@<target-ip>:~/nicochess
+scp dist/nicochess nico@<target-ip>:~/nicochess
 ```
 
 Or with `rsync`, which is faster for repeated deploys:
 
 ```
-rsync -avz --progress target/i686-unknown-linux-musl/release/nicochess nico@<target-ip>:~/
+rsync -avz --progress dist/nicochess nico@<target-ip>:~/
 ```
 
 ### 6.2 Run as a service
@@ -352,15 +371,13 @@ Create `/etc/systemd/system/nicochess.service` on the target:
 ```
 [Unit]
 Description=NicoChess board tracker
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 User=nico
 Group=nico
 SupplementaryGroups=video
 WorkingDirectory=/home/nico
-ExecStart=/home/nico/nicochess --listen 0.0.0.0:8080
+ExecStart=/home/nico/nicochess --listen 0.0.0.0:8080 --calibration /home/nico/calibration.json
 Restart=on-failure
 RestartSec=5
 
@@ -368,7 +385,8 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-The `--listen` flag is a placeholder until the program exists.
+There is no `After=network-online.target`, so the service also starts on a machine with no network (Wi-Fi access point only).
+Run `./nicochess --help` for all options. To test the camera by hand first: `./nicochess --device /dev/video0` and open the page.
 
 Enable and start it:
 
@@ -379,10 +397,13 @@ systemctl status nicochess
 journalctl -u nicochess -f
 ```
 
-### 6.3 View the preview
+### 6.3 Use the page
 
 From any machine on the network, open `http://<target-ip>:8080` in a browser.
-There is no authentication in the plan. Keep the target on a trusted home network and do not expose the port to the Internet.
+The first page to connect is the controller and can start games and calibrate; the others only watch and replay (see `docs/requirements.md`).
+There is no login. Keep the target on a trusted network (later, the Wi-Fi access point with a WPA2 passphrase) and do not expose the port to the Internet.
+
+Games are stored as JSON files in `--data-dir` (default `data`, so `/home/nico/data` with the service above) and the calibration in `--calibration`. Back up that folder to keep the games.
 
 ## 7. Acceptance checklist
 
@@ -397,7 +418,10 @@ The target is ready for development when all of these are true:
 - [ ] A test capture looks sharp and shows the whole board.
 - [ ] A cross-compiled binary runs on the target and opens the camera.
 - [ ] The systemd service starts at boot and restarts after a crash.
-- [ ] The preview is reachable from the PC browser.
+- [ ] The page is reachable from the PC browser and from a phone.
+- [ ] `./nicochess --source demo` plays the whole demo game without stalling the Atom.
+- [ ] Calibration looks right on the real board (the green grid follows the squares).
+- [ ] A few real moves are recognised correctly, and a wrong one can be fixed from the page.
 
 ## 8. Later: Wi-Fi access point for phone or tablet
 

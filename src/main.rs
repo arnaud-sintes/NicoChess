@@ -1,0 +1,146 @@
+//! NicoChess: follow a chess game on a real board with a webcam.
+//!
+//! The program serves a web page (for phones and tablets), watches the board with
+//! a camera, works out the moves with the chess rules, and records the games.
+
+mod calibration;
+mod camera;
+mod engine;
+mod game;
+mod http;
+mod roles;
+mod server;
+mod store;
+mod synthetic;
+mod tracker;
+mod vision;
+
+use anyhow::{Result, bail};
+use calibration::Calibration;
+use camera::{CameraSettings, SourceSpec};
+use engine::{Engine, EngineConfig};
+use std::path::PathBuf;
+use std::time::Duration;
+use store::Store;
+use tracker::TrackerConfig;
+
+const HELP: &str = "\
+nicochess: track a chess game with a webcam
+
+USAGE:
+    nicochess [OPTIONS]
+
+OPTIONS:
+    --listen <ADDR>          HTTP address                        [default: 0.0.0.0:8080]
+    --source <SRC>           camera | demo | synthetic | <image.jpg>   [default: camera]
+    --device <PATH>          camera device (Linux)               [default: /dev/video0]
+    --width <N>              camera width                        [default: 640]
+    --height <N>             camera height                       [default: 480]
+    --fps <N>                frames per second kept              [default: 3]
+    --data-dir <DIR>         where games are stored              [default: data]
+    --calibration <FILE>     calibration file                    [default: calibration.json]
+    --no-lock-controls       do not turn off auto exposure / white balance
+    --exposure <N>           manual exposure time (units of 100 us)
+    --white-balance <K>      manual white balance temperature (Kelvin)
+    --max-viewers <N>        open pages allowed at once          [default: 8]
+    --idle-timeout <SECS>    controller released after this silence, outside a game  [default: 60]
+    --game-timeout <MINS>    ... and during a game               [default: 30]
+    --demo-interval <SECS>   time between moves of the demo game [default: 4]
+
+  Tuning the move detection:
+    --stable-frames <N>      frames in a row that must agree     [default: 3]
+    --motion-threshold <X>   colour change that means 'a hand is there'  [default: 4]
+    --max-cost <X>           largest mismatch accepted for a move  [default: 1.6]
+    --margin <X>             how much better than the runner-up    [default: 1]
+
+    -h, --help               show this help
+
+'demo' plays a whole game on a synthetic board and 'synthetic' shows the starting
+position: both let you try everything on a PC without a camera.";
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let mut args = pico_args::Arguments::from_env();
+    if args.contains(["-h", "--help"]) {
+        println!("{HELP}");
+        return Ok(());
+    }
+
+    let listen: String = args.opt_value_from_str("--listen")?.unwrap_or_else(|| "0.0.0.0:8080".into());
+    let source: String = args.opt_value_from_str("--source")?.unwrap_or_else(|| "camera".into());
+    let device: String = args.opt_value_from_str("--device")?.unwrap_or_else(|| "/dev/video0".into());
+    let width: u32 = args.opt_value_from_str("--width")?.unwrap_or(640);
+    let height: u32 = args.opt_value_from_str("--height")?.unwrap_or(480);
+    let fps: f32 = args.opt_value_from_str("--fps")?.unwrap_or(3.0);
+    let data_dir: PathBuf = args.opt_value_from_str("--data-dir")?.unwrap_or_else(|| PathBuf::from("data"));
+    let calibration_path: PathBuf = args
+        .opt_value_from_str("--calibration")?
+        .unwrap_or_else(|| PathBuf::from("calibration.json"));
+    let lock_controls = !args.contains("--no-lock-controls");
+    let exposure: Option<i64> = args.opt_value_from_str("--exposure")?;
+    let white_balance: Option<i64> = args.opt_value_from_str("--white-balance")?;
+    let max_viewers: usize = args.opt_value_from_str("--max-viewers")?.unwrap_or(8);
+    let idle_secs: u64 = args.opt_value_from_str("--idle-timeout")?.unwrap_or(60);
+    let game_mins: u64 = args.opt_value_from_str("--game-timeout")?.unwrap_or(30);
+    let demo_secs: f32 = args.opt_value_from_str("--demo-interval")?.unwrap_or(4.0);
+
+    let defaults = TrackerConfig::default();
+    let tracker = TrackerConfig {
+        stable_frames: args.opt_value_from_str("--stable-frames")?.unwrap_or(defaults.stable_frames),
+        motion_threshold: args.opt_value_from_str("--motion-threshold")?.unwrap_or(defaults.motion_threshold),
+        max_cost: args.opt_value_from_str("--max-cost")?.unwrap_or(defaults.max_cost),
+        margin: args.opt_value_from_str("--margin")?.unwrap_or(defaults.margin),
+    };
+
+    let rest = args.finish();
+    if !rest.is_empty() {
+        bail!("unknown arguments: {rest:?} (see --help)");
+    }
+    if !(fps > 0.0 && fps <= 30.0) {
+        bail!("--fps must be between 0 and 30");
+    }
+    if demo_secs <= 0.0 {
+        bail!("--demo-interval must be positive");
+    }
+    let interval = Duration::from_secs_f32(1.0 / fps);
+
+    let spec = match source.as_str() {
+        "camera" => SourceSpec::Camera(CameraSettings {
+            device,
+            width,
+            height,
+            interval,
+            lock_controls,
+            exposure,
+            white_balance,
+        }),
+        "demo" => SourceSpec::Demo { move_interval: Duration::from_secs_f32(demo_secs) },
+        "synthetic" => SourceSpec::Synthetic,
+        path => SourceSpec::Image(path.to_string()),
+    };
+
+    let calibration = Calibration::load(&calibration_path)?;
+    match &calibration {
+        Some(_) => eprintln!("calibration: loaded {}", calibration_path.display()),
+        None => eprintln!("calibration: none yet, open the web page and use Calibrate"),
+    }
+    let store = Store::open(&data_dir)?;
+    eprintln!("games: stored in {}", data_dir.display());
+
+    let config = EngineConfig {
+        idle_timeout: Duration::from_secs(idle_secs),
+        game_timeout: Duration::from_secs(game_mins * 60),
+        tracker,
+    };
+    let engine = Engine::new(config, store, calibration_path, calibration);
+    engine.spawn_capture(camera::factory(spec, interval))?;
+
+    // Event streams each hold a connection, so leave room for ordinary requests too.
+    http::serve(&listen, max_viewers + 16, server::handler(engine, max_viewers))
+}

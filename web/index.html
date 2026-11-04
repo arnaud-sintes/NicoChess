@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NicoChess</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f4f4f2; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff; --line: #d6d6d0;
+    --accent: #0a7d4f; --accent-fg: #ffffff; --warn: #b3261e; --note: #8a5a00; --hl: #ffe9a8;
+    --sq-light: #f0d9b5; --sq-dark: #b58863;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161616; --fg: #ececea; --muted: #9a9a94; --card: #222222; --line: #3a3a36;
+      --accent: #3ecf8e; --accent-fg: #06281a; --warn: #ff8a80; --note: #f0c36a; --hl: #5a4a14;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; padding: 12px 16px 40px; background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; }
+  [hidden] { display: none !important; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px; }
+  h1 { font-size: 1.25rem; margin: 0; }
+  h2 { font-size: 1rem; margin: 0 0 8px; }
+  .chip { font-size: .8rem; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); }
+  .chip.ctl { border-color: var(--accent); color: var(--accent); }
+  .spacer { flex: 1; }
+  nav { display: flex; gap: 6px; margin: 8px 0 12px; flex-wrap: wrap; }
+  nav button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  button, select, input[type=text] {
+    font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--card); color: var(--fg);
+  }
+  button { cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  button.danger { color: var(--warn); }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  .notice { padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; border: 1px solid var(--note); color: var(--note); }
+  .notice.err { border-color: var(--warn); color: var(--warn); }
+  .layout { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); max-width: 1100px; align-items: start; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .muted { color: var(--muted); }
+  .status { margin: 8px 0; min-height: 1.4em; }
+  .status.unsure { color: var(--warn); }
+  svg.board { width: 100%; max-width: 480px; height: auto; display: block; border-radius: 4px; touch-action: manipulation; }
+  table.moves { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  table.moves td, table.moves th { padding: 3px 6px; text-align: left; }
+  table.moves th { color: var(--muted); font-weight: 500; font-size: .8rem; }
+  table.moves td.n { color: var(--muted); width: 2.2em; }
+  table.moves td.m { cursor: pointer; border-radius: 4px; }
+  table.moves td.m.on { background: var(--hl); }
+  table.moves small { color: var(--muted); margin-left: 4px; }
+  .scroll { max-height: 320px; overflow: auto; }
+  label { display: block; font-size: .85rem; color: var(--muted); margin: 8px 0 2px; }
+  input[type=text] { width: 100%; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stage { position: relative; line-height: 0; }
+  .stage img { width: 100%; height: auto; border-radius: 6px; background: #000; }
+  .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #live { cursor: crosshair; }
+  ul.games { list-style: none; margin: 0; padding: 0; }
+  ul.games li { padding: 10px 6px; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+  ul.games li:hover { background: var(--hl); }
+  .result { font-weight: 600; }
+  details { margin: 8px 0; }
+  .time { font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>NicoChess</h1>
+  <span class="chip" id="role">…</span>
+  <span class="chip" id="mode"></span>
+  <span class="spacer"></span>
+  <button id="claim" hidden>Take control</button>
+  <button id="release" hidden>Release control</button>
+</header>
+
+<div id="notice" class="notice" hidden></div>
+<div id="offline" class="notice err" hidden>Connection lost. Reconnecting…</div>
+
+<nav>
+  <button data-tab="live" class="on">Live</button>
+  <button data-tab="games">Games</button>
+  <button data-tab="calibrate">Calibrate</button>
+</nav>
+
+<!-- LIVE -->
+<section id="tab-live">
+  <div class="layout">
+    <div class="card">
+      <h2 id="live-title">Game</h2>
+      <svg class="board" id="live-board" viewBox="0 0 80 80" role="img" aria-label="Chess board"></svg>
+      <div class="status" id="status"></div>
+      <div id="candidates" class="bar" hidden></div>
+      <div id="promotion" class="bar" hidden>
+        <span>Promoted to a queen? Change it:</span>
+        <button data-piece="r">Rook</button><button data-piece="b">Bishop</button><button data-piece="n">Knight</button><button data-piece="q">Queen</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <!-- no game: start form -->
+      <div id="start-form" hidden>
+        <h2>New game</h2>
+        <p class="muted">Set up the pieces first, then press Start. The camera learns how the squares look from that position.</p>
+        <div class="row2">
+          <div><label for="white">White</label><input type="text" id="white" placeholder="White" maxlength="40"></div>
+          <div><label for="black">Black</label><input type="text" id="black" placeholder="Black" maxlength="40"></div>
+        </div>
+        <details><summary>Start from a position (FEN)</summary>
+          <input type="text" id="fen" placeholder="empty = standard starting position">
+        </details>
+        <div class="bar">
+          <button class="primary" id="start">Start game</button>
+          <button id="to-calibrate" hidden>Calibrate first</button>
+        </div>
+      </div>
+      <div id="start-viewer" class="muted" hidden>No game is being recorded.</div>
+
+      <!-- a game -->
+      <div id="game-panel" hidden>
+        <h2>Moves</h2>
+        <div class="muted" id="game-names"></div>
+        <div class="scroll"><table class="moves" id="live-moves"></table></div>
+        <div class="bar" id="game-over" hidden>
+          <strong id="game-result"></strong><a id="game-pgn" href="#" download>Download PGN</a>
+        </div>
+        <div id="controls" hidden>
+          <div class="bar">
+            <input type="text" id="move" placeholder="Enter a move, e.g. Nf3 or e2e4" autocapitalize="off" autocomplete="off" style="flex:1 1 180px">
+            <button id="send-move">Play</button>
+          </div>
+          <div class="bar">
+            <button id="undo">Undo last move</button>
+            <button id="relearn" title="Use when the light changed">Re-learn squares</button>
+          </div>
+          <div class="bar" id="end-bar">
+            <select id="end-choice">
+              <option value="">End the game…</option>
+              <option value="0-1|resignation">White resigns</option>
+              <option value="1-0|resignation">Black resigns</option>
+              <option value="1/2-1/2|agreement">Draw agreed</option>
+              <option value="*|abandoned">Abort the game</option>
+            </select>
+            <button class="danger" id="end">End</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- GAMES -->
+<section id="tab-games" hidden>
+  <div class="layout">
+    <div class="card" id="games-card">
+      <h2>Past games</h2>
+      <ul class="games" id="games-list"></ul>
+      <p class="muted" id="games-empty" hidden>No games yet.</p>
+    </div>
+    <div class="card" id="replay" hidden>
+      <h2 id="replay-title"></h2>
+      <svg class="board" id="replay-board" viewBox="0 0 80 80" role="img" aria-label="Replay board"></svg>
+      <div class="bar">
+        <button id="r-first" title="Start">⏮</button>
+        <button id="r-prev" title="Back">◀</button>
+        <button id="r-next" title="Forward">▶</button>
+        <button id="r-last" title="End">⏭</button>
+        <span class="time" id="r-time"></span>
+      </div>
+      <div class="bar">
+        <button id="r-play" class="primary">Play</button>
+        <select id="r-speed">
+          <option value="1">Real time</option>
+          <option value="2">Real time ×2</option>
+          <option value="5">Real time ×5</option>
+          <option value="0" selected>As fast as possible</option>
+        </select>
+        <a id="r-pgn" href="#" download>PGN</a>
+      </div>
+      <div class="scroll"><table class="moves" id="replay-moves"></table></div>
+    </div>
+  </div>
+</section>
+
+<!-- CALIBRATE -->
+<section id="tab-calibrate" hidden>
+  <div class="layout">
+    <div class="card">
+      <h2>Camera</h2>
+      <div id="cal-viewer" class="muted" hidden>Only the controller can calibrate.</div>
+      <div id="cal-controls">
+        <div class="bar">
+          <button id="cal-open" class="primary">Open the camera</button>
+          <button id="cal-close" hidden>Close the camera</button>
+          <button id="cal-clear" class="danger" hidden>Forget calibration</button>
+        </div>
+      </div>
+      <div class="stage" id="cal-stage" hidden><img id="live" alt="camera"><canvas id="overlay"></canvas></div>
+      <div class="status" id="cal-msg"></div>
+    </div>
+    <div class="card" id="warp-card" hidden>
+      <h2>Board, top-down</h2>
+      <div class="stage"><img id="warp" alt="warped board"></div>
+      <p class="muted">White at the bottom, the a-file on the left. The green grid must follow the squares.</p>
+    </div>
+  </div>
+</section>
+
+<script>
+'use strict';
+// ---------- identity ----------
+function makeToken() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+let memory = {};
+function stored(key, make) {
+  try {
+    let v = localStorage.getItem(key);
+    if (!v && make) { v = make(); localStorage.setItem(key, v); }
+    return v;
+  } catch (e) { if (!memory[key] && make) memory[key] = make(); return memory[key]; }
+}
+function remember(key, value) { try { localStorage.setItem(key, value); } catch (e) { memory[key] = value; } }
+// #token=... opens the page as the same user (for example the controller on another device).
+const fromAddress = (location.hash.match(/token=([0-9a-f]{8,64})/) || [])[1];
+if (fromAddress) remember('nicochess-token', fromAddress);
+const token = fromAddress || stored('nicochess-token', makeToken);
+
+// ---------- helpers ----------
+const $ = id => document.getElementById(id);
+let S = null;                       // latest state from the server
+let tab = 'live';
+
+async function api(method, path, body) {
+  try {
+    const res = await fetch(path, {
+      method, headers: { 'X-Client-Token': token, 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) { toast(data.error || ('Error ' + res.status)); return null; }
+    return data;
+  } catch (e) { toast('Server not reachable'); return null; }
+}
+let toastTimer = null;
+function toast(text) {
+  const el = $('notice'); el.textContent = text; el.classList.add('err'); el.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => renderNotice(), 5000);
+}
+function renderNotice() {
+  const el = $('notice');
+  const text = S && (S.notice || (S.camera && S.camera.error));
+  el.classList.toggle('err', !!(S && S.camera && S.camera.error));
+  el.textContent = text || ''; el.hidden = !text;
+}
+function mmss(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function dateText(iso) {
+  if (!iso) return 'undated';
+  const d = new Date(iso);
+  return isNaN(d) ? 'undated' : d.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+// ---------- board drawing ----------
+const GLYPH = { k: '♚', q: '♛', r: '♜', b: '♝', n: '♞', p: '♟' };
+function drawBoard(svg, fen, uci) {
+  const rows = (fen || '8/8/8/8/8/8/8/8').split(' ')[0].split('/');
+  const marked = new Set();
+  if (uci && uci.length >= 4) { marked.add(uci.slice(0, 2)); marked.add(uci.slice(2, 4)); }
+  let out = '<rect x="0" y="0" width="80" height="80" fill="var(--sq-dark)"/>';
+  for (let r = 0; r < 8; r++) {
+    let f = 0;
+    for (const ch of rows[r] || '') {
+      if (/\d/.test(ch)) { f += +ch; continue; }
+      f++;
+    }
+  }
+  for (let r = 0; r < 8; r++) {
+    for (let f = 0; f < 8; f++) {
+      const name = 'abcdefgh'[f] + (8 - r);
+      const light = (f + (8 - r)) % 2 === 1;
+      out += `<rect x="${f * 10}" y="${r * 10}" width="10" height="10" fill="${light ? 'var(--sq-light)' : 'var(--sq-dark)'}"/>`;
+      if (marked.has(name)) out += `<rect x="${f * 10}" y="${r * 10}" width="10" height="10" fill="#f6d84a" opacity=".55"/>`;
+    }
+  }
+  for (let r = 0; r < 8; r++) {
+    let f = 0;
+    for (const ch of rows[r] || '') {
+      if (/\d/.test(ch)) { f += +ch; continue; }
+      const white = ch === ch.toUpperCase();
+      const glyph = GLYPH[ch.toLowerCase()];
+      if (glyph) {
+        out += `<text x="${f * 10 + 5}" y="${r * 10 + 7.6}" text-anchor="middle" font-size="8.6" ` +
+          `fill="${white ? '#fff' : '#111'}" stroke="${white ? '#111' : '#fff'}" stroke-width=".35" ` +
+          `font-family="'Segoe UI Symbol','Noto Sans Symbols 2','DejaVu Sans',sans-serif">${glyph}︎</text>`;
+      }
+      f++;
+    }
+  }
+  for (let i = 0; i < 8; i++) {
+    out += `<text x="${i * 10 + 9.4}" y="79" font-size="2.4" text-anchor="end" fill="${i % 2 ? 'var(--sq-dark)' : 'var(--sq-light)'}">${'abcdefgh'[i]}</text>`;
+    out += `<text x="0.8" y="${i * 10 + 3}" font-size="2.4" fill="${i % 2 ? 'var(--sq-light)' : 'var(--sq-dark)'}">${8 - i}</text>`;
+  }
+  svg.innerHTML = out;
+}
+
+// ---------- move list ----------
+// Returns rows of {n, white: index|null, black: index|null} from the start position.
+function moveRows(startFen, count) {
+  let blackFirst = false, number = 1;
+  if (startFen) {
+    const parts = startFen.split(' ');
+    blackFirst = parts[1] === 'b'; number = parseInt(parts[5], 10) || 1;
+  }
+  const rows = []; let i = 0;
+  if (blackFirst && count > 0) { rows.push({ n: number, white: null, black: 0 }); i = 1; number++; }
+  for (; i < count; i += 2) rows.push({ n: number++, white: i, black: i + 1 < count ? i + 1 : null });
+  return rows;
+}
+function drawMoves(table, moves, startFen, current, clickable) {
+  let html = '<tr><th></th><th>White</th><th>Black</th></tr>';
+  const cell = idx => {
+    if (idx === null) return '<td></td>';
+    const m = moves[idx];
+    const on = current === idx + 1 ? ' on' : '';
+    return `<td class="m${on}" data-ply="${idx + 1}">${esc(m.san)}${m.guess ? '<small>?</small>' : ''}<small>${mmss(m.t)}</small></td>`;
+  };
+  for (const row of moveRows(startFen, moves.length)) {
+    html += `<tr><td class="n">${row.n}.</td>${cell(row.white)}${cell(row.black)}</tr>`;
+  }
+  table.innerHTML = html;
+  if (!clickable) table.querySelectorAll('td.m').forEach(td => td.style.cursor = 'default');
+  const active = table.querySelector('td.on');
+  if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+}
+
+// ---------- state from the server ----------
+const STATUS = {
+  no_calibration: 'The board is not calibrated.',
+  learning: 'Learning how the squares look. Keep your hands off the board.',
+  watching: 'Watching the board.',
+  moving: 'Something is moving over the board…',
+  unsure: 'Not sure which move was played. Pick one below, or enter it.',
+};
+
+function apply(state) {
+  S = state;
+  render();
+}
+
+function render() {
+  if (!S) return;
+  const ctl = S.role === 'controller';
+  $('role').textContent = ctl ? 'Controller' : 'Viewer';
+  $('role').classList.toggle('ctl', ctl);
+  $('mode').textContent = S.mode === 'playing' ? 'Recording' : S.mode === 'calibrating' ? 'Calibrating' : 'Idle';
+  $('claim').hidden = ctl || !S.can_claim;
+  $('release').hidden = !ctl;
+  renderNotice();
+
+  renderLive(ctl);
+  renderCalibrate(ctl);
+  if (tab === 'games') refreshGamesSoon();
+}
+
+function renderLive(ctl) {
+  const g = S.game, playing = S.mode === 'playing';
+  $('start-form').hidden = !(ctl && !playing);
+  $('start-viewer').hidden = !(!ctl && !playing && !g);
+  $('game-panel').hidden = !g;
+  $('to-calibrate').hidden = !!S.calibration;
+  $('start').disabled = !S.calibration;
+
+  if (!g) {
+    $('live-title').textContent = 'Board';
+    drawBoard($('live-board'), null);
+    $('status').textContent = ''; $('candidates').hidden = true; $('promotion').hidden = true;
+    return;
+  }
+  const last = g.moves.length ? g.moves[g.moves.length - 1] : null;
+  $('live-title').textContent = g.white + ' – ' + g.black;
+  drawBoard($('live-board'), g.fen, last && last.uci);
+  $('game-names').textContent = dateText(g.started_at) + (g.start_fen ? ' · from a position' : '');
+  drawMoves($('live-moves'), g.moves, g.start_fen, g.moves.length, false);
+
+  const over = g.over;
+  $('game-over').hidden = !g.result;
+  if (g.result) {
+    $('game-result').textContent = g.result + (g.termination ? ' (' + g.termination + ')' : '');
+    $('game-pgn').href = '/api/games/' + encodeURIComponent(g.id) + '/pgn';
+  }
+  $('controls').hidden = !(ctl && (playing || (g.termination && /^(checkmate|stalemate|insufficient)/.test(g.termination))));
+  $('undo').disabled = !g.moves.length;
+  $('end-bar').hidden = !playing;
+  $('relearn').hidden = !playing;
+  $('move').disabled = !playing; $('send-move').disabled = !playing;
+
+  const st = S.tracker.status;
+  const statusEl = $('status');
+  if (playing) {
+    const turn = g.turn === 'white' ? 'White' : 'Black';
+    statusEl.textContent = (STATUS[st] || st) + ' ' + turn + ' to move.';
+  } else {
+    statusEl.textContent = over ? 'Game over.' : 'The recording is stopped.';
+  }
+  statusEl.className = 'status' + (playing && st === 'unsure' ? ' unsure' : '');
+
+  const cands = $('candidates');
+  const showCands = ctl && playing && st === 'unsure' && S.tracker.candidates.length;
+  cands.hidden = !showCands;
+  if (showCands) {
+    cands.innerHTML = '<span>Which move?</span>' + S.tracker.candidates
+      .map(c => `<button data-move="${esc(c.uci)}">${esc(c.san)}</button>`).join('');
+  }
+  $('promotion').hidden = !(ctl && playing && S.tracker.promotion_pending);
+}
+
+// ---------- commands ----------
+$('claim').onclick = () => api('POST', '/api/claim');
+$('release').onclick = () => api('POST', '/api/release');
+
+$('start').onclick = async () => {
+  remember('nicochess-white', $('white').value); remember('nicochess-black', $('black').value);
+  const fen = $('fen').value.trim();
+  await api('POST', '/api/game/start', {
+    white: $('white').value, black: $('black').value, fen: fen || null, started_at: new Date().toISOString(),
+  });
+};
+$('to-calibrate').onclick = () => showTab('calibrate');
+$('send-move').onclick = async () => {
+  const text = $('move').value.trim(); if (!text) return;
+  if (await api('POST', '/api/game/move', { move: text })) $('move').value = '';
+};
+$('move').addEventListener('keydown', e => { if (e.key === 'Enter') $('send-move').click(); });
+$('undo').onclick = () => api('POST', '/api/game/undo');
+$('relearn').onclick = () => confirm('The board must show the current position. Learn the squares again?') && api('POST', '/api/game/relearn');
+$('end').onclick = async () => {
+  const choice = $('end-choice').value; if (!choice) return toast('Choose how the game ends.');
+  const [result, reason] = choice.split('|');
+  if (confirm('End the game now?')) { await api('POST', '/api/game/end', { result, reason }); $('end-choice').value = ''; }
+};
+$('candidates').addEventListener('click', e => {
+  const b = e.target.closest('button[data-move]'); if (b) api('POST', '/api/game/move', { move: b.dataset.move });
+});
+$('promotion').addEventListener('click', e => {
+  const b = e.target.closest('button[data-piece]'); if (b) api('POST', '/api/game/promotion', { piece: b.dataset.piece });
+});
+
+// ---------- tabs ----------
+function showTab(name) {
+  tab = name;
+  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  for (const t of ['live', 'games', 'calibrate']) $('tab-' + t).hidden = t !== name;
+  if (name === 'games') refreshGames();
+  cameraLoops();
+  renderCalibrate(S && S.role === 'controller');
+}
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+
+// ---------- calibration ----------
+const NAMES = ['a1', 'h1', 'h8', 'a8'];
+const live = $('live'), warp = $('warp'), overlay = $('overlay');
+let clicks = [];
+
+function renderCalibrate(ctl) {
+  if (!S) return;
+  const cameraOn = S.mode !== 'idle';
+  $('cal-viewer').hidden = ctl; $('cal-controls').hidden = !ctl;
+  $('cal-open').hidden = cameraOn;
+  $('cal-close').hidden = !(cameraOn && S.mode === 'calibrating');
+  $('cal-clear').hidden = !(S.calibration && S.mode !== 'playing');
+  $('cal-stage').hidden = !(cameraOn && ctl);
+  $('warp-card').hidden = !(cameraOn && S.calibration);
+  if (!cameraOn) clicks = [];
+  if (cameraOn && ctl && !clicks.length) {
+    $('cal-msg').className = 'status';
+    $('cal-msg').textContent = S.calibration
+      ? 'Calibrated. Click anywhere on the image to do it again.'
+      : 'Click the 4 corners of the board, in this order: a1, h1, h8, a8 (a1 is the corner of the square at the left of White’s back row).';
+  }
+  cameraLoops();
+}
+
+function drawOverlay() {
+  const w = live.clientWidth, h = live.clientHeight;
+  overlay.width = w; overlay.height = h;
+  if (!live.naturalWidth) return;
+  const sx = w / live.naturalWidth, sy = h / live.naturalHeight;
+  const ctx = overlay.getContext('2d');
+  const pts = clicks.length ? clicks : (S && S.calibration) || [];
+  ctx.lineWidth = 2; ctx.strokeStyle = '#3ecf8e'; ctx.font = '14px system-ui';
+  ctx.beginPath();
+  pts.forEach((p, i) => i ? ctx.lineTo(p[0] * sx, p[1] * sy) : ctx.moveTo(p[0] * sx, p[1] * sy));
+  if (pts.length === 4) ctx.closePath();
+  ctx.stroke();
+  pts.forEach((p, i) => {
+    ctx.fillStyle = '#ff5252'; ctx.beginPath(); ctx.arc(p[0] * sx, p[1] * sy, 5, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillText(NAMES[i], p[0] * sx + 8, p[1] * sy - 8);
+  });
+}
+
+live.addEventListener('click', async ev => {
+  if (!live.naturalWidth) return;
+  if (clicks.length === 4 || (S && S.calibration && !clicks.length)) clicks = [];
+  const r = live.getBoundingClientRect();
+  clicks.push([(ev.clientX - r.left) * live.naturalWidth / r.width, (ev.clientY - r.top) * live.naturalHeight / r.height]);
+  drawOverlay();
+  const msg = $('cal-msg'); msg.className = 'status';
+  if (clicks.length < 4) { msg.textContent = 'Now click corner ' + NAMES[clicks.length] + '.'; return; }
+  const ok = await api('POST', '/api/calibration', { corners: clicks });
+  clicks = [];
+  msg.textContent = ok ? 'Calibration saved.' : 'Rejected. Click the 4 corners again, starting with a1.';
+  msg.className = 'status' + (ok ? '' : ' unsure');
+  drawOverlay();
+});
+$('cal-open').onclick = () => api('POST', '/api/calibration/open');
+$('cal-close').onclick = () => api('POST', '/api/calibration/close');
+$('cal-clear').onclick = () => confirm('Forget the calibration?') && api('DELETE', '/api/calibration');
+window.addEventListener('resize', drawOverlay);
+
+// Reload an image after the previous one has loaded, only while it is visible.
+let loopsOn = { live: false, warp: false };
+function loop(img, url, every, key, wanted) {
+  if (!wanted()) { loopsOn[key] = false; return; }
+  if (loopsOn[key]) return;
+  loopsOn[key] = true;
+  const next = () => setTimeout(() => {
+    if (!wanted()) { loopsOn[key] = false; return; }
+    img.src = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now();
+  }, every);
+  img.onload = () => { if (img === live) drawOverlay(); next(); };
+  img.onerror = next;
+  img.src = url + '?t=' + Date.now();
+}
+function cameraLoops() {
+  const cal = tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle';
+  loop(live, '/frame.jpg', 400, 'live', () => tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle');
+  loop(warp, '/warp.jpg', 700, 'warp', () => tab === 'calibrate' && S && S.mode !== 'idle' && S.calibration);
+}
+
+// ---------- past games and replay ----------
+let gamesTimer = null;
+function refreshGamesSoon() { clearTimeout(gamesTimer); gamesTimer = setTimeout(refreshGames, 300); }
+async function refreshGames() {
+  let data;
+  try { data = await (await fetch('/api/games')).json(); } catch (e) { return; }
+  const list = $('games-list');
+  $('games-empty').hidden = data.games.length > 0;
+  list.innerHTML = data.games.map(g =>
+    `<li data-id="${esc(g.id)}"><strong>${esc(g.white)} – ${esc(g.black)}</strong>` +
+    `<span class="result">${g.result ? esc(g.result) : 'in progress'}</span>` +
+    `<span class="muted">${esc(dateText(g.started_at))} · ${g.moves} moves</span></li>`).join('');
+}
+$('games-list').addEventListener('click', e => { const li = e.target.closest('li[data-id]'); if (li) openReplay(li.dataset.id); });
+
+const R = { game: null, ply: 0, timer: null };
+async function openReplay(id) {
+  stopReplay();
+  let game;
+  try { game = await (await fetch('/api/games/' + encodeURIComponent(id))).json(); } catch (e) { return toast('Cannot load the game'); }
+  R.game = game; R.ply = 0;
+  $('replay').hidden = false;
+  $('replay-title').textContent = game.white + ' – ' + game.black + (game.result ? ' · ' + game.result : '');
+  $('r-pgn').href = '/api/games/' + encodeURIComponent(id) + '/pgn';
+  showPly(0);
+  $('replay').scrollIntoView({ block: 'nearest' });
+}
+function showPly(n) {
+  const g = R.game; if (!g) return;
+  R.ply = Math.max(0, Math.min(g.moves.length, n));
+  const last = R.ply ? g.moves[R.ply - 1] : null;
+  drawBoard($('replay-board'), g.fens[R.ply], last && last.uci);
+  drawMoves($('replay-moves'), g.moves, g.start_fen, R.ply, true);
+  $('r-time').textContent = mmss(last ? last.t : 0) + ' / ' + mmss(g.moves.length ? g.moves[g.moves.length - 1].t : 0) +
+    ' · move ' + R.ply + '/' + g.moves.length;
+  $('r-first').disabled = $('r-prev').disabled = R.ply === 0;
+  $('r-next').disabled = $('r-last').disabled = R.ply === g.moves.length;
+}
+function stopReplay() { clearTimeout(R.timer); R.timer = null; $('r-play').textContent = 'Play'; }
+function playReplay() {
+  const g = R.game; if (!g) return;
+  if (R.timer) return stopReplay();
+  if (R.ply >= g.moves.length) showPly(0);
+  $('r-play').textContent = 'Stop';
+  const speed = +$('r-speed').value;
+  const step = () => {
+    if (R.ply >= g.moves.length) return stopReplay();
+    // Wait as long as the players did (scaled), or a short fixed time when going fast.
+    const gap = R.ply ? g.moves[R.ply].t - g.moves[R.ply - 1].t : g.moves[0].t;
+    const wait = speed === 0 ? 250 : Math.min(Math.max(gap, 0.3) / speed, 30) * 1000;
+    R.timer = setTimeout(() => { showPly(R.ply + 1); step(); }, wait);
+  };
+  step();
+}
+$('r-first').onclick = () => { stopReplay(); showPly(0); };
+$('r-prev').onclick = () => { stopReplay(); showPly(R.ply - 1); };
+$('r-next').onclick = () => { stopReplay(); showPly(R.ply + 1); };
+$('r-last').onclick = () => { stopReplay(); showPly(R.game ? R.game.moves.length : 0); };
+$('r-play').onclick = playReplay;
+$('r-speed').onchange = () => { if (R.timer) { stopReplay(); playReplay(); } };
+$('replay-moves').addEventListener('click', e => {
+  const td = e.target.closest('td[data-ply]'); if (td) { stopReplay(); showPly(+td.dataset.ply); }
+});
+
+// ---------- events from the server ----------
+$('white').value = stored('nicochess-white') || '';
+$('black').value = stored('nicochess-black') || '';
+drawBoard($('live-board'), null);
+
+function connect() {
+  const source = new EventSource('/api/events?token=' + token);
+  source.addEventListener('state', e => { $('offline').hidden = true; apply(JSON.parse(e.data)); });
+  source.onerror = () => { $('offline').hidden = false; };
+}
+// Address shortcuts, separated by commas: games, calibrate, replay=ID (a link to a game),
+// token=... (see above) and poll (refresh by polling instead of events).
+const hashes = location.hash.slice(1).split(",");
+const replayId = (hashes.find(h => h.startsWith("replay=")) || "").slice(7);
+if (/^[A-Za-z0-9-]+$/.test(replayId)) { showTab("games"); openReplay(replayId); }
+const wanted = hashes.find(h => h === "games" || h === "calibrate");
+if (wanted) showTab(wanted);
+if (window.EventSource && !hashes.includes("poll")) connect();
+else {
+  const poll = async () => { try { apply(await (await fetch('/api/state?token=' + token)).json()); $('offline').hidden = true; } catch (e) { $('offline').hidden = false; } };
+  poll(); setInterval(poll, 2000);
+}
+</script>
+</body>
+</html>

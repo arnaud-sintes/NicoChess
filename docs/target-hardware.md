@@ -30,11 +30,11 @@ Enough if the design is event-driven and lean.
 - MJPEG decoding at 720p, the most expensive step; prefer YUYV or a lower resolution.
 - Building on the device; cross-compile from the main PC.
 - `opencv`; use pure-Rust `imageproc`.
-- A local GUI; run headless and expose a small web page (for example `axum`) or terminal output, and view it from another machine.
+- A local GUI; run headless and expose a small web page (`tiny_http`) or terminal output, and view it from another machine.
 
 ## Operating system
 
-Linux is better than Windows: lower overhead, good V4L2 camera access with `nokhwa`, easy headless use over SSH.
+Linux is better than Windows: lower overhead, good V4L2 camera access (the `v4l` crate), easy headless use over SSH.
 The distribution must still ship 32-bit x86.
 
 1. Debian 12 "Bookworm" (i386), recommended.
@@ -68,7 +68,7 @@ Camera on offer: Logitech C170 (about 15 years old).
 Specs below come from the Logitech support page (French, "Logitech Webcam C170 Caractéristiques techniques", https://support.logi.com/hc/fr/articles/360023305614-Logitech-Webcam-C170-Caract%C3%A9ristiques-techniques).
 They are not yet verified on the device (`v4l2-ctl --list-formats-ext`).
 
-- Basic VGA webcam, fixed focus, UVC class (works with V4L2 and `nokhwa`), USB 2.0.
+- Basic VGA webcam, fixed focus, UVC class (works with V4L2), USB 2.0.
 - Sensor: "Réelle = 640x480, interpolée = 1,3 MP". The real resolution is 640×480.
 - Video modes (4:3 SD): 320×240, 640×480, 1024×768. 16:9 modes: 320×180 and 360p.
 - Frame rate: 30 fps is stated for 640×480 only; none is given for the other modes.
