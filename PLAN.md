@@ -493,8 +493,9 @@ The reasoning is in `docs/requirements.md`, "Targets".
 5. Optional: start it at login with a systemd user service or a desktop autostart entry, and put the browser in full screen (F11) or kiosk mode.
 
 **Windows laptop**
-- Not planned: the laptop would run Linux, like the INEOS 600. Camera capture is implemented with V4L2 only, so Windows would need a new camera backend first.
-  Everything else runs on Windows already, which is how the program is developed: `cargo run --release -- --source demo --open` plays the demo game in the local browser.
+- The laptop would run Linux, like the INEOS 600. The program also runs on Windows, camera included (Media Foundation, added 2026-11-12): `cargo run --release -- --probe` lists the cameras, then `cargo run --release -- --device 0 --width 1280 --height 720 --open` uses one.
+  `cargo run --release -- --source demo --open` plays the demo game in the local browser, without a camera.
+  If the page does not open on Windows with "forbidden by its access permissions", the port is reserved (Docker Desktop and Hyper-V reserve ranges that include 8080): check with `netsh int ipv4 show excludedportrange protocol=tcp` and pass another port, e.g. `--listen 127.0.0.1:18080`.
 
 **Both**
 - Raise the resolution and the frame rate: the Atom limits (640x480, 3 fps, no heavy decoding) no longer apply.

@@ -88,7 +88,7 @@ impl FrameSource for Synthetic {
 }
 
 /// Converts packed YUYV (YUV 4:2:2) to RGB, BT.601 full range.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
     let needed = width as usize * height as usize * 2;
     if data.len() < needed {
@@ -115,7 +115,7 @@ pub fn yuyv_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
 
 /// Converts NV12 (a full-size Y plane, then interleaved half-size U and V) to RGB,
 /// BT.601 full range. Many room and laptop cameras offer it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
     let (w, h) = (width as usize, height as usize);
     let needed = w * h + (w * h) / 2;
@@ -142,8 +142,9 @@ pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
 
 /// Settings for the real camera.
 #[derive(Clone, Debug)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub struct CameraSettings {
+    /// Linux: the device path (/dev/video0). Windows: the camera number (0, 1, ...).
     pub device: String,
     pub width: u32,
     pub height: u32,
@@ -163,10 +164,279 @@ pub struct CameraSettings {
 #[cfg(target_os = "linux")]
 pub use v4l_camera::{V4lCamera, probe};
 
-/// Prints what a camera offers. Only available on Linux.
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub use windows_camera::{WindowsCamera, probe};
+
+/// Prints what a camera offers. Only available on Linux and Windows.
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn probe(_path: &str) -> Result<String> {
-    bail!("--probe is only available on Linux")
+    bail!("--probe is only available on Linux and Windows")
+}
+
+/// Webcams on Windows, through Media Foundation.
+#[cfg(windows)]
+mod windows_camera {
+    use super::*;
+    use nokhwa::Camera;
+    use std::sync::mpsc::{self, Receiver};
+    use nokhwa::utils::{
+        ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
+        RequestedFormat, RequestedFormatType,
+    };
+
+    const BACKEND: ApiBackend = ApiBackend::MediaFoundation;
+    const WANTED: &[FrameFormat] = &[FrameFormat::MJPEG, FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR];
+
+    /// "0", "1", ... pick a camera. Anything else (such as the Linux default
+    /// /dev/video0) means the first one.
+    fn index_of(device: &str) -> u32 {
+        device.trim().parse().unwrap_or(0)
+    }
+
+    fn open_raw(index: u32) -> Result<Camera> {
+        let request = RequestedFormat::with_formats(RequestedFormatType::None, WANTED);
+        Camera::with_backend(CameraIndex::Index(index), request, BACKEND)
+            .map_err(|e| anyhow::anyhow!("cannot open camera {index}: {e}"))
+    }
+
+    /// The formats to try, best first, as on Linux: large frames are better as
+    /// MJPEG, small ones as YUYV, which needs no decoding.
+    fn rank(format: FrameFormat, width: u32, height: u32) -> usize {
+        let large = u64::from(width) * u64::from(height) > 640 * 480;
+        let order: [FrameFormat; 5] = if large {
+            [FrameFormat::MJPEG, FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR]
+        } else {
+            [FrameFormat::YUYV, FrameFormat::MJPEG, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR]
+        };
+        order.iter().position(|f| *f == format).unwrap_or(order.len())
+    }
+
+    fn describe_formats(camera: &mut Camera) -> Vec<String> {
+        let mut formats = camera.compatible_camera_formats().unwrap_or_default();
+        formats.sort_by_key(|f| (f.format().to_string(), f.resolution().width(), f.resolution().height(), f.frame_rate()));
+        formats
+            .iter()
+            .map(|f| format!("{} {}x{} at {} fps", f.format(), f.resolution().width(), f.resolution().height(), f.frame_rate()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .fold(Vec::new(), |mut unique, line| {
+                // The same size is often listed several times, once per frame rate range.
+                if !unique.contains(&line) {
+                    unique.push(line);
+                }
+                unique
+            })
+    }
+
+    pub fn probe(device: &str) -> Result<String> {
+        let mut out = String::new();
+        let cameras = nokhwa::query(BACKEND).map_err(|e| anyhow::anyhow!("cannot list the cameras: {e}"))?;
+        out.push_str("Cameras (use --device <number>):\n");
+        if cameras.is_empty() {
+            out.push_str("  none found: is the camera plugged in, and allowed in Settings > Privacy > Camera?\n");
+        }
+        for info in &cameras {
+            out.push_str(&format!("  {}: {} ({})\n", info.index(), info.human_name(), info.description()));
+        }
+        let index = index_of(device);
+        let mut camera = open_raw(index)?;
+        out.push_str(&format!("\nCamera {index}, formats and frame sizes:\n"));
+        for line in describe_formats(&mut camera) {
+            out.push_str(&format!("  {line}\n"));
+        }
+        out.push_str("\nControls (Windows units: for exposure usually a power of two, e.g. -6 is 1/64 s):\n");
+        match camera.camera_controls() {
+            Ok(controls) => {
+                for c in controls {
+                    out.push_str(&format!("  {c}\n"));
+                }
+            }
+            Err(e) => out.push_str(&format!("  cannot list the controls: {e}\n")),
+        }
+        Ok(out)
+    }
+
+    /// The camera itself. It is not `Send`, so it lives on one thread only.
+    struct Grabber {
+        index: u32,
+        camera: Camera,
+        width: u32,
+        height: u32,
+        format: FrameFormat,
+        min_interval: Duration,
+        last: Option<Instant>,
+    }
+
+    impl Grabber {
+        fn open(settings: &CameraSettings) -> Result<Self> {
+            let index = index_of(&settings.device);
+            let mut camera = open_raw(index)?;
+            let offered = camera.compatible_camera_formats().unwrap_or_default();
+            for line in describe_formats(&mut camera) {
+                eprintln!("camera: offers {line}");
+            }
+
+            // The size asked for, then the best format and a frame rate of at most 30.
+            let mut candidates: Vec<CameraFormat> = offered
+                .into_iter()
+                .filter(|f| {
+                    f.resolution().width() == settings.width
+                        && f.resolution().height() == settings.height
+                        && WANTED.contains(&f.format())
+                })
+                .collect();
+            candidates.sort_by_key(|f| {
+                let fps = f.frame_rate();
+                (rank(f.format(), settings.width, settings.height), if fps <= 30 { 30 - fps } else { 1000 + fps })
+            });
+            let chosen = *candidates.first().with_context(|| {
+                format!(
+                    "the camera offers none of MJPEG, YUYV, NV12 or RGB at {}x{} (see the \"offers\" lines, or run --probe)",
+                    settings.width, settings.height
+                )
+            })?;
+            camera
+                .set_camera_requset(RequestedFormat::with_formats(RequestedFormatType::Exact(chosen), WANTED))
+                .map_err(|e| anyhow::anyhow!("cannot select {chosen}: {e}"))?;
+            apply_controls(&mut camera, settings);
+            camera.open_stream().map_err(|e| anyhow::anyhow!("cannot start the capture stream: {e}"))?;
+
+            let format = camera.camera_format();
+            eprintln!(
+                "camera: {index} {}x{} {} at {} fps",
+                format.resolution().width(),
+                format.resolution().height(),
+                format.format(),
+                format.frame_rate()
+            );
+            Ok(Grabber {
+                index,
+                camera,
+                width: format.resolution().width(),
+                height: format.resolution().height(),
+                format: format.format(),
+                min_interval: settings.interval,
+                last: None,
+            })
+        }
+    }
+
+    /// Best effort: a camera may not support these controls.
+    ///
+    /// Locking: a control is set to the value it has now. Media Foundation then
+    /// takes it as manual, so exposure, white balance and focus stop drifting.
+    fn apply_controls(camera: &mut Camera, settings: &CameraSettings) {
+        let wanted: [(&str, KnownCameraControl, Option<i64>); 4] = [
+            ("zoom", KnownCameraControl::Zoom, settings.zoom),
+            ("focus", KnownCameraControl::Focus, settings.focus),
+            ("white balance", KnownCameraControl::WhiteBalance, settings.white_balance),
+            ("exposure", KnownCameraControl::Exposure, settings.exposure),
+        ];
+        for (name, control, value) in wanted {
+            let setter = match value {
+                Some(v) => Some(ControlValueSetter::Integer(v)),
+                None if settings.lock_controls && control != KnownCameraControl::Zoom => {
+                    camera.camera_control(control).ok().map(|c| c.value())
+                }
+                None => None,
+            };
+            let Some(setter) = setter else { continue };
+            match camera.set_camera_control(control, setter) {
+                Ok(()) => eprintln!("camera: {name}: set"),
+                Err(e) => eprintln!("camera: {name}: not applied ({e})"),
+            }
+        }
+    }
+
+    impl Grabber {
+        fn describe(&self) -> String {
+            format!("camera {} ({}x{} {})", self.index, self.width, self.height, self.format)
+        }
+
+        fn next_frame(&mut self) -> Result<RgbImage> {
+            // The camera runs at its own pace (often 30 fps): only the frames
+            // that are due get converted.
+            loop {
+                let buffer = self.camera.frame().map_err(|e| anyhow::anyhow!("camera read failed: {e}"))?;
+                let due = self.last.is_none_or(|last| last.elapsed() >= self.min_interval);
+                if !due {
+                    continue;
+                }
+                let data = buffer.buffer();
+                let (w, h) = (self.width, self.height);
+                let image = match buffer.source_frame_format() {
+                    FrameFormat::YUYV => yuyv_to_rgb(data, w, h)?,
+                    FrameFormat::NV12 => nv12_to_rgb(data, w, h)?,
+                    FrameFormat::MJPEG => image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
+                        .context("bad MJPEG frame")?
+                        .to_rgb8(),
+                    FrameFormat::RAWRGB => RgbImage::from_raw(w, h, data.to_vec()).context("bad RGB frame size")?,
+                    FrameFormat::RAWBGR => {
+                        let mut rgb = data.to_vec();
+                        rgb.chunks_exact_mut(3).for_each(|p| p.swap(0, 2));
+                        RgbImage::from_raw(w, h, rgb).context("bad BGR frame size")?
+                    }
+                    FrameFormat::GRAY => {
+                        let rgb: Vec<u8> = data.iter().flat_map(|&g| [g, g, g]).collect();
+                        RgbImage::from_raw(w, h, rgb).context("bad gray frame size")?
+                    }
+                };
+                self.last = Some(Instant::now());
+                return Ok(image);
+            }
+        }
+    }
+
+    /// What the program uses: frames come from the thread that owns the camera.
+    /// Dropping it stops the thread and closes the camera.
+    pub struct WindowsCamera {
+        description: String,
+        frames: Receiver<Result<RgbImage>>,
+    }
+
+    impl WindowsCamera {
+        pub fn open(settings: &CameraSettings) -> Result<Self> {
+            let settings = settings.clone();
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<String>>();
+            // One frame at most is kept ahead: the camera waits for the program.
+            let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<RgbImage>>(1);
+            thread::Builder::new()
+                .name("camera".into())
+                .spawn(move || {
+                    let mut grabber = match Grabber::open(&settings) {
+                        Ok(g) => {
+                            let _ = ready_tx.send(Ok(g.describe()));
+                            g
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    loop {
+                        let frame = grabber.next_frame();
+                        let failed = frame.is_err();
+                        // The receiver is gone when the camera is closed.
+                        if frames_tx.send(frame).is_err() || failed {
+                            return;
+                        }
+                    }
+                })
+                .context("cannot start the camera thread")?;
+            let description = ready_rx.recv().context("the camera thread stopped")??;
+            Ok(WindowsCamera { description, frames: frames_rx })
+        }
+    }
+
+    impl FrameSource for WindowsCamera {
+        fn describe(&self) -> String {
+            self.description.clone()
+        }
+
+        fn next_frame(&mut self) -> Result<RgbImage> {
+            self.frames.recv().context("the camera thread stopped")?
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -463,9 +733,14 @@ fn open_camera(settings: &CameraSettings) -> Result<Box<dyn FrameSource>> {
     Ok(Box::new(V4lCamera::open(settings)?))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn open_camera(settings: &CameraSettings) -> Result<Box<dyn FrameSource>> {
+    Ok(Box::new(WindowsCamera::open(settings)?))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn open_camera(_settings: &CameraSettings) -> Result<Box<dyn FrameSource>> {
-    bail!("camera capture is only implemented on Linux; use --source demo, synthetic or an image file")
+    bail!("camera capture is only implemented on Linux and Windows; use --source demo, synthetic or an image file")
 }
 
 #[cfg(test)]

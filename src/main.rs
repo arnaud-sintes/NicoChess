@@ -3,26 +3,15 @@
 //! The program serves a web page (for phones and tablets), watches the board with
 //! a camera, works out the moves with the chess rules, and records the games.
 
-mod calibration;
-mod camera;
-mod engine;
-mod game;
-mod http;
-mod roles;
-mod server;
-mod store;
-mod synthetic;
-mod tracker;
-mod vision;
-
 use anyhow::{Result, bail};
-use calibration::Calibration;
-use camera::{CameraSettings, SourceSpec};
-use engine::{Engine, EngineConfig};
+use nicochess::calibration::Calibration;
+use nicochess::camera::{self, CameraSettings, SourceSpec};
+use nicochess::engine::{Engine, EngineConfig};
+use nicochess::store::Store;
+use nicochess::tracker::TrackerConfig;
+use nicochess::{http, server};
 use std::path::PathBuf;
 use std::time::Duration;
-use store::Store;
-use tracker::TrackerConfig;
 
 const HELP: &str = "\
 nicochess: track a chess game with a webcam
@@ -33,14 +22,14 @@ USAGE:
 OPTIONS:
     --listen <ADDR>          HTTP address                        [default: 0.0.0.0:8080]
     --source <SRC>           camera | demo | synthetic | <image.jpg>   [default: camera]
-    --device <PATH>          camera device (Linux)               [default: /dev/video0]
+    --device <X>             camera: /dev/videoN (Linux) or its number 0, 1... (Windows)  [default: /dev/video0]
     --width <N>              camera width                        [default: 640]
     --height <N>             camera height                       [default: 480]
     --fps <N>                frames per second kept              [default: 3]
     --data-dir <DIR>         where games are stored              [default: data]
     --calibration <FILE>     calibration file                    [default: calibration.json]
     --no-lock-controls       do not turn off auto exposure / white balance
-    --exposure <N>           manual exposure time (units of 100 us)
+    --exposure <N>           manual exposure (Linux: units of 100 us; Windows: the driver value, see --probe)
     --white-balance <K>      manual white balance temperature (Kelvin)
     --focus <N>              manual focus position (turns autofocus off)
     --zoom <N>               zoom level of the camera (for cameras that crop or zoom on their own)

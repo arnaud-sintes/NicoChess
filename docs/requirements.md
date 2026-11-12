@@ -92,7 +92,7 @@ The target may become a regular laptop, which has its own screen. What changes:
 
 - **Linux laptop:** nothing changes in the program. Build natively (needs `clang`, `libclang-dev` and `linux-libc-dev` for the camera bindings).
   Run `nicochess --listen 127.0.0.1:8080 --open`: the laptop's own browser opens the page and, being the first to connect, is the controller.
-- **Windows laptop:** not planned. The server, the page, the tracker and the game store already build and run on Windows (the tests run there), but camera capture only uses V4L2, so a Windows backend (Media Foundation) would have to be written first.
+- **Windows:** the server, the page, the tracker and the game store build and run on Windows, and since 2026-11-12 so does camera capture (Media Foundation, through the `nokhwa` crate, with a camera thread of its own). Tried on a PC's integrated webcam: the format list, 1280x720 MJPEG capture and the frame served by the page. Not yet tried: locking exposure and white balance, a real game.
 - `--open` opens the default browser of the computer once the server is up; use F11 there for full screen.
 - Decided (2026-11-04): if the target becomes a laptop, it runs Linux, the same distribution as the INEOS 600 (Debian). No Windows camera backend is needed. A 64-bit Debian can be a newer release than 12, since the 32-bit limit only applies to the Atom.
 

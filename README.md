@@ -69,7 +69,7 @@ Copy its content to a FAT32 key and follow `README.txt` on the target. Details i
 
 - Logitech C170 (VGA): the fallback, marginal at 640x480.
 - Yealink UVC30 Room (4K, 120°): the better candidate, not tried yet. The program accepts MJPEG, YUYV and NV12, turns autofocus off, and
-  `./nicochess --probe` (Linux) lists what a camera offers. Details and open points in [docs/target-hardware.md](docs/target-hardware.md).
+  `./nicochess --probe` (Linux and Windows) lists what a camera offers. Details and open points in [docs/target-hardware.md](docs/target-hardware.md).
 
 ## Under study
 
