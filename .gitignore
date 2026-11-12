@@ -4,3 +4,10 @@ dist/
 /data/
 /calibration.json
 /usb/
+
+# Android build
+/android/.gradle/
+/android/app/build/
+/android/app/src/main/jniLibs/
+/android/local.properties
+*.apk

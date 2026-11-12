@@ -4,12 +4,9 @@
 //! a camera, works out the moves with the chess rules, and records the games.
 
 use anyhow::{Result, bail};
-use nicochess::calibration::Calibration;
+use nicochess::app::{self, ServerOptions};
 use nicochess::camera::{self, CameraSettings, SourceSpec};
-use nicochess::engine::{Engine, EngineConfig};
-use nicochess::store::Store;
 use nicochess::tracker::TrackerConfig;
-use nicochess::{http, server};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -128,30 +125,24 @@ fn run() -> Result<()> {
         path => SourceSpec::Image(path.to_string()),
     };
 
-    let calibration = Calibration::load(&calibration_path)?;
-    match &calibration {
-        Some(_) => eprintln!("calibration: loaded {}", calibration_path.display()),
-        None => eprintln!("calibration: none yet, open the web page and use Calibrate"),
-    }
-    let store = Store::open(&data_dir)?;
-    eprintln!("games: stored in {}", data_dir.display());
-
-    let config = EngineConfig {
-        idle_timeout: Duration::from_secs(idle_secs),
-        game_timeout: Duration::from_secs(game_mins * 60),
-        tracker,
-    };
-    let engine = Engine::new(config, store, calibration_path, calibration);
-    engine.spawn_capture(camera::factory(spec, interval))?;
-
-    // Event streams each hold a connection, so leave room for ordinary requests too.
     let on_ready: Option<Box<dyn FnOnce()>> = if open {
         let url = format!("http://{}", listen.replace("0.0.0.0", "localhost"));
         Some(Box::new(move || open_browser(&url)))
     } else {
         None
     };
-    http::serve(&listen, max_viewers + 16, server::handler(engine, max_viewers), on_ready)
+    let options = ServerOptions {
+        listen,
+        source: spec,
+        frame_interval: interval,
+        data_dir,
+        calibration_path,
+        tracker,
+        idle_timeout: Duration::from_secs(idle_secs),
+        game_timeout: Duration::from_secs(game_mins * 60),
+        max_viewers,
+    };
+    app::serve(options, on_ready)
 }
 
 /// Opens an address in the default browser of this computer.

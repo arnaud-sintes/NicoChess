@@ -9,6 +9,7 @@
 //!
 //! Each platform provides its own camera as a [`camera::FrameSource`].
 
+pub mod app;
 pub mod calibration;
 pub mod camera;
 pub mod engine;
