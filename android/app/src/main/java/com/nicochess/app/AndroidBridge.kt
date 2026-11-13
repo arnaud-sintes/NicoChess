@@ -17,9 +17,22 @@ class AndroidBridge(context: Context) {
     private val app = context.applicationContext
     private val manager = app.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
+    /** The last answer of [info] and when it was made: the page asks several times a second. */
+    private var cached = ""
+    private var cachedAt = 0L
+
     /** Everything the "This phone" card shows, as JSON. */
     @JavascriptInterface
+    @Synchronized
     fun info(): String {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (cached.isNotEmpty() && now - cachedAt < CACHE_MS) return cached
+        cached = build()
+        cachedAt = now
+        return cached
+    }
+
+    private fun build(): String {
         val service = CoreService.instance
         val cameras = CameraCatalog.list(manager)
         val json = JSONObject()
@@ -62,20 +75,30 @@ class AndroidBridge(context: Context) {
     @JavascriptInterface
     fun setRemote(on: Boolean) {
         Settings.setRemote(app, on)
-        CoreService.instance?.settingsChanged()
+        changed(cameraAffected = false)
     }
 
     /** Uses the external (USB) camera instead of one of the phone (or not). */
     @JavascriptInterface
     fun setExternal(on: Boolean) {
         Settings.setExternal(app, on)
-        CoreService.instance?.settingsChanged()
+        changed(cameraAffected = true)
     }
 
     /** Chooses which camera of the phone to use, by its id. */
     @JavascriptInterface
     fun setCamera(id: String) {
         Settings.setCameraId(app, id)
-        CoreService.instance?.settingsChanged()
+        changed(cameraAffected = true)
+    }
+
+    @Synchronized
+    private fun changed(cameraAffected: Boolean) {
+        cachedAt = 0L
+        CoreService.instance?.settingsChanged(cameraAffected)
+    }
+
+    private companion object {
+        const val CACHE_MS = 1500L
     }
 }

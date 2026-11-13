@@ -2,6 +2,7 @@
 name = "nicochess-android"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "NicoChess for Android: the core library behind a JNI entry point"
 
 [lib]
@@ -12,8 +13,3 @@ crate-type = ["cdylib"]
 nicochess = { path = "../.." }
 jni = "0.21"
 libc = "0.2"
-
-[profile.release]
-lto = true
-codegen-units = 1
-strip = true

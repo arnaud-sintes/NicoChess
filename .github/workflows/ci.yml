@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # The exact compiler the Docker images use (see docker/*.Dockerfile). rust-version in Cargo.toml
+  # is the oldest one that is expected to work.
+  RUST_TOOLCHAIN: 1.98.1
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages for the V4L2 bindings
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - name: Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c rustfmt -c clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Android library (type check only: it needs the NDK to link)
+        run: cargo check --locked -p nicochess-android
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests (includes the Media Foundation camera code)
+        run: cargo test --locked

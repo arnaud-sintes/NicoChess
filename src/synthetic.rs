@@ -36,9 +36,7 @@ pub fn start_grid() -> PieceGrid {
 
 /// Where the board corners (a1, h1, h8, a8) are in the synthetic frame.
 pub fn corners() -> Calibration {
-    Calibration {
-        corners: [[120.0, 440.0], [520.0, 425.0], [470.0, 90.0], [190.0, 100.0]],
-    }
+    Calibration::new([[120.0, 440.0], [520.0, 425.0], [470.0, 90.0], [190.0, 100.0]])
 }
 
 /// The board seen from above, white at the bottom, without any margin.
@@ -47,11 +45,7 @@ pub fn board_top_down(square_px: u32, grid: &PieceGrid) -> RgbImage {
     let mut img = RgbImage::from_fn(size, size, |x, y| {
         let (col, row) = (x / square_px, y / square_px);
         // a1 (col 0, bottom row) is a dark square.
-        if (col + (7 - row)) % 2 == 0 {
-            DARK_SQUARE
-        } else {
-            LIGHT_SQUARE
-        }
+        if (col + (7 - row)) % 2 == 0 { DARK_SQUARE } else { LIGHT_SQUARE }
     });
 
     let radius = (square_px as f32 * 0.33) as i32;
@@ -74,23 +68,11 @@ pub fn frame_from_grid(grid: &PieceGrid) -> RgbImage {
     let size = (8 * square_px) as f32;
     let top_down = [(0.0, size), (size, size), (size, 0.0), (0.0, 0.0)];
     let c = corners().corners;
-    let image_points = [
-        (c[0][0], c[0][1]),
-        (c[1][0], c[1][1]),
-        (c[2][0], c[2][1]),
-        (c[3][0], c[3][1]),
-    ];
-    let projection = Projection::from_control_points(top_down, image_points)
-        .expect("synthetic corners define a valid projection");
+    let image_points = [(c[0][0], c[0][1]), (c[1][0], c[1][1]), (c[2][0], c[2][1]), (c[3][0], c[3][1])];
+    let projection = Projection::from_control_points(top_down, image_points).expect("synthetic corners define a valid projection");
 
     let mut out = RgbImage::from_pixel(WIDTH, HEIGHT, BACKGROUND);
-    warp_into(
-        &board,
-        projection,
-        Interpolation::Bilinear,
-        Border::Constant(BACKGROUND),
-        &mut out,
-    );
+    warp_into(&board, projection, Interpolation::Bilinear, Border::Constant(BACKGROUND), &mut out);
     out
 }
 
@@ -118,9 +100,8 @@ pub fn degrade(image: &mut RgbImage, brightness: i32, noise: i32, seed: u64) {
 /// 33 plies with captures, castling, checks and a checkmate. Used by the demo
 /// source and by the tests.
 pub const OPERA_GAME: [&str; 33] = [
-    "e4", "e5", "Nf3", "d6", "d4", "Bg4", "dxe5", "Bxf3", "Qxf3", "dxe5", "Bc4", "Nf6", "Qb3", "Qe7",
-    "Nc3", "c6", "Bg5", "b5", "Nxb5", "cxb5", "Bxb5+", "Nbd7", "O-O-O", "Rd8", "Rxd7", "Rxd7", "Rd1",
-    "Qe6", "Bxd7+", "Nxd7", "Qb8+", "Nxb8", "Rd8#",
+    "e4", "e5", "Nf3", "d6", "d4", "Bg4", "dxe5", "Bxf3", "Qxf3", "dxe5", "Bc4", "Nf6", "Qb3", "Qe7", "Nc3", "c6", "Bg5", "b5", "Nxb5",
+    "cxb5", "Bxb5+", "Nbd7", "O-O-O", "Rd8", "Rxd7", "Rxd7", "Rd1", "Qe6", "Bxd7+", "Nxd7", "Qb8+", "Nxb8", "Rd8#",
 ];
 
 /// One move of a scripted game, with the board before and after it.
@@ -135,11 +116,7 @@ pub fn game_steps(sans: &[&str]) -> Vec<Step> {
     let mut pos = Chess::default();
     let mut steps = Vec::new();
     for text in sans {
-        let mv = text
-            .parse::<San>()
-            .expect("valid SAN")
-            .to_move(&pos)
-            .expect("legal move");
+        let mv = text.parse::<San>().expect("valid SAN").to_move(&pos).expect("legal move");
         let before = grid_from_position(&pos);
         pos.play_unchecked(mv);
         steps.push(Step { mv, before, after: grid_from_position(&pos) });

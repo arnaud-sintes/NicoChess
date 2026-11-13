@@ -1,0 +1,3 @@
+# The code has long lines by habit (comments and messages in plain English): keep them readable.
+max_width = 140
+use_small_heuristics = "Max"

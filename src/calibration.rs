@@ -29,9 +29,24 @@ pub const BOARD_PX: u32 = 8 * SQUARE_PX + 2 * MARGIN_PX;
 pub struct Calibration {
     /// Corners a1, h1, h8, a8 in camera image pixels, as `[x, y]`.
     pub corners: [[f32; 2]; 4],
+    /// Width and height of the picture the corners were made for. A calibration made for another
+    /// size (another camera or resolution) is wrong, and the engine says so. Files from before
+    /// this field have none: the first picture received fixes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<[u32; 2]>,
 }
 
 impl Calibration {
+    /// Corners with no known picture size.
+    pub fn new(corners: [[f32; 2]; 4]) -> Self {
+        Calibration { corners, size: None }
+    }
+
+    /// Corners made for a picture of this size.
+    pub fn for_frame(corners: [[f32; 2]; 4], width: u32, height: u32) -> Self {
+        Calibration { corners, size: Some([width, height]) }
+    }
+
     /// Checks that the corners are inside the frame and form a convex quadrilateral
     /// of a reasonable size.
     pub fn validate(&self, width: u32, height: u32) -> Result<()> {
@@ -98,8 +113,7 @@ impl Calibration {
     pub fn load(path: &Path) -> Result<Option<Self>> {
         match fs::read_to_string(path) {
             Ok(text) => {
-                let cal = serde_json::from_str(&text)
-                    .with_context(|| format!("invalid calibration file {}", path.display()))?;
+                let cal = serde_json::from_str(&text).with_context(|| format!("invalid calibration file {}", path.display()))?;
                 Ok(Some(cal))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -110,27 +124,15 @@ impl Calibration {
     /// Saves the calibration, replacing the file in one step so a power loss
     /// cannot leave a half-written file.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
-        Ok(())
+        crate::fsutil::write_atomic(path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 }
 
 /// Warps the camera image to a top-down board (with a margin around it).
 pub fn warp_board(image: &RgbImage, cal: &Calibration) -> Result<RgbImage> {
-    let projection = cal
-        .projection()
-        .context("the corners do not define a valid projection")?;
+    let projection = cal.projection().context("the corners do not define a valid projection")?;
     let mut out = RgbImage::new(BOARD_PX, BOARD_PX);
-    warp_into(
-        image,
-        projection,
-        Interpolation::Bilinear,
-        Border::Constant(Rgb([0, 0, 0])),
-        &mut out,
-    );
+    warp_into(image, projection, Interpolation::Bilinear, Border::Constant(Rgb([0, 0, 0])), &mut out);
     Ok(out)
 }
 
@@ -153,9 +155,7 @@ mod tests {
 
     #[test]
     fn synthetic_corners_are_valid() {
-        synthetic::corners()
-            .validate(synthetic::WIDTH, synthetic::HEIGHT)
-            .unwrap();
+        synthetic::corners().validate(synthetic::WIDTH, synthetic::HEIGHT).unwrap();
     }
 
     #[test]
@@ -176,14 +176,10 @@ mod tests {
         reversed.corners.swap(1, 3);
         assert!(reversed.validate(640, 480).is_err());
 
-        let tiny = Calibration {
-            corners: [[100.0, 100.0], [110.0, 100.0], [110.0, 110.0], [100.0, 110.0]],
-        };
+        let tiny = Calibration::new([[100.0, 100.0], [110.0, 100.0], [110.0, 110.0], [100.0, 110.0]]);
         assert!(tiny.validate(640, 480).is_err());
 
-        let aligned = Calibration {
-            corners: [[10.0, 10.0], [20.0, 20.0], [30.0, 30.0], [40.0, 40.0]],
-        };
+        let aligned = Calibration::new([[10.0, 10.0], [20.0, 20.0], [30.0, 30.0], [40.0, 40.0]]);
         assert!(aligned.validate(640, 480).is_err());
     }
 
@@ -198,10 +194,7 @@ mod tests {
             for col in 0..8 {
                 let x = col * SQUARE_PX + SQUARE_PX / 2;
                 let y = row * SQUARE_PX + SQUARE_PX / 2;
-                let (a, b) = (
-                    warped.get_pixel(x + MARGIN_PX, y + MARGIN_PX),
-                    reference.get_pixel(x, y),
-                );
+                let (a, b) = (warped.get_pixel(x + MARGIN_PX, y + MARGIN_PX), reference.get_pixel(x, y));
                 for ch in 0..3 {
                     let diff = (a[ch] as i32 - b[ch] as i32).abs();
                     assert!(diff < 40, "square row {row} col {col}: {a:?} vs {b:?}");

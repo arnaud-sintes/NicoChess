@@ -36,7 +36,7 @@ records the game, and shows it live and in replay on a phone or tablet.
 - FR-3c. Stabilization: during a game, while the board is quiet, the board is looked for again about every 1.5 s; if it shifted by 0.04 to 0.45 of a square, the calibration moves along and the learned squares are kept. It can be switched off, and the choice is kept.
 
 ### Android app
-- AR-1. The app shows the page itself (no browser) and uses the camera of the phone by default. Nothing outside the phone can reach the page unless the owner allows it.
+- AR-1. The app shows the page itself (no browser) and uses the camera of the phone by default. The page is served on the loopback address (127.0.0.1:8080), which only the phone itself can reach (other apps on the phone included, which is why the page of the app and its bridge are not a secret from them); other devices on the network can open it only when the owner switches the remote server on (AR-2).
 - AR-2. A switch lets other devices on the network open the page (remote server), and shows the addresses. It is off by default and kept between runs.
 - AR-3. A switch uses an external USB camera, when Android lists one; the owner can also choose among the cameras of the phone. Neither can change during a game.
 - AR-4. A foreground service keeps the server and the camera running with the screen off or another app in front, with a notification and a Stop button.
@@ -103,7 +103,7 @@ The target may become a regular laptop, which has its own screen. What changes:
   Run `nicochess --listen 127.0.0.1:8080 --open`: the laptop's own browser opens the page and, being the first to connect, is the controller.
 - **Windows:** the server, the page, the tracker and the game store build and run on Windows, and since 2026-11-12 so does camera capture (Media Foundation, through the `nokhwa` crate, with a camera thread of its own). Tried on a PC's integrated webcam: the format list, 1280x720 MJPEG capture and the frame served by the page. Not yet tried: locking exposure and white balance, a real game.
 - `--open` opens the default browser of the computer once the server is up; use F11 there for full screen.
-- Decided (2026-11-04): if the target becomes a laptop, it runs Linux, the same distribution as the INEOS 600 (Debian). No Windows camera backend is needed. A 64-bit Debian can be a newer release than 12, since the 32-bit limit only applies to the Atom.
+- Decided (2026-11-04): if the target becomes a laptop, it runs Linux, the same distribution as the INEOS 600 (Debian). This was later overtaken: the Windows camera backend exists (2026-11-12) and a Windows package is built (`scriptspackage-windows.ps1`), so a Windows laptop works too. A 64-bit Debian can be a newer release than 12, since the 32-bit limit only applies to the Atom.
 
 ### Engine analysis with Stockfish
 
@@ -129,11 +129,11 @@ A user asked whether Stockfish could run on the target for game analysis. It is 
 2. PGN time comment: confirm that `[%emt]` imports correctly in Lichess and chess.com with a real import.
 3. The controller role lifetime (kept for the whole game, 60 seconds idle outside a game, 30 minutes of silence ends a game's hold) is implemented as proposed. The owner has not confirmed it yet.
 
-## Implementation status (2026-11-04)
+## Implementation status (updated 2026-11-13)
 
 All of the requirements above are implemented and tested on a PC with a synthetic camera, including a whole game
 recorded from the demo camera to a PGN, and the 32-bit Linux build running in a Debian 12 i386 container.
-Not verified on the real thing: the webcam itself (formats, exposure lock, detection quality) and the INEOS 600.
+Not verified on the real thing: detection quality on a real board with any camera, the C170 and the Yealink, the INEOS 600, and the Android app on a phone.
 
 | Step | Status |
 |---|---|
@@ -144,9 +144,14 @@ Not verified on the real thing: the webcam itself (formats, exposure lock, detec
 | 5. Interface | Done: live, calibration, games, replay, corrections |
 | 6. Roles, names, results | Done |
 | 7. Tuning on the target | To do. Tuning flags exist: `--stable-frames`, `--motion-threshold`, `--max-cost`, `--margin` |
+| 8. Windows camera and Windows package | Done (2026-11-12 and 2026-11-13). Webcam tried on a PC; a real game not yet |
+| 9. Picture settings, auto-detect of the board, stabilization (FR-3a to FR-3c) | Done, tested on synthetic pictures and, for the auto-detect, on a few photos of real boards. Not yet on a real game |
+| 10. Android app: phone camera, remote server switch, camera choice, foreground service (AR-1 to AR-4) | Built and compiled. Not yet run on a phone |
 
 Known limits:
-- A game that was running when the power went off stays in the list as "in progress" and is not resumed.
+- A game that was running when the power went off (or the program was stopped) is found at start and kept in the Idle state; the page offers **Resume** (the camera is opened and the squares are learned again from the position reached) or **Close it** (the game is ended as unfinished). The moves are on disk as they are recorded.
 - Promotion is guessed as a queen, and the page offers the other pieces.
-- Detection assumes a still camera. After moving it, calibrate again (the squares are learned again from the current position).
+- Detection assumes a still camera. A small shift during a game (a knock, a phone slipping on its stand) is followed by the stabilization (FR-3c); after a larger move, calibrate again (the squares are learned again from the current position).
+- Repetition and the 50-move rule are not detected: the game ends by checkmate, stalemate or insufficient material, or by a button.
+- Two moves made between two still pictures (an instant reply) match no single legal move: the page stays unsure until the moves are entered by hand.
 - The warp keeps a 25 pixel margin around the board for the future "captured pieces" idea; nothing uses it yet.

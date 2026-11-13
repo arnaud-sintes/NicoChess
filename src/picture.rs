@@ -135,8 +135,7 @@ impl Picture {
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(text) => {
-                let picture: Picture =
-                    serde_json::from_str(&text).with_context(|| format!("invalid picture file {}", path.display()))?;
+                let picture: Picture = serde_json::from_str(&text).with_context(|| format!("invalid picture file {}", path.display()))?;
                 picture.validate()?;
                 Ok(picture)
             }
@@ -147,9 +146,7 @@ impl Picture {
 
     /// Saves the settings, replacing the file in one step.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?).with_context(|| format!("cannot write {}", tmp.display()))?;
-        fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+        crate::fsutil::write_atomic(path, serde_json::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
 }
@@ -208,9 +205,8 @@ mod tests {
                 // Pixel (x, y) of the picture became pixel (h - 1 - y, x): the points are
                 // positions of pixel corners, so allow for that offset of one.
                 let (x, y) = (p[0] as u32, p[1] as u32);
-                let hit = (x.saturating_sub(1)..=x.min(w - 1)).any(|cx| {
-                    (y.saturating_sub(1)..=y.min(h - 1)).any(|cy| turned.get_pixel(cx, cy).0 == [255, 255, 255])
-                });
+                let hit = (x.saturating_sub(1)..=x.min(w - 1))
+                    .any(|cx| (y.saturating_sub(1)..=y.min(h - 1)).any(|cy| turned.get_pixel(cx, cy).0 == [255, 255, 255]));
                 assert!(hit, "turns {turns}: {p:?} does not land on a marked pixel");
             }
         }

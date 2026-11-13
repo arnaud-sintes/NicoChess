@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.Process
 import android.util.Log
 import java.net.Inet4Address
@@ -36,6 +37,8 @@ class CoreService : Service() {
 
     @Volatile
     private var serverUp = false
+
+    private var wakeLock: PowerManager.WakeLock? = null
 
     /** Why the server for other devices could not be opened, or "". */
     @Volatile
@@ -79,6 +82,7 @@ class CoreService : Service() {
     override fun onDestroy() {
         main.removeCallbacks(poll)
         camera.close()
+        syncWakeLock()
         worker.shutdown()
         instance = null
         super.onDestroy()
@@ -119,12 +123,16 @@ class CoreService : Service() {
         }
     }
 
-    /** The owner changed a setting: take it into account now. Any thread. */
-    fun settingsChanged() {
+    /**
+     * The owner changed a setting: take it into account now. Any thread. Only a change of camera
+     * restarts the camera (it is opened again with the new choice by the next poll): the picture
+     * must not be disturbed by the other settings, in the middle of a game.
+     */
+    fun settingsChanged(cameraAffected: Boolean) {
         main.post {
-            // The camera is opened again with the new choice by the next poll.
-            camera.close()
+            if (cameraAffected) camera.close()
             if (serverUp) applyRemote()
+            syncWakeLock()
         }
     }
 
@@ -133,13 +141,24 @@ class CoreService : Service() {
         if (!serverUp) return
         if (!NativeCore.cameraWanted()) {
             camera.close()
-            return
-        }
-        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+        } else if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             camera.open()
         } else {
             NativeCore.cameraFailed("Camera permission needed: allow it in the settings of the app")
         }
+        syncWakeLock()
+    }
+
+    /**
+     * With the screen off the processor may go to sleep and the pictures stop: keep it awake
+     * for as long as the camera is open, and not longer.
+     */
+    private fun syncWakeLock() {
+        val lock = wakeLock ?: (getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nicochess:camera")
+            .also { it.setReferenceCounted(false); wakeLock = it })
+        if (camera.active && !lock.isHeld) lock.acquire()
+        if (!camera.active && lock.isHeld) lock.release()
     }
 
     // ---- Notification -----------------------------------------------------------------

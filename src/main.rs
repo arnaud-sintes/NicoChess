@@ -73,9 +73,7 @@ fn run() -> Result<()> {
     let height: u32 = args.opt_value_from_str("--height")?.unwrap_or(480);
     let fps: f32 = args.opt_value_from_str("--fps")?.unwrap_or(3.0);
     let data_dir: PathBuf = args.opt_value_from_str("--data-dir")?.unwrap_or_else(|| PathBuf::from("data"));
-    let calibration_path: PathBuf = args
-        .opt_value_from_str("--calibration")?
-        .unwrap_or_else(|| PathBuf::from("calibration.json"));
+    let calibration_path: PathBuf = args.opt_value_from_str("--calibration")?.unwrap_or_else(|| PathBuf::from("calibration.json"));
     let lock_controls = !args.contains("--no-lock-controls");
     let exposure: Option<i64> = args.opt_value_from_str("--exposure")?;
     let white_balance: Option<i64> = args.opt_value_from_str("--white-balance")?;
@@ -113,17 +111,9 @@ fn run() -> Result<()> {
     let interval = Duration::from_secs_f32(1.0 / fps);
 
     let spec = match source.as_str() {
-        "camera" => SourceSpec::Camera(CameraSettings {
-            device,
-            width,
-            height,
-            interval,
-            lock_controls,
-            exposure,
-            white_balance,
-            focus,
-            zoom,
-        }),
+        "camera" => {
+            SourceSpec::Camera(CameraSettings { device, width, height, interval, lock_controls, exposure, white_balance, focus, zoom })
+        }
         "demo" => SourceSpec::Demo { move_interval: Duration::from_secs_f32(demo_secs) },
         "synthetic" => SourceSpec::Synthetic,
         path => SourceSpec::Image(path.to_string()),

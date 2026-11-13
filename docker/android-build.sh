@@ -15,7 +15,7 @@ tar --exclude=./.git --exclude=./target --exclude=./dist --exclude=./downloads -
 cd /work/android/native
 targets=()
 for abi in $ABIS; do targets+=(-t "$abi"); done
-cargo ndk --platform 24 "${targets[@]}" -o /work/android/app/src/main/jniLibs build --release
+cargo ndk --platform 24 "${targets[@]}" -o /work/android/app/src/main/jniLibs build --release --locked
 
 cd /work/android
 gradle --no-daemon --console=plain assembleDebug

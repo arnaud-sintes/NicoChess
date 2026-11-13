@@ -44,7 +44,7 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
   .muted { color: var(--muted); }
   .small { font-size: .85rem; }
-  select { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line, #ccc); background: var(--card, #fff); color: var(--fg); max-width: 100%; }
+  select { max-width: 100%; }
   label.check { display: flex; gap: 8px; align-items: center; color: var(--fg); margin: 6px 0 2px; }
   .status { margin: 8px 0; min-height: 1.4em; }
   .status.unsure { color: var(--warn); }
@@ -134,6 +134,11 @@
         <h2>Moves</h2>
         <div class="muted" id="game-names"></div>
         <div class="scroll"><table class="moves" id="live-moves"></table></div>
+        <div class="bar" id="unfinished" hidden>
+          <span>An unfinished game was found.</span>
+          <button class="primary" id="resume" title="Set the pieces as in the position shown, then press">Resume</button>
+          <button id="close-unfinished" title="Keep the game as it is, with no result">Close it</button>
+        </div>
         <div class="bar" id="game-over" hidden>
           <strong id="game-result"></strong><a id="game-pgn" href="#" download>Download PGN</a>
         </div>
@@ -271,6 +276,7 @@ const token = fromAddress || stored('nicochess-token', makeToken);
 const $ = id => document.getElementById(id);
 let S = null;                       // latest state from the server
 let tab = 'live';
+let lastGamesSignature = '';
 
 let lastApiError = '';
 async function api(method, path, body) {
@@ -314,13 +320,6 @@ function drawBoard(svg, fen, uci) {
   const marked = new Set();
   if (uci && uci.length >= 4) { marked.add(uci.slice(0, 2)); marked.add(uci.slice(2, 4)); }
   let out = '<rect x="0" y="0" width="80" height="80" fill="var(--sq-dark)"/>';
-  for (let r = 0; r < 8; r++) {
-    let f = 0;
-    for (const ch of rows[r] || '') {
-      if (/\d/.test(ch)) { f += +ch; continue; }
-      f++;
-    }
-  }
   for (let r = 0; r < 8; r++) {
     for (let f = 0; f < 8; f++) {
       const name = 'abcdefgh'[f] + (8 - r);
@@ -406,7 +405,10 @@ function render() {
 
   renderLive(ctl);
   renderCalibrate(ctl);
-  if (tab === 'games') refreshGamesSoon();
+  // The list of games is read from the disk: ask for it again only when a game changed.
+  const gamesSignature = S.game ? S.game.id + ':' + S.game.moves.length + ':' + (S.game.result || '') : '';
+  if (tab === 'games' && gamesSignature !== lastGamesSignature) refreshGamesSoon();
+  lastGamesSignature = gamesSignature;
 }
 
 function renderLive(ctl) {
@@ -430,6 +432,7 @@ function renderLive(ctl) {
   drawMoves($('live-moves'), g.moves, g.start_fen, g.moves.length, false);
 
   const over = g.over;
+  $('unfinished').hidden = !(ctl && !playing && !g.result);
   $('game-over').hidden = !g.result;
   if (g.result) {
     $('game-result').textContent = g.result + (g.termination ? ' (' + g.termination + ')' : '');
@@ -473,6 +476,8 @@ $('start').onclick = async () => {
   });
 };
 $('to-calibrate').onclick = () => showTab('calibrate');
+$('resume').onclick = () => confirm('Set the pieces as they are in the position shown, then resume the game. Resume now?') && api('POST', '/api/game/resume');
+$('close-unfinished').onclick = () => confirm('Close this game as it is? It is kept, with no result.') && api('POST', '/api/game/end', { result: '*', reason: 'abandoned' });
 $('send-move').onclick = async () => {
   const text = $('move').value.trim(); if (!text) return;
   if (await api('POST', '/api/game/move', { move: text })) $('move').value = '';
@@ -529,7 +534,7 @@ function renderCalibrate(ctl) {
   $('warp-card').hidden = !(cameraOn && S.calibration);
   $('picture-card').hidden = !(cameraOn && ctl && S.mode !== 'playing');
   showPicture();
-  andRender();
+  if (tab === 'calibrate') andRender();
   if (!cameraOn) { clicks = []; calNote = null; }
   if (cameraOn && ctl && !clicks.length && calNote) {
     $('cal-msg').className = 'status' + (calNote.bad ? ' unsure' : '');
@@ -563,6 +568,8 @@ function drawOverlay() {
 
 live.addEventListener('click', async ev => {
   if (!live.naturalWidth) return;
+  if (S && S.mode === 'playing' && !clicks.length &&
+      !confirm('A game is being recorded. Calibrating again makes the squares be learned again from the position now. Continue?')) return;
   calNote = null;
   if (clicks.length === 4 || (S && S.calibration && !clicks.length)) clicks = [];
   const r = live.getBoundingClientRect();
@@ -789,10 +796,16 @@ $('white').value = stored('nicochess-white') || '';
 $('black').value = stored('nicochess-black') || '';
 drawBoard($('live-board'), null);
 
+let retryTimer = null;
 function connect() {
   const source = new EventSource('/api/events?token=' + token);
   source.addEventListener('state', e => { $('offline').hidden = true; apply(JSON.parse(e.data)); });
-  source.onerror = () => { $('offline').hidden = false; };
+  source.onerror = () => {
+    $('offline').hidden = false;
+    // The browser retries by itself, except after a refusal (too many pages open) or a server that
+    // answered with an error: then the stream is closed for good, so open it again later.
+    if (source.readyState === EventSource.CLOSED) { clearTimeout(retryTimer); retryTimer = setTimeout(connect, 3000); }
+  };
 }
 // Address shortcuts, separated by commas: games, calibrate, replay=ID (a link to a game),
 // token=... (see above) and poll (refresh by polling instead of events).

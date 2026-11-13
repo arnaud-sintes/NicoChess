@@ -2,6 +2,14 @@
 name = "nicochess"
 version = "0.1.0"
 edition = "2024"
+# The oldest compiler that builds it (let-chains, slice::as_chunks). The Docker images pin an exact one.
+rust-version = "1.88"
+
+# One lock file for the program and the Android library. A plain `cargo build` or `cargo test` at the
+# root only touches the program; the Android crate needs the NDK and does not build on a PC.
+[workspace]
+members = ["android/native"]
+default-members = ["."]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -12,6 +20,7 @@ pico-args = "0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 shakmaty = "0.30.2"
+socket2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { version = "0.14.0", default-features = false, features = ["v4l2"] }

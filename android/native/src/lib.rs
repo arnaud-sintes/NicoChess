@@ -43,12 +43,11 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_start<'l>(
     listen: JString<'l>,
     source: JString<'l>,
 ) -> jstring {
-    let mut read = |s: &JString<'l>| -> Result<String, String> {
-        env.get_string(s).map(String::from).map_err(|e| e.to_string())
-    };
+    let mut read = |s: &JString<'l>| -> Result<String, String> { env.get_string(s).map(String::from).map_err(|e| e.to_string()) };
     let result = match (read(&data_dir), read(&listen), read(&source)) {
-        (Ok(d), Ok(l), Ok(s)) => std::panic::catch_unwind(|| start(d, l, s))
-            .unwrap_or_else(|_| Err("the native code panicked".to_string())),
+        (Ok(d), Ok(l), Ok(s)) => {
+            std::panic::catch_unwind(|| start(d, l, s)).unwrap_or_else(|_| Err("the native code panicked".to_string()))
+        }
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
     };
     let message = result.err().unwrap_or_default();
@@ -64,13 +63,9 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_cameraWanted<'l>(_env: 
 
 /// `void NativeCore.cameraFailed(String message)`: the app could not open its camera.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_nicochess_app_NativeCore_cameraFailed<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-    message: JString<'l>,
-) {
+pub extern "system" fn Java_com_nicochess_app_NativeCore_cameraFailed<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, message: JString<'l>) {
     let text = env.get_string(&message).map(String::from).unwrap_or_else(|_| "the camera failed".to_string());
-    inbox().fail(text);
+    let _ = std::panic::catch_unwind(|| inbox().fail(text));
 }
 
 /// `String NativeCore.setRemote(boolean enabled, int port)`: opens (or closes) the listener on all
@@ -82,8 +77,8 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_setRemote<'l>(
     enabled: jboolean,
     port: jint,
 ) -> jstring {
-    let result = std::panic::catch_unwind(|| set_remote(enabled != 0, port))
-        .unwrap_or_else(|_| Err("the native code panicked".to_string()));
+    let result =
+        std::panic::catch_unwind(|| set_remote(enabled != 0, port)).unwrap_or_else(|_| Err("the native code panicked".to_string()));
     env.new_string(result.err().unwrap_or_default()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
@@ -153,9 +148,12 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_pushFrame<'l>(
         inbox().fail("the camera gave a picture with a negative size or stride");
         return;
     };
-    match yuv420_to_rgb(width, height, y, y_stride, u, v, uv_stride, uv_pixel_stride) {
-        Ok(image) => inbox().push(image),
-        Err(e) => inbox().fail(format!("{e:#}")),
+    // A panic must not cross into the JVM (it would abort the app); one bad picture is skipped, not
+    // fatal: the next one is probably fine, and failing would close and reopen the camera.
+    match std::panic::catch_unwind(|| yuv420_to_rgb(width, height, y, y_stride, u, v, uv_stride, uv_pixel_stride)) {
+        Ok(Ok(image)) => inbox().push(image),
+        Ok(Err(e)) => eprintln!("camera: a picture was skipped: {e:#}"),
+        Err(_) => eprintln!("camera: a picture was skipped (internal error)"),
     }
 }
 
@@ -191,6 +189,14 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
             game_timeout: Duration::from_secs(30 * 60),
             max_viewers: 8,
         };
+        // Take the port first: if it is not free, nothing else has been built yet.
+        let listener = match http::bind_first(&[options.listen.clone()]) {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
         let built = match app::build(options) {
             Ok(built) => built,
             Err(e) => {
@@ -202,7 +208,7 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
         let ready: Box<dyn FnOnce()> = Box::new(move || {
             let _ = ready_tx.send(Ok(()));
         });
-        if let Err(e) = http::serve(&built.listen, built.max_connections, built.handler, Some(ready)) {
+        if let Err(e) = http::serve_on(listener, built.max_connections, built.handler, Some(ready)) {
             eprintln!("server stopped: {e:#}");
             let _ = tx.send(Err(format!("{e:#}")));
         }

@@ -19,9 +19,35 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Locks that go on working after a thread panicked while holding them: the state they guard is
+/// plain data, and one failed picture must not make every later request fail too.
+trait Recover<T> {
+    fn grab(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> Recover<T> for Mutex<T> {
+    fn grab(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+trait RecoverRw<T> {
+    fn read_ok(&self) -> RwLockReadGuard<'_, T>;
+    fn write_ok(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RecoverRw<T> for RwLock<T> {
+    fn read_ok(&self) -> RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn write_ok(&self) -> RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// A calibration page left open for longer than this closes itself.
 const CALIBRATION_LIMIT: Duration = Duration::from_secs(10 * 60);
@@ -32,6 +58,14 @@ const FOLLOW_EVERY: Duration = Duration::from_millis(1500);
 /// A shift smaller than this (in squares) is noise; one larger than this is not the same board.
 const FOLLOW_MIN_SHIFT: f32 = 0.04;
 const FOLLOW_MAX_SHIFT: f32 = 0.45;
+/// Over a whole game the calibration may not move further than this (in squares) from where it began.
+const FOLLOW_MAX_DRIFT: f32 = 1.0;
+/// The moved calibration is written to disk at most this often.
+const FOLLOW_SAVE_EVERY: Duration = Duration::from_secs(10);
+
+/// Shown when the picture has another size than the one the board was calibrated on.
+const SIZE_NOTICE: &str =
+    "The camera picture is not the size it had when the board was calibrated (another camera or resolution): calibrate again.";
 
 /// Microseconds the last preview JPEG took to make (for the speed figures on the page).
 static ENCODE_US: AtomicU32 = AtomicU32::new(0);
@@ -66,6 +100,8 @@ pub enum ApiError {
     BadRequest(String),
     /// The request is fine but not possible right now.
     Conflict(String),
+    /// Something failed on this side (a file could not be written, for example).
+    Internal(String),
 }
 
 impl ApiError {
@@ -74,13 +110,14 @@ impl ApiError {
             ApiError::Forbidden => 403,
             ApiError::BadRequest(_) => 400,
             ApiError::Conflict(_) => 409,
+            ApiError::Internal(_) => 500,
         }
     }
 
     pub fn message(&self) -> String {
         match self {
             ApiError::Forbidden => "only the controller can do that".to_string(),
-            ApiError::BadRequest(m) | ApiError::Conflict(m) => m.clone(),
+            ApiError::BadRequest(m) | ApiError::Conflict(m) | ApiError::Internal(m) => m.clone(),
         }
     }
 }
@@ -88,6 +125,13 @@ impl ApiError {
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
         ApiError::BadRequest(format!("{e:#}"))
+    }
+}
+
+impl ApiError {
+    /// For a failure that is not the caller's fault: files, disk.
+    pub fn internal(e: anyhow::Error) -> Self {
+        ApiError::Internal(format!("{e:#}"))
     }
 }
 
@@ -161,13 +205,13 @@ struct Hub {
 impl Hub {
     fn subscribe(&self) -> Receiver<()> {
         let (tx, rx) = channel();
-        self.subscribers.lock().unwrap().push(tx);
+        self.subscribers.grab().push(tx);
         rx
     }
 
     fn notify(&self) {
         // A page that has gone away has dropped its receiver: forget it.
-        self.subscribers.lock().unwrap().retain(|tx| tx.send(()).is_ok());
+        self.subscribers.grab().retain(|tx| tx.send(()).is_ok());
     }
 }
 
@@ -215,6 +259,11 @@ struct Inner {
     last_follow: Option<Instant>,
     follow_count: u32,
     follow_shift: f32,
+    /// How often the board is looked for: slower on a machine where looking takes long.
+    follow_every: Duration,
+    /// The calibration when following began: the board may not drift further than a square from it.
+    follow_anchor: Option<Calibration>,
+    last_follow_save: Option<Instant>,
 }
 
 /// Speed figures of the camera pipeline, smoothed.
@@ -245,7 +294,7 @@ pub struct Engine {
 }
 
 /// Picture streams allowed at once (two per page: the camera and the top-down board).
-const MAX_FRAME_STREAMS: usize = 8;
+const MAX_FRAME_STREAMS: usize = 16;
 
 #[derive(Debug, Default)]
 pub struct StartRequest {
@@ -260,6 +309,13 @@ impl Engine {
         let mut tracker = Tracker::new(config.tracker);
         tracker.set_calibration(calibration.as_ref());
         let picture_path = calibration_path.with_file_name("picture.json");
+        let unfinished = store.latest_unfinished().unwrap_or_else(|e| {
+            eprintln!("store: {e:#}");
+            None
+        });
+        if let Some(game) = &unfinished {
+            eprintln!("game: {} was not finished; it can be resumed or closed from the page", game.id);
+        }
         let picture = Picture::load(&picture_path).unwrap_or_else(|e| {
             eprintln!("picture: {e:#}; using the defaults");
             Picture::default()
@@ -269,7 +325,7 @@ impl Engine {
                 roles: Roles::new(config.idle_timeout, config.game_timeout),
                 mode: Mode::Idle,
                 calibrating_since: None,
-                game: None,
+                game: unfinished,
                 game_started: None,
                 tracker,
                 calibration,
@@ -283,6 +339,9 @@ impl Engine {
                 last_follow: None,
                 follow_count: 0,
                 follow_shift: 0.0,
+                follow_every: FOLLOW_EVERY,
+                follow_anchor: None,
+                last_follow_save: None,
             }),
             frame: RwLock::new(None),
             camera_wanted: Mutex::new(false),
@@ -307,18 +366,15 @@ impl Engine {
     /// needs it and closed when nobody does.
     pub fn spawn_capture(self: &Arc<Self>, factory: SourceFactory) -> std::io::Result<()> {
         let engine = Arc::clone(self);
-        thread::Builder::new()
-            .name("capture".into())
-            .spawn(move || engine.capture_loop(factory))
-            .map(|_| ())
+        thread::Builder::new().name("capture".into()).spawn(move || engine.capture_loop(factory)).map(|_| ())
     }
 
     fn capture_loop(&self, factory: SourceFactory) {
         loop {
             {
-                let mut wanted = self.camera_wanted.lock().unwrap();
+                let mut wanted = self.camera_wanted.grab();
                 while !*wanted {
-                    wanted = self.camera_cv.wait(wanted).unwrap();
+                    wanted = self.camera_cv.wait(wanted).unwrap_or_else(PoisonError::into_inner);
                 }
             }
             match factory() {
@@ -329,7 +385,11 @@ impl Engine {
                             source.restart();
                         }
                         match source.next_frame() {
-                            Ok(image) => self.on_frame(image),
+                            Ok(image) => {
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.on_frame(image))).is_err() {
+                                    eprintln!("camera: a picture could not be processed (internal error); going on");
+                                }
+                            }
                             Err(e) => {
                                 self.camera_failed(format!("{e:#}"));
                                 break;
@@ -340,7 +400,7 @@ impl Engine {
                 }
                 Err(e) => self.camera_failed(format!("{e:#}")),
             }
-            *self.frame.write().unwrap() = None;
+            *self.frame.write_ok() = None;
             self.set_source(String::new());
             if self.camera_is_wanted() {
                 thread::sleep(CAMERA_RETRY);
@@ -349,46 +409,75 @@ impl Engine {
     }
 
     fn camera_is_wanted(&self) -> bool {
-        *self.camera_wanted.lock().unwrap()
+        *self.camera_wanted.grab()
     }
 
     fn set_camera(&self, wanted: bool) {
-        *self.camera_wanted.lock().unwrap() = wanted;
+        *self.camera_wanted.grab() = wanted;
         self.camera_cv.notify_all();
     }
 
+    /// Back to idle: nothing is recorded or calibrated, and the camera is released.
+    fn go_idle(&self, inner: &mut Inner) {
+        inner.mode = Mode::Idle;
+        inner.calibrating_since = None;
+        self.set_camera(false);
+    }
+
     fn set_source(&self, description: String) {
-        self.inner.lock().unwrap().source = description;
+        self.inner.grab().source = description;
         self.hub.notify();
     }
 
     fn camera_failed(&self, message: String) {
         eprintln!("camera: {message}");
-        self.inner.lock().unwrap().camera_error = Some(message);
+        self.inner.grab().camera_error = Some(message);
         self.hub.notify();
     }
 
     /// Handles one camera frame.
     fn on_frame(&self, image: RgbImage) {
         let started = Instant::now();
-        let seq = self.frame.read().unwrap().as_ref().map_or(1, |l| l.seq + 1);
-        let picture = self.inner.lock().unwrap().picture;
+        let seq = self.frame.read_ok().as_ref().map_or(1, |l| l.seq + 1);
+        let picture = self.inner.grab().picture;
         let raw = picture.rotate(image);
         let adjusted = picture.adjust(&raw);
         let latest = Arc::new(Latest::new(raw, adjusted, seq));
-        *self.frame.write().unwrap() = Some(Arc::clone(&latest));
+        *self.frame.write_ok() = Some(Arc::clone(&latest));
         {
-            *self.frame_count.lock().unwrap() += 1;
+            *self.frame_count.grab() += 1;
             self.frame_cv.notify_all();
         }
 
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.grab();
         let inner = &mut *guard;
         let mut changed = inner.camera_error.take().is_some();
+        // Time-based clean-up also runs with no page open (the camera must not stay on for ever).
+        self.housekeeping(inner, now);
+
+        // A calibration is only good for the picture size it was made for.
+        let size = [latest.image.width(), latest.image.height()];
+        let mut size_ok = true;
+        if let Some(calibration) = inner.calibration.as_mut() {
+            match calibration.size {
+                None => calibration.size = Some(size),
+                Some(known) if known != size => size_ok = false,
+                Some(_) => {}
+            }
+        }
+        if !size_ok {
+            if inner.notice.as_deref() != Some(SIZE_NOTICE) {
+                inner.notice = Some(SIZE_NOTICE.to_string());
+                changed = true;
+            }
+        } else if inner.notice.as_deref() == Some(SIZE_NOTICE) {
+            inner.notice = None;
+            changed = true;
+        }
 
         let feed_due = inner.last_feed.is_none_or(|t| now.duration_since(t) >= self.track_interval);
-        if inner.mode == Mode::Playing && feed_due {
+        if inner.mode == Mode::Playing && feed_due && size_ok {
             inner.last_feed = Some(now);
             match inner.tracker.feed(&latest.image, now) {
                 Detection::Nothing => {
@@ -398,8 +487,11 @@ impl Engine {
                     }
                 }
                 Detection::Unsure { candidates } => {
-                    inner.candidates = candidates;
-                    changed = true;
+                    // Tell the pages only when the list changed: this comes at every picture while unsure.
+                    if !inner.candidates.iter().map(|c| &c.uci).eq(candidates.iter().map(|c| &c.uci)) {
+                        inner.candidates = candidates;
+                        changed = true;
+                    }
                 }
                 Detection::Move { mv, since, promotion_guess } => {
                     inner.candidates.clear();
@@ -424,7 +516,7 @@ impl Engine {
     /// Keeps the figures shown under the camera picture: pictures per second, and the time
     /// one picture takes here.
     fn note_speed(&self, started: Instant) {
-        let mut stats = self.stats.lock().unwrap();
+        let mut stats = self.stats.grab();
         let smooth = |old: f32, new: f32| if old == 0.0 { new } else { 0.8 * old + 0.2 * new };
         if let Some(last) = stats.last_frame {
             stats.interval_ms = smooth(stats.interval_ms, started.duration_since(last).as_secs_f32() * 1000.0);
@@ -435,7 +527,7 @@ impl Engine {
 
     /// Pictures per second and milliseconds per picture, for the page.
     pub fn camera_stats(&self) -> Value {
-        let stats = self.stats.lock().unwrap();
+        let stats = self.stats.grab();
         let fps = match stats.last_frame {
             Some(last) if last.elapsed() < Duration::from_secs(3) && stats.interval_ms > 0.0 => 1000.0 / stats.interval_ms,
             _ => 0.0,
@@ -452,12 +544,13 @@ impl Engine {
     /// the board has shifted a little (a knock, a phone slipping on its stand), the calibration
     /// moves with it, so the squares stay where the detection looks for them.
     fn follow_board(&self, latest: &Latest, now: Instant) {
+        let size = [latest.image.width(), latest.image.height()];
         let calibration = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.grab();
             if inner.mode != Mode::Playing || !inner.picture.follow {
                 return;
             }
-            if inner.last_follow.is_some_and(|t| now.duration_since(t) < FOLLOW_EVERY) {
+            if inner.last_follow.is_some_and(|t| now.duration_since(t) < inner.follow_every) {
                 return;
             }
             // Only while the board is quiet: no hand, no move being made.
@@ -466,22 +559,30 @@ impl Engine {
             }
             inner.last_follow = Some(now);
             match inner.calibration {
-                Some(c) => c,
-                None => return,
+                Some(c) if c.size.is_none_or(|known| known == size) => c,
+                _ => return,
             }
         };
-        // The search runs without the lock: it takes a few tens of milliseconds.
-        let Ok(found) = boarddetect::refine(&latest.image, &calibration) else { return };
-        let moved = Calibration { corners: found.corners };
+        // The search runs without the lock: it takes a few tens of milliseconds on a PC, more on
+        // a small machine, which then looks less often (never more than 1/20th of the time).
+        let started = Instant::now();
+        let found = boarddetect::refine(&latest.image, &calibration);
+        let spent = started.elapsed();
+        let mut inner = self.inner.grab();
+        inner.follow_every = FOLLOW_EVERY.max(spent * 20);
+        let Ok(found) = found else { return };
+        let moved = Calibration::for_frame(found.corners, size[0], size[1]);
         let shift = boarddetect::shift_in_squares(&calibration, &moved);
-        if !(FOLLOW_MIN_SHIFT..=FOLLOW_MAX_SHIFT).contains(&shift)
-            || moved.validate(latest.image.width(), latest.image.height()).is_err()
-        {
+        if !(FOLLOW_MIN_SHIFT..=FOLLOW_MAX_SHIFT).contains(&shift) || moved.validate(size[0], size[1]).is_err() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
         // Things may have changed while looking.
         if inner.mode != Mode::Playing || inner.calibration != Some(calibration) {
+            return;
+        }
+        let anchor = *inner.follow_anchor.get_or_insert(calibration);
+        if boarddetect::shift_in_squares(&anchor, &moved) > FOLLOW_MAX_DRIFT {
+            eprintln!("follow: the board is more than a square from where the game began; not following (calibrate again)");
             return;
         }
         match inner.tracker.status() {
@@ -491,8 +592,11 @@ impl Engine {
             _ => return,
         }
         inner.calibration = Some(moved);
-        if let Err(e) = moved.save(&self.calibration_path) {
-            eprintln!("calibration: cannot save the moved board: {e:#}");
+        if inner.last_follow_save.is_none_or(|t| now.duration_since(t) >= FOLLOW_SAVE_EVERY) {
+            inner.last_follow_save = Some(now);
+            if let Err(e) = moved.save(&self.calibration_path) {
+                eprintln!("calibration: cannot save the moved board: {e:#}");
+            }
         }
         inner.follow_count += 1;
         inner.follow_shift = shift;
@@ -521,18 +625,20 @@ impl Engine {
     /// Saves the game and ends it if the rules say so.
     fn after_game_change(&self, inner: &mut Inner) {
         let Some(game) = inner.game.as_mut() else { return };
+        let mut warning = None;
         match game.rules_outcome() {
             Ok(Some((result, reason))) => {
                 game.finish(&result, &reason);
                 eprintln!("game: over, {result} ({reason})");
-                inner.mode = Mode::Idle;
-                inner.calibrating_since = None;
-                self.set_camera(false);
+                self.go_idle(inner);
             }
             Ok(None) => {}
-            Err(e) => inner.notice = Some(format!("{e:#}")),
+            Err(e) => warning = Some(format!("{e:#}")),
         }
         self.save(inner);
+        if warning.is_some() {
+            inner.notice = warning;
+        }
     }
 
     fn save(&self, inner: &mut Inner) {
@@ -550,7 +656,7 @@ impl Engine {
     // ---- Frames -------------------------------------------------------------
 
     pub fn latest_frame(&self) -> Option<Arc<Latest>> {
-        self.frame.read().unwrap().clone()
+        self.frame.read_ok().clone()
     }
 
     /// Registers an open picture stream. Returns `None` if there are too many.
@@ -565,24 +671,24 @@ impl Engine {
     /// Waits for a picture other than `last`. Returns `None` if none comes in time.
     pub fn wait_for_frame(&self, last: Option<&Arc<Latest>>, timeout: Duration) -> Option<Arc<Latest>> {
         let deadline = Instant::now() + timeout;
-        let mut count = self.frame_count.lock().unwrap();
+        let mut count = self.frame_count.grab();
         loop {
-            if let Some(frame) = self.latest_frame() {
-                if last.is_none_or(|l| !Arc::ptr_eq(l, &frame)) {
-                    return Some(frame);
-                }
+            if let Some(frame) = self.latest_frame()
+                && last.is_none_or(|l| !Arc::ptr_eq(l, &frame))
+            {
+                return Some(frame);
             }
             let now = Instant::now();
             if now >= deadline {
                 return None;
             }
-            count = self.frame_cv.wait_timeout(count, deadline - now).unwrap().0;
+            count = self.frame_cv.wait_timeout(count, deadline - now).unwrap_or_else(PoisonError::into_inner).0;
         }
     }
 
     /// True when the camera is off or about to be: a picture stream can end.
     pub fn camera_is_idle(&self) -> bool {
-        self.inner.lock().unwrap().mode == Mode::Idle
+        self.inner.grab().mode == Mode::Idle
     }
 
     /// The top-down board for the current calibration, as JPEG.
@@ -593,12 +699,7 @@ impl Engine {
 
     /// The top-down board from one given camera frame.
     pub fn warped_jpeg_of(&self, latest: &Latest, with_grid: bool) -> ApiResult<Vec<u8>> {
-        let calibration = self
-            .inner
-            .lock()
-            .unwrap()
-            .calibration
-            .ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
+        let calibration = self.inner.lock().unwrap().calibration.ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
         let mut warped = calibration::warp_board(&latest.image, &calibration)?;
         if with_grid {
             calibration::draw_grid(&mut warped);
@@ -622,12 +723,12 @@ impl Engine {
     /// Everything a page needs to draw itself, for one user.
     pub fn snapshot(&self, token: &str) -> Value {
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.grab();
         let inner = &mut *guard;
         self.housekeeping(inner, now);
         let playing = inner.mode == Mode::Playing;
         let role = if roles::valid_token(token) { inner.roles.touch(token, now, playing) } else { Role::Viewer };
-        let frame = self.frame.read().unwrap().clone();
+        let frame = self.frame.read_ok().clone();
 
         let game = inner.game.as_ref().map(|g| {
             let position = g.position().ok();
@@ -645,11 +746,7 @@ impl Engine {
                 "over": g.result.is_some(),
             })
         });
-        let promotion_pending = inner
-            .game
-            .as_ref()
-            .and_then(|g| g.moves.last())
-            .is_some_and(|m| m.promotion_guess);
+        let promotion_pending = inner.game.as_ref().and_then(|g| g.moves.last()).is_some_and(|m| m.promotion_guess);
 
         json!({
             "role": if role == Role::Controller { "controller" } else { "viewer" },
@@ -673,7 +770,6 @@ impl Engine {
                 "adjusted": inner.follow_count,
                 "last_shift": (inner.follow_shift * 100.0).round() / 100.0,
             },
-            "corner_names": calibration::CORNER_NAMES,
             "tracker": {
                 "status": status_name(inner.tracker.status()),
                 "candidates": inner.candidates.iter().map(|c| json!({"uci": c.uci, "san": c.san, "cost": (c.cost * 10.0).round() / 10.0})).collect::<Vec<_>>(),
@@ -691,15 +787,13 @@ impl Engine {
         let lost_controller = inner.roles.expire(now, playing);
         let calibration_too_long = inner.calibrating_since.is_some_and(|s| now.duration_since(s) > CALIBRATION_LIMIT);
         if inner.mode == Mode::Calibrating && (lost_controller || calibration_too_long) {
-            inner.mode = Mode::Idle;
-            inner.calibrating_since = None;
-            self.set_camera(false);
+            self.go_idle(inner);
         }
     }
 
     fn controlled(&self, token: &str) -> ApiResult<MutexGuard<'_, Inner>> {
         let now = Instant::now();
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.grab();
         self.housekeeping(&mut guard, now);
         let playing = guard.mode == Mode::Playing;
         if !roles::valid_token(token) || !guard.roles.is_controller(token, now, playing) {
@@ -716,7 +810,7 @@ impl Engine {
             return Err(ApiError::BadRequest("missing client token".into()));
         }
         let now = Instant::now();
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.grab();
         let playing = inner.mode == Mode::Playing;
         if !inner.roles.claim(token, now, playing) {
             return Err(ApiError::Conflict("someone else is controlling".into()));
@@ -730,9 +824,7 @@ impl Engine {
         let mut inner = self.controlled(token)?;
         inner.roles.release(token);
         if inner.mode == Mode::Calibrating {
-            inner.mode = Mode::Idle;
-            inner.calibrating_since = None;
-            self.set_camera(false);
+            self.go_idle(&mut inner);
         }
         drop(inner);
         self.hub.notify();
@@ -756,9 +848,7 @@ impl Engine {
     pub fn close_calibration(&self, token: &str) -> ApiResult {
         let mut inner = self.controlled(token)?;
         if inner.mode == Mode::Calibrating {
-            inner.mode = Mode::Idle;
-            inner.calibrating_since = None;
-            self.set_camera(false);
+            self.go_idle(&mut inner);
         }
         drop(inner);
         self.hub.notify();
@@ -767,13 +857,12 @@ impl Engine {
 
     pub fn set_calibration(&self, token: &str, corners: [[f32; 2]; 4]) -> ApiResult {
         let mut inner = self.controlled(token)?;
-        let frame = self
-            .latest_frame()
-            .ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
-        let calibration = Calibration { corners };
+        let frame = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
+        let calibration = Calibration::for_frame(corners, frame.image.width(), frame.image.height());
         calibration.validate(frame.image.width(), frame.image.height())?;
-        calibration.save(&self.calibration_path)?;
+        calibration.save(&self.calibration_path).map_err(ApiError::internal)?;
         inner.calibration = Some(calibration);
+        inner.follow_anchor = None;
         // During a game the squares are learned again from the position reached.
         inner.tracker.set_calibration(Some(&calibration));
         inner.notice = None;
@@ -786,9 +875,7 @@ impl Engine {
     /// Returns a sentence for the page: what was found, and what to check.
     pub fn detect_calibration(&self, token: &str) -> ApiResult<String> {
         drop(self.controlled(token)?);
-        let frame = self
-            .latest_frame()
-            .ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
+        let frame = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
         // Without the lock: searching takes a fraction of a second.
         let found = boarddetect::find_board(&frame.image).map_err(|e| ApiError::Conflict(format!("{e:#}")))?;
         self.set_calibration(token, found.corners)?;
@@ -805,7 +892,7 @@ impl Engine {
     pub fn set_follow(&self, token: &str, on: bool) -> ApiResult {
         let mut inner = self.controlled(token)?;
         let settings = Picture { follow: on, ..inner.picture };
-        settings.save(&self.picture_path)?;
+        settings.save(&self.picture_path).map_err(ApiError::internal)?;
         inner.picture = settings;
         drop(inner);
         self.hub.notify();
@@ -826,15 +913,15 @@ impl Engine {
     /// was just turned by (0 when only brightness or contrast changed).
     fn store_picture(&self, inner: &mut Inner, picture: Picture, turns: i32) -> ApiResult {
         picture.validate()?;
-        picture.save(&self.picture_path)?;
+        picture.save(&self.picture_path).map_err(ApiError::internal)?;
         inner.picture = picture;
         // The next picture will have the new settings. Redo the one on show too, so the
         // page does not have to wait for it.
         if let Some(latest) = self.latest_frame() {
             let raw = Picture::default().turned(turns).rotate((*latest.raw).clone());
             let adjusted = picture.adjust(&raw);
-            *self.frame.write().unwrap() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq)));
-            *self.frame_count.lock().unwrap() += 1;
+            *self.frame.write_ok() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq)));
+            *self.frame_count.grab() += 1;
             self.frame_cv.notify_all();
         }
         Ok(())
@@ -850,19 +937,19 @@ impl Engine {
         }
         let mut turned_calibration = None;
         if let Some(calibration) = inner.calibration {
-            let frame = self
-                .latest_frame()
-                .ok_or_else(|| ApiError::Conflict("the camera is off: open it first, so the calibration can be turned with the picture".into()))?;
-            let (corners, width, height) =
-                picture::turn_points(&calibration.corners, frame.raw.width(), frame.raw.height(), turns);
-            let turned = Calibration { corners };
+            let frame = self.latest_frame().ok_or_else(|| {
+                ApiError::Conflict("the camera is off: open it first, so the calibration can be turned with the picture".into())
+            })?;
+            let (corners, width, height) = picture::turn_points(&calibration.corners, frame.raw.width(), frame.raw.height(), turns);
+            let turned = Calibration::for_frame(corners, width, height);
             turned.validate(width, height)?;
             turned_calibration = Some(turned);
         }
         let settings = inner.picture.turned(turns);
         if let Some(turned) = turned_calibration {
-            turned.save(&self.calibration_path)?;
+            turned.save(&self.calibration_path).map_err(ApiError::internal)?;
             inner.calibration = Some(turned);
+            inner.follow_anchor = None;
             inner.tracker.set_calibration(Some(&turned));
         }
         self.store_picture(&mut inner, settings, turns)?;
@@ -911,7 +998,7 @@ impl Engine {
         match std::fs::remove_file(&self.calibration_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(ApiError::BadRequest(format!("cannot delete the calibration file: {e}"))),
+            Err(e) => return Err(ApiError::Internal(format!("cannot delete the calibration file: {e}"))),
         }
         inner.calibration = None;
         inner.tracker.set_calibration(None);
@@ -933,17 +1020,48 @@ impl Engine {
         let id = self.store.new_id(request.started_at.as_deref());
         let game = GameRecord::new(id, request.started_at, &request.white, &request.black, request.fen)?;
         let position = game.start_position()?;
-        inner.tracker.start(position);
         inner.game = Some(game);
-        inner.game_started = Some(Instant::now());
+        self.begin_playing(&mut inner, position, 0.0);
+        drop(inner);
+        self.hub.notify();
+        Ok(())
+    }
+
+    /// The board shows `position`: follow the game from there. `resume_at` is how many seconds
+    /// of the game were already played (0 for a new game), so the timestamps carry on.
+    fn begin_playing(&self, inner: &mut Inner, position: shakmaty::Chess, resume_at: f64) {
+        inner.tracker.start(position);
+        inner.game_started = Some(Instant::now().checked_sub(Duration::from_secs_f64(resume_at)).unwrap_or_else(Instant::now));
         inner.mode = Mode::Playing;
         inner.calibrating_since = None;
         inner.candidates.clear();
         inner.notice = None;
         inner.last_status = Status::Learning;
+        inner.follow_anchor = None;
         self.restart_source.store(true, Ordering::SeqCst);
         self.set_camera(true);
-        drop(inner);
+    }
+
+    /// Goes on with the unfinished game that was found at start (or left by a crash or a stop).
+    /// The board must show the position the game had reached.
+    pub fn resume_game(&self, token: &str) -> ApiResult {
+        let mut guard = self.controlled(token)?;
+        let inner = &mut *guard;
+        if inner.mode == Mode::Playing {
+            return Err(ApiError::Conflict("a game is already running".into()));
+        }
+        if inner.calibration.is_none() {
+            return Err(ApiError::Conflict("calibrate the board first".into()));
+        }
+        let game = inner
+            .game
+            .as_ref()
+            .filter(|g| g.result.is_none())
+            .ok_or_else(|| ApiError::Conflict("there is no unfinished game to resume".into()))?;
+        let position = game.position()?;
+        let resume_at = game.moves.last().map_or(0.0, |m| m.t);
+        self.begin_playing(inner, position, resume_at);
+        drop(guard);
         self.hub.notify();
         Ok(())
     }
@@ -951,7 +1069,8 @@ impl Engine {
     /// Ends the game with a result decided by the players.
     pub fn end_game(&self, token: &str, result: &str, reason: &str) -> ApiResult {
         let mut inner = self.controlled(token)?;
-        if inner.mode != Mode::Playing {
+        let unfinished_but_stopped = inner.mode == Mode::Idle && inner.game.as_ref().is_some_and(|g| g.result.is_none());
+        if inner.mode != Mode::Playing && !unfinished_but_stopped {
             return Err(ApiError::Conflict("no game is running".into()));
         }
         if !["1-0", "0-1", "1/2-1/2", "*"].contains(&result) {
@@ -968,9 +1087,8 @@ impl Engine {
             game.finish(result, reason);
             self.save(&mut inner);
         }
-        inner.mode = Mode::Idle;
+        self.go_idle(&mut inner);
         inner.candidates.clear();
-        self.set_camera(false);
         drop(inner);
         self.hub.notify();
         Ok(())
@@ -1001,11 +1119,15 @@ impl Engine {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         let reopenable = inner.mode == Mode::Idle
-            && inner.game.as_ref().is_some_and(|g| {
-                matches!(g.termination.as_deref(), Some("checkmate" | "stalemate" | "insufficient material"))
-            });
+            && inner
+                .game
+                .as_ref()
+                .is_some_and(|g| matches!(g.termination.as_deref(), Some("checkmate" | "stalemate" | "insufficient material")));
         if inner.mode != Mode::Playing && !reopenable {
             return Err(ApiError::Conflict("no game is running".into()));
+        }
+        if reopenable && inner.calibration.is_none() {
+            return Err(ApiError::Conflict("calibrate the board first".into()));
         }
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         game.undo().ok_or_else(|| ApiError::Conflict("no move to take back".into()))?;
@@ -1013,14 +1135,7 @@ impl Engine {
         let resume_at = game.moves.last().map_or(0.0, |m| m.t);
         if reopenable {
             // The board must show the position again before learning resumes.
-            inner.mode = Mode::Playing;
-            inner.game_started = Some(
-                Instant::now()
-                    .checked_sub(Duration::from_secs_f64(resume_at))
-                    .unwrap_or_else(Instant::now),
-            );
-            inner.tracker.start(position);
-            self.set_camera(true);
+            self.begin_playing(inner, position, resume_at);
         } else {
             inner.tracker.set_position(position);
         }
@@ -1035,6 +1150,11 @@ impl Engine {
     pub fn set_promotion(&self, token: &str, piece: char) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
+        if inner.mode != Mode::Playing {
+            // A finished game keeps its result: take the last move back first (which reopens the
+            // game when the rules had ended it), then change the piece.
+            return Err(ApiError::Conflict("no game is running".into()));
+        }
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         game.set_last_promotion(piece)?;
         let position = game.position()?;
@@ -1096,5 +1216,23 @@ fn status_name(status: Status) -> &'static str {
         Status::Watching => "watching",
         Status::Moving => "moving",
         Status::Unsure => "unsure",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lock_goes_on_working_after_a_thread_panicked_holding_it() {
+        let shared = Arc::new(Mutex::new(5));
+        let other = Arc::clone(&shared);
+        let _ = thread::spawn(move || {
+            let _guard = other.lock().unwrap();
+            panic!("a picture could not be processed");
+        })
+        .join();
+        assert!(shared.lock().is_err(), "the lock is poisoned");
+        assert_eq!(*shared.grab(), 5);
     }
 }

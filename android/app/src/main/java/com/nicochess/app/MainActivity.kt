@@ -2,12 +2,19 @@ package com.nicochess.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
+import android.webkit.JsResult
+import android.webkit.URLUtil
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
+import java.net.URL
 
 /**
  * Shows the NicoChess page. The server runs in this same process, on the loopback
@@ -30,6 +37,22 @@ class MainActivity : Activity() {
             // The page keeps its client token in localStorage.
             settings.domStorageEnabled = true
             webViewClient = WebViewClient()
+            // Without a WebChromeClient every confirm() of the page answers "no": End game, Abort,
+            // Forget calibration and Re-learn would do nothing.
+            webChromeClient = object : WebChromeClient() {
+                override fun onJsConfirm(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                    ask(message, result, withCancel = true)
+                    return true
+                }
+
+                override fun onJsAlert(view: WebView?, url: String?, message: String?, result: JsResult?): Boolean {
+                    ask(message, result, withCancel = false)
+                    return true
+                }
+            }
+            // The WebView ignores the "download" of a link: the PGN of a game is handed to the
+            // share sheet instead (mail, notes, files...).
+            setDownloadListener { url, _, disposition, mimeType, _ -> sharePgn(url, disposition, mimeType) }
             // The page of this app (and only it: the WebView never leaves the loopback address)
             // gets the controls of "This phone".
             addJavascriptInterface(AndroidBridge(this@MainActivity), "NicoAndroid")
@@ -85,6 +108,38 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         CoreService.start(this)
+    }
+
+    private fun ask(message: String?, result: JsResult?, withCancel: Boolean) {
+        val dialog = AlertDialog.Builder(this)
+            .setMessage(message ?: "")
+            .setPositiveButton(android.R.string.ok) { _, _ -> result?.confirm() }
+            .setOnCancelListener { result?.cancel() }
+        if (withCancel) dialog.setNegativeButton(android.R.string.cancel) { _, _ -> result?.cancel() }
+        dialog.show()
+    }
+
+    /** Reads a game from the local server (only from it) and offers it to the share sheet. */
+    private fun sharePgn(url: String, disposition: String?, mimeType: String?) {
+        if (!url.startsWith("http://127.0.0.1:${Settings.LOCAL_PORT}/")) return
+        Thread {
+            val text = try {
+                URL(url).openStream().bufferedReader().use { it.readText() }
+            } catch (e: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (text == null) {
+                    Toast.makeText(this, "The game could not be read", Toast.LENGTH_LONG).show()
+                    return@runOnUiThread
+                }
+                val send = Intent(Intent.ACTION_SEND)
+                    .setType("text/plain")
+                    .putExtra(Intent.EXTRA_SUBJECT, URLUtil.guessFileName(url, disposition, mimeType))
+                    .putExtra(Intent.EXTRA_TEXT, text)
+                startActivity(Intent.createChooser(send, "Share the game (PGN)"))
+            }
+        }.start()
     }
 
     private fun showError(message: String) {

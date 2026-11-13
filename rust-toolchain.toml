@@ -1,0 +1,3 @@
+[toolchain]
+# The exact compiler of the Docker images and of CI. rust-version in Cargo.toml is the oldest one that works.
+channel = "1.98.1"

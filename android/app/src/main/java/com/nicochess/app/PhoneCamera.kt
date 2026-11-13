@@ -26,14 +26,15 @@ import kotlin.math.abs
  * pictures. After a short moment the exposure, white balance and focus are locked,
  * because a picture that keeps changing upsets the detection of moves.
  *
- * Call [open] and [close] from the main thread. The camera callbacks run on a thread of
- * their own and only ask the main thread to act.
+ * Call [open] and [close] from the main thread. The camera callbacks run on the main thread too
+ * (they are given its handler), so no state is shared between threads: a camera that opens
+ * while [close] runs is simply found to be late and closed. Only the pictures arrive on a
+ * thread of their own, the one of the image reader.
  */
 class PhoneCamera(private val context: Context) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val main = Handler(Looper.getMainLooper())
     private var thread: HandlerThread? = null
-    private var handler: Handler? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
@@ -77,7 +78,6 @@ class PhoneCamera(private val context: Context) {
             val worker = HandlerThread("nicochess-camera").also { it.start() }
             val workerHandler = Handler(worker.looper)
             thread = worker
-            handler = workerHandler
 
             val imageReader = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
             imageReader.setOnImageAvailableListener({ source -> onImage(source, mine) }, workerHandler)
@@ -103,7 +103,7 @@ class PhoneCamera(private val context: Context) {
                     camera.close()
                     failLater(mine, "The camera failed (error $error)")
                 }
-            }, workerHandler)
+            }, main)
         } catch (e: SecurityException) {
             failNow("Camera permission refused: allow it in the settings of the app")
         } catch (e: CameraAccessException) {
@@ -130,7 +130,6 @@ class PhoneCamera(private val context: Context) {
         device = null
         reader = null
         thread = null
-        handler = null
         Log.i(TAG, "camera closed")
     }
 
@@ -141,7 +140,7 @@ class PhoneCamera(private val context: Context) {
         NativeCore.cameraFailed(message)
     }
 
-    /** From a camera thread: the main thread does it, unless the camera has been closed since. */
+    /** From a camera callback: skipped when the camera has been closed (or opened again) since. */
     private fun failLater(mine: Int, message: String) {
         main.post { if (mine == generation && active) failNow(message) }
     }
@@ -181,7 +180,7 @@ class PhoneCamera(private val context: Context) {
                         failLater(mine, "The camera could not be configured")
                     }
                 },
-                handler,
+                main,
             )
         } catch (e: Exception) {
             failLater(mine, "Cannot start the camera: ${e.message}")
@@ -202,10 +201,10 @@ class PhoneCamera(private val context: Context) {
             if (offers(characteristics, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             }
-            session.setRepeatingRequest(builder.build(), null, handler)
+            session.setRepeatingRequest(builder.build(), null, main)
 
             // Let exposure, white balance and focus settle on the board, then freeze them.
-            handler?.postDelayed({
+            main.postDelayed({
                 if (mine == generation) lock(camera, session, imageReader, characteristics)
             }, SETTLE_MS)
         } catch (e: Exception) {
@@ -243,7 +242,7 @@ class PhoneCamera(private val context: Context) {
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                 applied += "focus"
             }
-            session.setRepeatingRequest(builder.build(), null, handler)
+            session.setRepeatingRequest(builder.build(), null, main)
             Log.i(TAG, "locked: ${applied.joinToString()}")
         } catch (e: Exception) {
             Log.w(TAG, "could not lock the camera settings: ${e.message}")

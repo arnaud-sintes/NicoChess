@@ -14,6 +14,7 @@ pub mod boarddetect;
 pub mod calibration;
 pub mod camera;
 pub mod engine;
+pub mod fsutil;
 pub mod game;
 pub mod http;
 pub mod picture;

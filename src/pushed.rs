@@ -89,11 +89,8 @@ impl FrameSource for PushedSource {
 
     fn next_frame(&mut self) -> Result<RgbImage> {
         let state = self.inbox.state.lock().unwrap();
-        let (mut state, timeout) = self
-            .inbox
-            .arrived
-            .wait_timeout_while(state, FRAME_TIMEOUT, |s| s.frame.is_none() && s.error.is_none())
-            .unwrap();
+        let (mut state, timeout) =
+            self.inbox.arrived.wait_timeout_while(state, FRAME_TIMEOUT, |s| s.frame.is_none() && s.error.is_none()).unwrap();
         if let Some(message) = state.error.take() {
             bail!("{message}");
         }
@@ -145,7 +142,7 @@ pub fn yuv420_to_rgb(
                 let at = chroma_row + pair * uv_pixel_stride;
                 let (cu, cv) = (i32::from(u[at]) - 128, i32::from(v[at]) - 128);
                 let (r, g, b) = ((359 * cv) >> 8, ((88 * cu) >> 8) + ((183 * cv) >> 8), (454 * cu) >> 8);
-                for (pixel, &luma) in pixels.chunks_exact_mut(3).zip(lumas) {
+                for (pixel, &luma) in pixels.as_chunks_mut::<3>().0.iter_mut().zip(lumas) {
                     let luma = i32::from(luma);
                     pixel[0] = clamp(luma + r);
                     pixel[1] = clamp(luma - g);
@@ -154,15 +151,14 @@ pub fn yuv420_to_rgb(
             }
         } else {
             // The chroma planes end early (some devices cut the last row short).
-            for col in 0..w {
+            for (col, (&luma, pixel)) in luma_row.iter().zip(out_row.as_chunks_mut::<3>().0.iter_mut()).enumerate() {
                 let at = chroma_row + (col / 2) * uv_pixel_stride;
                 let cu = i32::from(u.get(at).copied().unwrap_or(128)) - 128;
                 let cv = i32::from(v.get(at).copied().unwrap_or(128)) - 128;
-                let luma = i32::from(luma_row[col]);
-                let o = col * 3;
-                out_row[o] = clamp(luma + ((359 * cv) >> 8));
-                out_row[o + 1] = clamp(luma - (((88 * cu) >> 8) + ((183 * cv) >> 8)));
-                out_row[o + 2] = clamp(luma + ((454 * cu) >> 8));
+                let luma = i32::from(luma);
+                pixel[0] = clamp(luma + ((359 * cv) >> 8));
+                pixel[1] = clamp(luma - (((88 * cu) >> 8) + ((183 * cv) >> 8)));
+                pixel[2] = clamp(luma + ((454 * cu) >> 8));
             }
         }
     }

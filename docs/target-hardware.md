@@ -30,7 +30,7 @@ Enough if the design is event-driven and lean.
 - MJPEG decoding at 720p, the most expensive step; prefer YUYV or a lower resolution.
 - Building on the device; cross-compile from the main PC.
 - `opencv`; use pure-Rust `imageproc`.
-- A local GUI; run headless and expose a small web page (`tiny_http`) or terminal output, and view it from another machine.
+- A local GUI; run headless and expose a small web page (the program's own small server, `src/http.rs`) or terminal output, and view it from another machine.
 
 ## Operating system
 
@@ -124,13 +124,13 @@ What the program now does for this camera:
 - Tries MJPEG first for sizes above 640x480 and YUYV first below, and also accepts NV12.
 - Logs every format and size the camera offers (`camera: offers ...` lines).
 - Turns autofocus off, and has `--focus`, `--zoom`, `--exposure` and `--white-balance` options.
-- `./nicochess --probe` (Linux) prints the camera's formats, frame sizes and controls with their ranges, then exits. This is the first thing to run with the Yealink.
+- `./nicochess --probe` (Linux and Windows) prints the camera's formats, frame sizes and controls with their ranges, then exits. This is the first thing to run with the Yealink.
 - MJPEG frames from some cameras lack the tables a JPEG decoder needs. If `bad MJPEG frame` appears, use a size where the camera offers YUYV or NV12.
 
 First test with the Yealink (Linux): `v4l2-ctl --list-devices`, `./nicochess --probe --device /dev/videoN` for the capture node, then `./nicochess --width 1280 --height 720` and look at the Calibrate tab.
 
 ## Build targets to set up
 
-- `i686-unknown-linux-gnu` for Debian.
-- `i686-unknown-linux-musl` for Alpine or a static binary.
-- First milestone on the target: a headless capture-and-warp tool serving its preview over HTTP.
+- `i686-unknown-linux-gnu` for Debian: this is the one in use, built natively inside a Debian 12 i386 container (`scripts/build-target.ps1`).
+- `i686-unknown-linux-musl` (static binary) was tried first and does not work: the camera crate needs the Linux headers at build time. Not used.
+- First milestone on the target: the page, the camera preview and a calibration, served over HTTP.

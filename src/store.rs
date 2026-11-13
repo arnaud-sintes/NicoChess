@@ -75,22 +75,31 @@ impl Store {
 
     pub fn save(&self, game: &GameRecord) -> Result<()> {
         let path = self.path(&game.id)?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(game)?)
-            .with_context(|| format!("cannot write {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("cannot replace {}", path.display()))?;
-        Ok(())
+        crate::fsutil::write_atomic(&path, &serde_json::to_vec_pretty(game)?)
     }
 
     pub fn load(&self, id: &str) -> Result<Option<GameRecord>> {
         let path = self.path(id)?;
         match fs::read_to_string(&path) {
-            Ok(text) => Ok(Some(
-                serde_json::from_str(&text).with_context(|| format!("invalid game file {}", path.display()))?,
-            )),
+            Ok(text) => {
+                let game: GameRecord = serde_json::from_str(&text).with_context(|| format!("invalid game file {}", path.display()))?;
+                if game.version > crate::game::FORMAT_VERSION {
+                    anyhow::bail!("{} was written by a newer version of NicoChess (format {})", path.display(), game.version);
+                }
+                Ok(Some(game))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
         }
+    }
+
+    /// The newest game, if it was never finished (a crash, a power cut or a stop in the middle of a game).
+    pub fn latest_unfinished(&self) -> Result<Option<GameRecord>> {
+        let Some(newest) = self.list()?.into_iter().next() else { return Ok(None) };
+        if newest.result.is_some() {
+            return Ok(None);
+        }
+        self.load(&newest.id)
     }
 
     /// All games, most recent first. Unreadable files are skipped.

@@ -12,10 +12,11 @@
 #>
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-Set-Location $root
+Push-Location $root
+try {
 
 Write-Host 'Building the program (release)...'
-cargo build --release
+cargo build --release --locked
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
 $exe = Join-Path $root 'target\release\nicochess.exe'
@@ -53,3 +54,6 @@ Write-Host ''
 Write-Host "Package: $out"
 Write-Host "Zip:     $zip ($size MB)"
 Get-ChildItem $out | Format-Table Name, Length -AutoSize
+} finally {
+    Pop-Location
+}

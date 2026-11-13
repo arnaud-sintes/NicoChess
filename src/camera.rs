@@ -1,4 +1,5 @@
-//! Frame sources: the real camera (Linux, V4L2), a still image, or a synthetic board.
+//! Frame sources: a real camera (V4L2 on Linux, Media Foundation on Windows), a still image,
+//! a synthetic board, or a camera driven from outside (see `pushed`).
 
 use crate::synthetic;
 use anyhow::{Context, Result, bail};
@@ -6,10 +7,17 @@ use image::RgbImage;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// How long a real camera may stay silent before it counts as failed (the Android camera is the
+/// app's business: see `pushed`).
+#[cfg(any(windows, target_os = "linux"))]
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Something that produces camera frames.
 pub trait FrameSource: Send {
     fn describe(&self) -> String;
-    /// Blocks until the next frame is due, then returns it.
+    /// Blocks until the next frame is due, then returns it. It must not block for ever: a camera
+    /// that stops delivering (unplugged, taken by another program) makes this return an error
+    /// within a few seconds, so that the engine reports it and tries again.
     fn next_frame(&mut self) -> Result<RgbImage>;
     /// Called when a game starts. Scripted sources begin again; a real camera does nothing.
     fn restart(&mut self) {}
@@ -46,9 +54,7 @@ pub struct StillImage {
 
 impl StillImage {
     pub fn open(path: &str, interval: Duration) -> Result<Self> {
-        let image = image::open(path)
-            .with_context(|| format!("cannot open image {path}"))?
-            .to_rgb8();
+        let image = image::open(path).with_context(|| format!("cannot open image {path}"))?.to_rgb8();
         Ok(StillImage { path: path.to_string(), image, pacer: Pacer::new(interval) })
     }
 }
@@ -178,11 +184,10 @@ pub fn probe(_path: &str) -> Result<String> {
 mod windows_camera {
     use super::*;
     use nokhwa::Camera;
-    use std::sync::mpsc::{self, Receiver};
     use nokhwa::utils::{
-        ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl,
-        RequestedFormat, RequestedFormatType,
+        ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl, RequestedFormat, RequestedFormatType,
     };
+    use std::sync::mpsc::{self, Receiver};
 
     const BACKEND: ApiBackend = ApiBackend::MediaFoundation;
     const WANTED: &[FrameFormat] = &[FrameFormat::MJPEG, FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR];
@@ -195,8 +200,7 @@ mod windows_camera {
 
     fn open_raw(index: u32) -> Result<Camera> {
         let request = RequestedFormat::with_formats(RequestedFormatType::None, WANTED);
-        Camera::with_backend(CameraIndex::Index(index), request, BACKEND)
-            .map_err(|e| anyhow::anyhow!("cannot open camera {index}: {e}"))
+        Camera::with_backend(CameraIndex::Index(index), request, BACKEND).map_err(|e| anyhow::anyhow!("cannot open camera {index}: {e}"))
     }
 
     /// The formats to try, best first, as on Linux: large frames are better as
@@ -280,9 +284,7 @@ mod windows_camera {
             let mut candidates: Vec<CameraFormat> = offered
                 .into_iter()
                 .filter(|f| {
-                    f.resolution().width() == settings.width
-                        && f.resolution().height() == settings.height
-                        && WANTED.contains(&f.format())
+                    f.resolution().width() == settings.width && f.resolution().height() == settings.height && WANTED.contains(&f.format())
                 })
                 .collect();
             candidates.sort_by_key(|f| {
@@ -367,13 +369,13 @@ mod windows_camera {
                 let image = match buffer.source_frame_format() {
                     FrameFormat::YUYV => yuyv_to_rgb(data, w, h)?,
                     FrameFormat::NV12 => nv12_to_rgb(data, w, h)?,
-                    FrameFormat::MJPEG => image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
-                        .context("bad MJPEG frame")?
-                        .to_rgb8(),
+                    FrameFormat::MJPEG => {
+                        image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.to_rgb8()
+                    }
                     FrameFormat::RAWRGB => RgbImage::from_raw(w, h, data.to_vec()).context("bad RGB frame size")?,
                     FrameFormat::RAWBGR => {
                         let mut rgb = data.to_vec();
-                        rgb.chunks_exact_mut(3).for_each(|p| p.swap(0, 2));
+                        rgb.as_chunks_mut::<3>().0.iter_mut().for_each(|p| p.swap(0, 2));
                         RgbImage::from_raw(w, h, rgb).context("bad BGR frame size")?
                     }
                     FrameFormat::GRAY => {
@@ -434,7 +436,13 @@ mod windows_camera {
         }
 
         fn next_frame(&mut self) -> Result<RgbImage> {
-            self.frames.recv().context("the camera thread stopped")?
+            match self.frames.recv_timeout(FRAME_TIMEOUT) {
+                Ok(frame) => frame,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bail!("no picture from the camera for {} seconds (is another program using it?)", FRAME_TIMEOUT.as_secs())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the camera thread stopped"),
+            }
         }
     }
 }
@@ -542,8 +550,7 @@ mod v4l_camera {
 
     impl V4lCamera {
         pub fn open(settings: &CameraSettings) -> Result<Self> {
-            let device = Device::with_path(&settings.device)
-                .with_context(|| format!("cannot open {}", settings.device))?;
+            let device = Device::with_path(&settings.device).with_context(|| format!("cannot open {}", settings.device))?;
 
             for line in describe_formats(&device) {
                 eprintln!("camera: offers {line}");
@@ -562,15 +569,13 @@ mod v4l_camera {
             }
             let (format, pixel_format) =
                 chosen.context("the camera offers none of YUYV, MJPEG or NV12 at this size (see the \"offers\" lines, or run --probe)")?;
-            eprintln!(
-                "camera: {} {}x{} {:?}",
-                settings.device, format.width, format.height, pixel_format
-            );
+            eprintln!("camera: {} {}x{} {:?}", settings.device, format.width, format.height, pixel_format);
 
             apply_controls(&device, settings);
 
-            let stream = Stream::with_buffers(&device, Type::VideoCapture, 4)
-                .context("cannot start the capture stream")?;
+            let mut stream = Stream::with_buffers(&device, Type::VideoCapture, 4).context("cannot start the capture stream")?;
+            // A camera that stops delivering must end the read, not block it for ever.
+            stream.set_timeout(FRAME_TIMEOUT);
 
             Ok(V4lCamera {
                 path: settings.device.clone(),
@@ -625,7 +630,8 @@ mod v4l_camera {
             // The camera runs at its own pace (often 30 fps). Waiting for each
             // buffer is cheap; only the frames that are due get converted.
             loop {
-                let (buffer, meta) = self.stream.next().context("camera read failed")?;
+                let (buffer, meta) =
+                    self.stream.next().context("camera read failed (no picture within the time allowed: unplugged or in use?)")?;
                 let due = self.last.is_none_or(|last| last.elapsed() >= self.min_interval);
                 if !due {
                     continue;
@@ -636,9 +642,7 @@ mod v4l_camera {
                     PixelFormat::Yuyv => yuyv_to_rgb(data, self.width, self.height)?,
                     PixelFormat::Nv12 => nv12_to_rgb(data, self.width, self.height)?,
                     PixelFormat::Mjpeg => {
-                        image::load_from_memory_with_format(data, image::ImageFormat::Jpeg)
-                            .context("bad MJPEG frame")?
-                            .to_rgb8()
+                        image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.to_rgb8()
                     }
                 };
                 self.last = Some(Instant::now());
@@ -709,7 +713,9 @@ pub enum SourceSpec {
     /// The starting position on a synthetic board.
     Synthetic,
     /// A scripted game, see [`DemoGame`].
-    Demo { move_interval: Duration },
+    Demo {
+        move_interval: Duration,
+    },
     /// A fixed image file.
     Image(String),
     /// Pictures pushed in by the host program (the Android app), see [`crate::pushed`].

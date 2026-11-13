@@ -27,7 +27,8 @@
 //!   POST   /api/camera/auto-contrast   stretch the picture of the board over the whole range
 //!   POST   /api/camera/picture/reset   brightness and contrast back to neutral
 //!   POST   /api/game/start             {"white","black","fen"?,"started_at"?}
-//!   POST   /api/game/end               {"result","reason"}
+//!   POST   /api/game/resume            go on with the unfinished game found at start (the board must show its position)
+//!   POST   /api/game/end               {"result","reason"}  (also closes an unfinished game that is not running)
 //!   POST   /api/game/move              {"move": "e2e4" or "Nf3"}
 //!   POST   /api/game/undo              take back the last move
 //!   POST   /api/game/promotion         {"piece": "q"|"r"|"b"|"n"}
@@ -162,12 +163,10 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
                 started_at: Option<String>,
             }
             done(body_json::<Body>(&request).and_then(|b| {
-                engine.start_game(
-                    &token,
-                    StartRequest { white: b.white, black: b.black, fen: b.fen, started_at: b.started_at },
-                )
+                engine.start_game(&token, StartRequest { white: b.white, black: b.black, fen: b.fen, started_at: b.started_at })
             }))
         }
+        ("POST", "/api/game/resume") => done(engine.resume_game(&token)),
         ("POST", "/api/game/end") => {
             #[derive(Deserialize)]
             struct Body {
@@ -201,7 +200,7 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
         ("POST", "/api/game/relearn") => done(engine.relearn(&token)),
 
         ("GET" | "POST" | "DELETE", _) => Reply::text(404, "not found"),
-        _ => Reply::text(400, "unsupported method"),
+        _ => Reply::text(405, "method not allowed").with_header("Allow", "GET, POST, DELETE"),
     }
 }
 
@@ -663,6 +662,69 @@ mod tests {
         let stats = rig.call("GET", "/api/camera/stats", "", "").1;
         assert!(stats["fps"].as_f64().unwrap() > 0.0, "{stats}");
         assert!(stats["process_ms"].as_f64().unwrap() >= 0.0 && stats["encode_ms"].is_number(), "{stats}");
+    }
+
+    /// An engine whose store already holds an unfinished game: one move (e4) was played.
+    fn rig_with_unfinished_game(name: &str, calibration: Option<crate::calibration::Calibration>) -> Rig {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let mut game = crate::game::GameRecord::new("20260101T100000".into(), None, "Ann", "Bob", None).unwrap();
+        game.push_text("e4", 3.0).unwrap();
+        store.save(&game).unwrap();
+        let engine = Engine::new(EngineConfig::default(), store, dir.join("calibration.json"), calibration);
+        engine.spawn_capture(camera::factory(SourceSpec::Synthetic, Duration::from_millis(5))).unwrap();
+        let handler = handler(Arc::clone(&engine), 8);
+        Rig { engine, handler, dir }
+    }
+
+    #[test]
+    fn an_unfinished_game_is_found_at_start_and_can_be_resumed() {
+        let rig = rig_with_unfinished_game("resume", None);
+        let state = rig.state(ALICE);
+        assert_eq!(state["mode"], "idle");
+        assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 1);
+        assert_eq!(state["game"]["over"], false);
+
+        // Not while nobody controls, and not without a calibration.
+        assert_eq!(rig.call("POST", "/api/game/resume", BOB, "").0, 403);
+        assert_eq!(rig.call("POST", "/api/game/resume", ALICE, "").0, 409);
+        // A finished game keeps its result: the promotion cannot be changed while nothing runs.
+        assert_eq!(rig.call("POST", "/api/game/promotion", ALICE, r#"{"piece": "n"}"#).0, 409);
+
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/resume", ALICE, "").0, 200);
+        let state = rig.state(ALICE);
+        assert_eq!(state["mode"], "playing");
+        assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 1, "the moves are kept");
+        assert_eq!(state["game"]["id"], "20260101T100000", "the same game goes on");
+        // It is an ordinary running game now.
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result": "1/2-1/2", "reason": "agreement"}"#).0, 200);
+        assert!(rig.engine.list_games().unwrap().iter().all(|g| g.result.is_some()));
+    }
+
+    #[test]
+    fn an_unfinished_game_can_be_closed_without_resuming_it() {
+        let rig = rig_with_unfinished_game("close", None);
+        rig.state(ALICE);
+        let (status, _) = rig.call("POST", "/api/game/end", ALICE, r#"{"result": "*", "reason": "abandoned"}"#);
+        assert_eq!(status, 200);
+        assert_eq!(rig.state(ALICE)["game"]["over"], true);
+        assert!(rig.engine.list_games().unwrap().iter().all(|g| g.result.is_some()), "it is saved as finished");
+        // Nothing is left to close.
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result": "*", "reason": "abandoned"}"#).0, 409);
+    }
+
+    #[test]
+    fn a_calibration_for_another_picture_size_is_reported() {
+        // Made for a 320x240 picture; the synthetic camera gives 640x480.
+        let calibration = crate::calibration::Calibration::for_frame(synthetic::corners().corners, 320, 240);
+        let rig = rig_with_unfinished_game("size", Some(calibration));
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("the warning", || rig.state(ALICE)["notice"].as_str().is_some_and(|n| n.contains("calibrate again")));
     }
 
     fn corners_json() -> String {

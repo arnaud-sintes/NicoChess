@@ -56,6 +56,15 @@ struct Homography {
 
 type Pair = ((f64, f64), (f64, f64));
 
+/// Saddles matched to the places of a lattice, by lattice coordinates (i, j).
+type Matches = HashMap<(i32, i32), usize>;
+/// A lattice found: its matches and the map from lattice to picture.
+type Lattice = (Matches, Homography);
+/// The best lattice seen so far: matches, origin of its 7x7 window, how many it holds, their strength.
+type BestWindow = (Matches, (i32, i32), usize, f32);
+/// An outer corner of the board: place in the lattice, place in the picture, is its square dark.
+type RingCorner = ((f64, f64), (f64, f64), bool);
+
 impl Homography {
     /// Least squares fit of a projective map from lattice (u, v) to picture (x, y).
     fn fit(pairs: &[Pair]) -> Option<Homography> {
@@ -100,6 +109,7 @@ impl Homography {
 }
 
 /// Gaussian elimination with partial pivoting.
+#[allow(clippy::needless_range_loop)] // plain numerical code: indexing two matrices at once reads best
 fn solve(mut a: [[f64; 8]; 8], mut b: [f64; 8]) -> Option<[f64; 8]> {
     for col in 0..8 {
         let pivot = (col..8).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
@@ -312,7 +322,7 @@ fn prune(points: &[Saddle], matches: &mut HashMap<(i32, i32), usize>, mut h: Hom
 }
 
 /// Grows a lattice from a seed saddle and two neighbours that give its two directions.
-fn grow(points: &[Saddle], seed: usize, a: (f64, f64), b: (f64, f64)) -> Option<(HashMap<(i32, i32), usize>, Homography)> {
+fn grow(points: &[Saddle], seed: usize, a: (f64, f64), b: (f64, f64)) -> Option<Lattice> {
     let s = points[seed];
     let spacing = a.0.hypot(a.1).min(b.0.hypot(b.1));
     let mut matches = HashMap::from([((0, 0), seed)]);
@@ -322,10 +332,7 @@ fn grow(points: &[Saddle], seed: usize, a: (f64, f64), b: (f64, f64)) -> Option<
             if (i, j) == (0, 0) {
                 continue;
             }
-            let at = (
-                f64::from(s.x) + f64::from(i) * a.0 + f64::from(j) * b.0,
-                f64::from(s.y) + f64::from(i) * a.1 + f64::from(j) * b.1,
-            );
+            let at = (f64::from(s.x) + f64::from(i) * a.0 + f64::from(j) * b.0, f64::from(s.y) + f64::from(i) * a.1 + f64::from(j) * b.1);
             if let Some(k) = nearest(points, at, 0.3 * spacing, &used) {
                 matches.insert((i, j), k);
                 used.insert(k);
@@ -397,10 +404,7 @@ fn spread_enough(matches: &HashMap<(i32, i32), usize>) -> bool {
 
 /// Fits the 7x7 window, matches the corners that are still missing, and fits again.
 /// Keys of the result are window coordinates, 0..=6.
-fn settle_window(
-    points: &[Saddle],
-    window: &HashMap<(i32, i32), usize>,
-) -> Option<(HashMap<(i32, i32), usize>, Homography)> {
+fn settle_window(points: &[Saddle], window: &HashMap<(i32, i32), usize>) -> Option<Lattice> {
     let mut matches = window.clone();
     let mut h = Homography::fit(&pairs_of(points, &matches, (0, 0)))?;
     for _ in 0..2 {
@@ -452,7 +456,7 @@ pub fn find_board(image: &RgbImage) -> Result<Found> {
         bail!("no chessboard pattern: not enough corners between squares (is the picture sharp and the board in view?)");
     }
 
-    let mut best: Option<(HashMap<(i32, i32), usize>, (i32, i32), usize, f32)> = None;
+    let mut best: Option<BestWindow> = None;
     'seeds: for seed in 0..points.len().min(150) {
         let s = points[seed];
         let mut near: Vec<(f64, usize)> = points
@@ -489,7 +493,9 @@ pub fn find_board(image: &RgbImage) -> Result<Found> {
         bail!("no chessboard pattern found: make sure the whole board is in view, in focus and well lit");
     };
     if count < MIN_MATCHED {
-        bail!("only {count} of the 49 inner corners of the board could be seen (need {MIN_MATCHED}): show the whole board, in focus and well lit");
+        bail!(
+            "only {count} of the 49 inner corners of the board could be seen (need {MIN_MATCHED}): show the whole board, in focus and well lit"
+        );
     }
     let window: HashMap<(i32, i32), usize> = matches
         .iter()
@@ -531,7 +537,8 @@ fn label(prepared: &Prepared, window: &HashMap<(i32, i32), usize>, h: &Homograph
         for v in 0..N {
             let (fu, fv) = (f64::from(u), f64::from(v));
             let patch = |du: f64, dv: f64| grey(fu + du, fv + dv);
-            let (Some(a), Some(b), Some(c), Some(d)) = (patch(0.25, 0.25), patch(-0.25, -0.25), patch(-0.25, 0.25), patch(0.25, -0.25)) else {
+            let (Some(a), Some(b), Some(c), Some(d)) = (patch(0.25, 0.25), patch(-0.25, -0.25), patch(-0.25, 0.25), patch(0.25, -0.25))
+            else {
                 continue;
             };
             let s = f64::from(a + b - c - d);
@@ -545,7 +552,7 @@ fn label(prepared: &Prepared, window: &HashMap<(i32, i32), usize>, h: &Homograph
     // The outer corners in order around the board; counter-clockwise on screen (the order that
     // a1, h1, h8, a8 have from any side). Each remembers its place in the lattice and whether the
     // square in that corner is dark.
-    let mut ring: Vec<((f64, f64), (f64, f64), bool)> = OUTER
+    let mut ring: Vec<RingCorner> = OUTER
         .iter()
         .enumerate()
         .map(|(n, &uv)| {
@@ -603,10 +610,12 @@ fn label(prepared: &Prepared, window: &HashMap<(i32, i32), usize>, h: &Homograph
     }
     let alternation = if total > 0.0 { (vote.abs() / total) as f32 } else { 0.0 };
     if alternation < MIN_ALTERNATION {
-        bail!("a grid was found but it does not alternate light and dark like a chessboard (score {alternation:.2}): is the whole board in view, in focus and evenly lit?");
+        bail!(
+            "a grid was found but it does not alternate light and dark like a chessboard (score {alternation:.2}): is the whole board in view, in focus and evenly lit?"
+        );
     }
     let found = Found { corners, matched: window.len(), sides_from_pieces: from_pieces, alternation };
-    Calibration { corners }.validate(image.width(), image.height()).map_err(|e| {
+    Calibration::new(corners).validate(image.width(), image.height()).map_err(|e| {
         anyhow::anyhow!("the board was found, but not all of it is in the picture or it looks wrong ({e:#}): show the whole board")
     })?;
     Ok(found)
@@ -621,11 +630,8 @@ pub fn refine(image: &RgbImage, current: &Calibration) -> Result<Found> {
     let points = &prepared.saddles;
     let scale = f64::from(prepared.scale);
     // Lattice (u, v) = 0..=6 are the inner corners; the board is -1..=7.
-    let known: Vec<Pair> = OUTER
-        .iter()
-        .zip(&current.corners)
-        .map(|(&uv, c)| (uv, (f64::from(c[0]) * scale, f64::from(c[1]) * scale)))
-        .collect();
+    let known: Vec<Pair> =
+        OUTER.iter().zip(&current.corners).map(|(&uv, c)| (uv, (f64::from(c[0]) * scale, f64::from(c[1]) * scale))).collect();
     let mut h = Homography::fit(&known).ok_or_else(|| anyhow::anyhow!("the calibration does not define a projection"))?;
 
     let mut matches: HashMap<(i32, i32), usize> = HashMap::new();
@@ -758,12 +764,12 @@ mod tests {
         let truth = synthetic::corners();
         let image = synthetic::frame();
         // The calibration is a few pixels off, as if the camera had been bumped.
-        let off = Calibration { corners: truth.corners.map(|c| [c[0] + 4.0, c[1] - 3.0]) };
+        let off = Calibration::new(truth.corners.map(|c| [c[0] + 4.0, c[1] - 3.0]));
         let found = refine(&image, &off).unwrap();
         close(&found.corners, &truth.corners, 1.5);
-        assert!(shift_in_squares(&off, &Calibration { corners: found.corners }) > 0.05);
+        assert!(shift_in_squares(&off, &Calibration::new(found.corners)) > 0.05);
         // A calibration that is right stays where it is.
         let again = refine(&image, &truth).unwrap();
-        assert!(shift_in_squares(&truth, &Calibration { corners: again.corners }) < 0.04);
+        assert!(shift_in_squares(&truth, &Calibration::new(again.corners)) < 0.04);
     }
 }

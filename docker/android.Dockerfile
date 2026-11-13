@@ -33,7 +33,7 @@ RUN curl -fsSL -o /tmp/gradle.zip https://services.gradle.org/distributions/grad
 
 # 64-bit ARM (almost every phone since 2017) and 32-bit ARM (older phones and tablets).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | sh -s -- -y --profile minimal --default-toolchain stable \
+  | sh -s -- -y --profile minimal --default-toolchain 1.98.1 \
       --target aarch64-linux-android --target armv7-linux-androideabi \
  && cargo install cargo-ndk --locked
 

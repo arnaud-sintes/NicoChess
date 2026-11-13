@@ -100,10 +100,7 @@ impl Sampler {
         for square in self.points.chunks_exact(per_square) {
             let (mut sum, mut lum_sum, mut lum_sq) = ([0.0f32; 3], 0.0f32, 0.0f32);
             for &(x, y) in square {
-                let px = image.get_pixel(
-                    (x.round() as i32).clamp(0, w - 1) as u32,
-                    (y.round() as i32).clamp(0, h - 1) as u32,
-                );
+                let px = image.get_pixel((x.round() as i32).clamp(0, w - 1) as u32, (y.round() as i32).clamp(0, h - 1) as u32);
                 let (r, g, b) = (px[0] as f32, px[1] as f32, px[2] as f32);
                 sum[0] += r;
                 sum[1] += g;
@@ -114,10 +111,7 @@ impl Sampler {
             }
             let n = per_square as f32;
             let mean_lum = lum_sum / n;
-            out.push(Features {
-                mean: [sum[0] / n, sum[1] / n, sum[2] / n],
-                std: (lum_sq / n - mean_lum * mean_lum).max(0.0).sqrt(),
-            });
+            out.push(Features { mean: [sum[0] / n, sum[1] / n, sum[2] / n], std: (lum_sq / n - mean_lum * mean_lum).max(0.0).sqrt() });
         }
         out
     }

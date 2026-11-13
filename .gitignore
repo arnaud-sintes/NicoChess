@@ -8,6 +8,12 @@ dist/
 
 # Android build
 /android/.gradle/
+/android/build/
+/android/.idea/
+.idea/
+*.jks
+*.keystore
+*.log
 /android/app/build/
 /android/app/src/main/jniLibs/
 /android/local.properties

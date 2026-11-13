@@ -27,15 +27,11 @@ Everything below is in `downloads/` (git-ignored). Checksums were verified on 20
 |---|---|---|
 | Debian 12.15.0 i386 netinst ISO (656 MB) | `downloads/debian-12.15.0-i386/debian-12.15.0-i386-netinst.iso` | SHA256 matches `SHA256SUMS`, and the `SHA256SUMS.sign` signature is good for the Debian CD signing key (fingerprint `DF9B 9C49 EAA9 2984 3258 9D76 DA87 E80D 6294 BE9B`) |
 | Rufus 4.15 portable | `downloads/rufus-4.15/rufus-4.15.exe` | Not verified (a `.sig` file is next to it) |
-| Zig 0.17.0 (Windows, portable) | `downloads/tools/zig-x86_64-windows-0.17.0/zig.exe` | SHA256 matches the Zig download index |
-| `cargo-zigbuild` 0.24.0 | `downloads/tools/cargo-zigbuild/cargo-zigbuild.exe` | SHA256 matches the release `.sha256` file |
-| Rust std for `i686-unknown-linux-musl` | installed in the PC's rustup toolchain | `rustup target list --installed` |
 
-Proof that the toolchain works: a throwaway "hello" program built with `cargo zigbuild --release --target i686-unknown-linux-musl` gave a static 32-bit ELF (Intel i386). It was **not** run on the target yet.
+The program is built in a Docker container (section 5), so the PC needs no cross-compile toolchain. Zig and `cargo-zigbuild` were downloaded for an earlier route that did not work with the camera crate; they are not used (the folder `downloads/tools/` can be deleted).
 
 Not downloaded:
 - `ffmpeg`, used in step 4.3 to view a raw test capture on the PC. Install it with `winget install ffmpeg` or use WSL (`sudo apt install ffmpeg`).
-- The `i386/debian:12` Docker image, only needed if the musl build fails (step 5.2).
 - Nothing for the camera: the C170 is UVC and needs no driver on Linux.
 
 ## 1. Write the USB stick and inspect the target
@@ -56,7 +52,7 @@ There is no live system, and the installer has no `v4l-utils`, so the inspection
    Some of these tools may be missing in the installer's busybox shell; if so, note it and check after the install.
    Go back to the installer with Ctrl+Alt+F1.
 
-Record the results in a new file `docs/target-findings.md`.
+Write the results down (a note of your own, or keep the report that `scripts/target-setup.sh` produces, `nicochess-findings-<date>.txt`, next to the project).
 
 Decision points from these results:
 
@@ -286,113 +282,78 @@ Mount the tripod so the camera sees the whole board at about 45° tilt and about
 Use diffuse, constant light and avoid a window beside the board.
 Once the position is chosen, do not move it. Any move means re-calibrating the 4 corners.
 
-## 5. Build toolchain on the PC
+## 5. Build the program on the PC
 
 Build on the PC. Do not build on the target.
 
-**What the project uses:** a Debian 12 i386 container, driven by `scripts/build-target.ps1` (Docker Desktop must be running).
-The `v4l` camera crate generates its V4L2 bindings at build time (`bindgen`), which needs `libclang` and the Linux kernel headers.
-A Windows host does not have them, so the musl and Zig route below fails for this project: `cargo zigbuild` stops with `'linux/videodev2.h' file not found`.
-The container also has the same glibc as the target, so the binary runs there.
+The program is built in a Debian 12 i386 container, driven by `scripts/build-target.ps1` (Docker Desktop must be running):
 
 ```
 .\scripts\build-target.ps1          # writes dist\nicochess
 ```
 
-The first run builds the image (about 1 GB, a few minutes) **(not run yet)**.
+Why a container: the `v4l` camera crate generates its V4L2 bindings at build time (`bindgen`), which needs `libclang` and the Linux kernel headers. A Windows host does not have them, so a cross-compile with Zig and musl failed (`'linux/videodev2.h' file not found`). The container also has the same glibc as the target, so the binary runs there.
+The first run builds the image (about 1 GB, a few minutes); later runs reuse it and the cargo cache. The build uses `--locked`. Details, and the other builds (Android, Windows), are in [ENVIRONMENT.md](ENVIRONMENT.md).
 
-The musl and Zig route below is kept for code that does not use `v4l`. It did build a hello program for the target.
+### 5.1 First proof
 
-### 5.0 Use the portable tools
-
-`zig.exe` and `cargo-zigbuild.exe` are in `downloads/tools/` and are not on the PATH.
-In PowerShell, from the project root, for the current session:
-
-```
-$env:PATH = "$PWD\downloads\tools\zig-x86_64-windows-0.17.0;$PWD\downloads\tools\cargo-zigbuild;$env:PATH"
-cargo zigbuild --release --target i686-unknown-linux-musl
-```
-
-Zig 0.17.0 with `cargo-zigbuild` 0.24.0 worked for the hello test. Pin both versions if a later update breaks the build.
-
-### 5.1 Target choice
-
-Primary: **`i686-unknown-linux-musl`**, a fully static binary.
-It avoids glibc version mismatches between the PC's build environment and Debian 12 (glibc 2.36) **(verify)**.
-
-```
-rustup target add i686-unknown-linux-musl
-```
-
-### 5.2 Linker on Windows
-
-Rust needs a Linux-capable linker. Options, in order of preference **(verify each on your PC)**:
-
-1. **`cargo-zigbuild`**: uses Zig as the C compiler and linker.
-   ```
-   cargo install cargo-zigbuild
-   cargo zigbuild --release --target i686-unknown-linux-musl
-   ```
-   Zig must be installed and on the PATH.
-2. **WSL2 with Debian**: install the Rust toolchain inside WSL and build there. Simplest if `cargo-zigbuild` fails on this project's dependencies.
-3. **Docker with an `i386/debian:12` image**: builds in the same environment as the target, which gives the best binary compatibility. Slower to set up.
-
-The camera crate (`v4l`) did turn out not to cross-compile this way, so option 3 (the container) is the route in use.
-
-### 5.3 First proof
-
-Build `nicochess` with `scripts/build-target.ps1` and copy `dist/nicochess` to the target (section 6.1).
+Copy `dist/nicochess` to the target (section 6.1) or use the USB key (section 10).
 The 32-bit binary has already been run in a Debian 12 i386 container on the PC, with the demo source, so the build, the 32-bit runtime and the server are known to work. The real camera and the INEOS 600 have not been tried.
 
 First tests on the target, in this order:
 
-1. **No camera.** `./nicochess --source demo`, then open `http://<target-ip>:8080` from the PC and from a phone. Calibrate with the corners shown in the README, start a game, and watch the demo play 33 moves. This tests the server, the page and the Atom's speed (watch `top` while it plays).
+1. **No camera.** `./nicochess --source demo`, then open `http://<target-ip>:8080` from the PC and from a phone. Calibrate with the corners shown in the README (or press **Auto-detect the board**), start a game, and watch the demo play 33 moves. This tests the server, the page and the Atom's speed (watch `top` while it plays).
 2. **The camera alone.** First `./nicochess --probe` (add `--device /dev/videoN` if needed): it lists the formats, frame sizes and controls the camera offers. Then `./nicochess` (source `camera`, device `/dev/video0`) and read the `camera:` lines in the output: the format chosen, and which controls were applied (white balance off, manual exposure, autofocus off). Then use the Calibrate tab and look at the picture. With the Yealink UVC30 Room, see the Webcam section of `docs/target-hardware.md`.
 3. **A real game.** Set up the pieces, calibrate, press Start, and play a few moves. If moves are missed or wrong, see the tuning flags in `./nicochess --help` and the notes in `docs/requirements.md`.
 
 ## 6. Deploy and run
 
-### 6.1 Copy the binary
+The simplest way is the USB key (section 10): `install.sh` installs the program, the user, the folders and the service in one go. With a network, `scripts/deploy.ps1` updates the program afterwards. The layout on the target is the same either way:
+
+| What | Where |
+|---|---|
+| Program | `/opt/nicochess/nicochess` |
+| Service | `nicochess.service` (systemd), run by the user `nicochess` (group `video`) |
+| Settings | `/etc/default/nicochess`, one line `NICOCHESS_ARGS="..."`: `--width 640 --height 480 --fps 3` by default, `--source demo` after `install.sh --demo` |
+| Games | `/var/lib/nicochess/games/` |
+| Calibration and picture settings | `/var/lib/nicochess/calibration.json` and `/var/lib/nicochess/picture.json` |
+
+### 6.1 Update the program
 
 ```
-scp dist/nicochess nico@<target-ip>:~/nicochess
+.\scripts\deploy.ps1 -Target nico@<target-ip>              # build in the container, copy, restart
+.\scripts\deploy.ps1 -Target nico@<target-ip> -SkipBuild   # copy dist\nicochess as it is
 ```
 
-Or with `rsync`, which is faster for repeated deploys:
+The user on the target needs `sudo`, and `install.sh` must have been run once. By hand: `scp dist/nicochess nico@<target-ip>:/tmp/nicochess.new`, then `sudo install -m 755 /tmp/nicochess.new /opt/nicochess/nicochess && sudo systemctl restart nicochess`.
 
-```
-rsync -avz --progress dist/nicochess nico@<target-ip>:~/
-```
+### 6.2 The service
 
-### 6.2 Run as a service
-
-Create `/etc/systemd/system/nicochess.service` on the target:
+`install.sh` writes `/etc/systemd/system/nicochess.service` (do not write it by hand):
 
 ```
 [Unit]
 Description=NicoChess board tracker
 
 [Service]
-User=nico
-Group=nico
+User=nicochess
+Group=nicochess
 SupplementaryGroups=video
-WorkingDirectory=/home/nico
-ExecStart=/home/nico/nicochess --listen 0.0.0.0:8080 --calibration /home/nico/calibration.json
+EnvironmentFile=-/etc/default/nicochess
+ExecStart=/opt/nicochess/nicochess --listen 0.0.0.0:8080 --data-dir /var/lib/nicochess/games --calibration /var/lib/nicochess/calibration.json $NICOCHESS_ARGS
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 There is no `After=network-online.target`, so the service also starts on a machine with no network (Wi-Fi access point only).
-Run `./nicochess --help` for all options. To test the camera by hand first: `./nicochess --device /dev/video0` and open the page.
-
-Enable and start it:
+To change the options, edit `/etc/default/nicochess` and run `sudo systemctl restart nicochess`. `/opt/nicochess/nicochess --help` lists them all. To test the camera by hand first, stop the service and run `/opt/nicochess/nicochess --device /dev/video0`.
 
 ```
-sudo systemctl daemon-reload
-sudo systemctl enable --now nicochess
 systemctl status nicochess
 journalctl -u nicochess -f
 ```
@@ -403,13 +364,13 @@ From any machine on the network, open `http://<target-ip>:8080` in a browser.
 The first page to connect is the controller and can start games and calibrate; the others only watch and replay (see `docs/requirements.md`).
 There is no login. Keep the target on a trusted network (later, the Wi-Fi access point with a WPA2 passphrase) and do not expose the port to the Internet.
 
-Games are stored as JSON files in `--data-dir` (default `data`, so `/home/nico/data` with the service above) and the calibration in `--calibration`. Back up that folder to keep the games.
+Games are JSON files in `/var/lib/nicochess/games`; the calibration and the picture settings are next to them in `/var/lib/nicochess`. Back up that folder to keep the games and the calibration.
 
 ## 7. Acceptance checklist
 
 The target is ready for development when all of these are true:
 
-- [ ] `lscpu` and `/proc/cpuinfo` results recorded in `docs/target-findings.md`.
+- [ ] `lscpu` and `/proc/cpuinfo` results written down (see section 1).
 - [ ] Debian 12 i386 installed without a desktop, boots to a login prompt.
 - [ ] SSH key login works, password login disabled.
 - [ ] The target keeps the same IP address after a reboot.
@@ -572,7 +533,6 @@ Limits and cautions:
 - Actual RAM and storage of the unit (not yet known).
 - Whether the BIOS allows booting from USB and has an AC power recovery option.
 - Whether the C170 exposes manual exposure and white balance on Linux.
-- Which cross-compile route (`cargo-zigbuild`, WSL2, Docker) works with the chosen crates.
 - Exact Debian 12 support dates for i386.
 - Which Wi-Fi dongle supports AP mode with a Debian 12 driver, and whether it needs non-free firmware.
 - Whether the corporate network allows the target to connect, otherwise the install is done at home.

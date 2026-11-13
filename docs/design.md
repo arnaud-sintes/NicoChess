@@ -53,21 +53,21 @@ Auto-detecting the corners of the board is done from the 49 inner corners of the
 
 | Need | Crate |
 |---|---|
-| Camera capture | `v4l` (V4L2 on Linux), used directly. `nokhwa` was considered but also wraps `v4l`, so it brings no benefit on the target |
+| Camera capture | Linux: `v4l` (V4L2), used directly. Windows: `nokhwa` (Media Foundation), on a camera thread of its own, with frames decoded in the program. Android: the app captures with Camera2 and pushes the pictures in (`src/pushed.rs`) |
 | Image processing and homography | `imageproc` + `image` (pure Rust), or `opencv` (needs an OpenCV install) |
-| Chess rules, legal moves, FEN/PGN | `shakmaty` (not added yet) |
-| UI and preview | A small synchronous web server (`tiny_http`) on the target machine; `axum` was considered but is heavier for a single-core Atom |
+| Chess rules, legal moves, FEN/PGN | `shakmaty` |
+| UI and preview | The program's own small synchronous web server (`src/http.rs`, thread per connection) on the target machine. `tiny_http` and `axum` were considered; ready-made small servers buffer the event streams, and `axum` is heavier for a single-core Atom |
 | Optional ML later | `ort` (ONNX Runtime) or `tract` |
 
 `imageproc` provides `Projection::from_control_points` and `warp`, so the pure-Rust route covers the homography.
-Start pure Rust and add `opencv` only if automatic corner detection is wanted.
+Pure Rust was enough, including automatic corner detection (`src/boarddetect.rs`), so `opencv` was never added.
 
 ## Setup tips
 
 - Use diffuse, constant lighting and a matte board, since glare is the main enemy.
 - Choose pieces with strong color contrast against the squares.
 - A higher camera makes occupancy easier but piece shapes harder, and 45° is a good compromise.
-- Keep camera and board fixed, and re-calibrate if either moves.
+- Keep camera and board fixed. During a game the calibration follows a small shift (a knock to the camera), see "Stabilization" in requirements.md; after a larger move, calibrate again.
 
 ## Milestones
 

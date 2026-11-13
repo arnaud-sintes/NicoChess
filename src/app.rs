@@ -6,8 +6,8 @@
 use crate::calibration::Calibration;
 use crate::camera::{self, SourceSpec};
 use crate::engine::{Engine, EngineConfig};
-use crate::tracker::TrackerConfig;
 use crate::http::Handler;
+use crate::tracker::TrackerConfig;
 use crate::{http, server, store::Store};
 use anyhow::Result;
 use std::net::TcpListener;
@@ -60,10 +60,11 @@ pub fn build(options: ServerOptions) -> Result<Built> {
     let engine = Engine::new(config, store, options.calibration_path, calibration);
     engine.spawn_capture(camera::factory(options.source, options.frame_interval))?;
 
-    // Event streams each hold a connection, so leave room for ordinary requests too.
+    // A page holds up to three long connections (events, camera picture, top-down board) and
+    // makes ordinary requests besides: leave room for all of that.
     Ok(Built {
         handler: server::handler(engine, options.max_viewers),
-        max_connections: options.max_viewers + 16,
+        max_connections: options.max_viewers * 3 + 8,
         listen: options.listen,
     })
 }

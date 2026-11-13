@@ -5,11 +5,11 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use shakmaty::KnownOutcome;
 use shakmaty::fen::Fen;
 use shakmaty::san::{San, SanPlus};
 use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, EnPassantMode, Move, Outcome, Position, Role};
-use shakmaty::KnownOutcome;
 
 /// File format version, bumped when the stored shape changes.
 pub const FORMAT_VERSION: u32 = 1;
@@ -46,9 +46,7 @@ pub struct GameRecord {
 
 pub fn parse_fen(fen: &str) -> Result<Chess> {
     let parsed: Fen = fen.trim().parse().map_err(|e| anyhow!("bad FEN: {e}"))?;
-    parsed
-        .into_position(CastlingMode::Standard)
-        .map_err(|e| anyhow!("illegal position: {e}"))
+    parsed.into_position(CastlingMode::Standard).map_err(|e| anyhow!("illegal position: {e}"))
 }
 
 pub fn fen_of(pos: &Chess) -> String {
@@ -84,13 +82,7 @@ pub fn clean_name(name: &str, default: &str) -> String {
 }
 
 impl GameRecord {
-    pub fn new(
-        id: String,
-        started_at: Option<String>,
-        white: &str,
-        black: &str,
-        start_fen: Option<String>,
-    ) -> Result<Self> {
+    pub fn new(id: String, started_at: Option<String>, white: &str, black: &str, start_fen: Option<String>) -> Result<Self> {
         let start_fen = start_fen.map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
         if let Some(fen) = &start_fen {
             parse_fen(fen)?;
@@ -147,12 +139,7 @@ impl GameRecord {
             bail!("illegal move");
         }
         let t = round_tenths(t.max(self.moves.last().map_or(0.0, |m| m.t)));
-        self.moves.push(MoveRecord {
-            uci: uci_of(mv),
-            san: san_of(&pos, mv),
-            t,
-            promotion_guess,
-        });
+        self.moves.push(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t, promotion_guess });
         Ok(self.moves.last().expect("just pushed"))
     }
 
@@ -333,14 +320,7 @@ mod tests {
     use crate::synthetic::OPERA_GAME;
 
     fn opera() -> GameRecord {
-        let mut game = GameRecord::new(
-            "test".into(),
-            Some("2026-11-04T10:15:30.000Z".into()),
-            "Morphy",
-            "Duke",
-            None,
-        )
-        .unwrap();
+        let mut game = GameRecord::new("test".into(), Some("2026-11-04T10:15:30.000Z".into()), "Morphy", "Duke", None).unwrap();
         for (i, san) in OPERA_GAME.iter().enumerate() {
             game.push_text(san, 5.0 * (i + 1) as f64).unwrap();
         }

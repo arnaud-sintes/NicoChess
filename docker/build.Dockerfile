@@ -21,7 +21,7 @@ RUN apt-get update \
 # `linux32` makes `uname -m` report a 32-bit machine (a 64-bit kernel would
 # otherwise make rustup pick the 64-bit toolchain), and the host is set explicitly.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-  | linux32 sh -s -- -y --profile minimal --default-toolchain stable \
+  | linux32 sh -s -- -y --profile minimal --default-toolchain 1.98.1 \
       --default-host i686-unknown-linux-gnu
 
 WORKDIR /src

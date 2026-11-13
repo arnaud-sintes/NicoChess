@@ -66,7 +66,9 @@ pub enum Detection {
         promotion_guess: bool,
     },
     /// The board changed but no single move fits well enough.
-    Unsure { candidates: Vec<Candidate> },
+    Unsure {
+        candidates: Vec<Candidate>,
+    },
 }
 
 /// Tells when the image has stopped changing.
@@ -131,6 +133,9 @@ pub struct Tracker {
     last_eval: Option<Grid>,
     still: bool,
     unsure: bool,
+    /// The moves offered while unsure, kept so that they come back when the same picture is seen
+    /// again after a hand passed over the board.
+    candidates: Vec<Candidate>,
 }
 
 /// What the board should look like for a position.
@@ -149,13 +154,10 @@ pub fn expected_grid(pos: &Chess) -> Grid {
 /// How badly a picture disagrees with an expected board. A square read with high
 /// confidence that contradicts the expectation costs more than a doubtful one.
 fn cost(seen: &Grid, confidence: &[f32; 64], expected: &Grid) -> f32 {
-    (0..64)
-        .filter(|&i| seen[i] != expected[i])
-        .map(|i| 0.5 + confidence[i])
-        .sum()
+    (0..64).filter(|&i| seen[i] != expected[i]).map(|i| 0.5 + confidence[i]).sum()
 }
 
-struct Option_ {
+struct Hypothesis {
     cost: f32,
     grid: Grid,
     /// `None` means "no move was played".
@@ -175,6 +177,7 @@ impl Tracker {
             last_eval: None,
             still: false,
             unsure: false,
+            candidates: Vec::new(),
         }
     }
 
@@ -261,14 +264,14 @@ impl Tracker {
         };
         self.still = true;
         if self.last_eval == Some(grid) {
-            return Detection::Nothing;
+            return if self.unsure { Detection::Unsure { candidates: self.candidates.clone() } } else { Detection::Nothing };
         }
         self.last_eval = Some(grid);
         self.evaluate(&grid, &confidence, since)
     }
 
     fn evaluate(&mut self, seen: &Grid, confidence: &[f32; 64], since: Instant) -> Detection {
-        let mut options = vec![Option_ {
+        let mut options = vec![Hypothesis {
             cost: cost(seen, confidence, &expected_grid(&self.position)),
             grid: expected_grid(&self.position),
             mv: None,
@@ -284,7 +287,7 @@ impl Tracker {
                 }
                 continue;
             }
-            options.push(Option_ { cost: cost(seen, confidence, &grid), grid, mv: Some(mv) });
+            options.push(Hypothesis { cost: cost(seen, confidence, &grid), grid, mv: Some(mv) });
         }
         options.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
@@ -306,11 +309,10 @@ impl Tracker {
         self.unsure = true;
         let candidates = options
             .iter()
-            .filter_map(|o| {
-                o.mv.map(|mv| Candidate { uci: uci_of(mv), san: san_of(&self.position, mv), cost: o.cost })
-            })
+            .filter_map(|o| o.mv.map(|mv| Candidate { uci: uci_of(mv), san: san_of(&self.position, mv), cost: o.cost }))
             .take(4)
-            .collect();
+            .collect::<Vec<_>>();
+        self.candidates = candidates.clone();
         Detection::Unsure { candidates }
     }
 }
@@ -406,7 +408,15 @@ mod tests {
             broken[usize::from(sq)] = None;
         }
         let detections = rig.show(&broken, 4);
-        assert!(matches!(detections.as_slice(), [Detection::Unsure { candidates }] if !candidates.is_empty()));
+        assert!(!detections.is_empty());
+        assert!(detections.iter().all(|d| matches!(d, Detection::Unsure { candidates } if !candidates.is_empty())));
+        assert_eq!(rig.tracker.status(), Status::Unsure);
+
+        // A hand passes over the board and goes away: the same picture is seen again, and the
+        // moves to choose from come back (they must not vanish while the page asks for a choice).
+        rig.show(&synthetic::start_grid(), 1);
+        let again = rig.show(&broken, 4);
+        assert!(again.iter().any(|d| matches!(d, Detection::Unsure { candidates } if !candidates.is_empty())));
         assert_eq!(rig.tracker.status(), Status::Unsure);
 
         // Putting the pieces back and playing a real move recovers.

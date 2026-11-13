@@ -43,9 +43,10 @@ if (-not $SkipDebs) {
 }
 if (-not (Test-Path "$bundle\debs\Packages")) { throw 'usb\debs\Packages is missing: run without -SkipDebs' }
 
-# Checksums of everything except the packages (apt checks those itself, from `Packages`).
+# Checksums of everything, the packages included: the apt repository on the key is not signed
+# (install.sh trusts it), so this is what catches a damaged copy.
 $lines = Get-ChildItem $bundle -Recurse -File |
-    Where-Object { $_.FullName -notlike "$bundle\debs\*" -and $_.Name -ne 'SHA256SUMS' } |
+    Where-Object { $_.Name -ne 'SHA256SUMS' } |
     Sort-Object FullName |
     ForEach-Object {
         $relative = $_.FullName.Substring($bundle.Length + 1).Replace('\', '/')
