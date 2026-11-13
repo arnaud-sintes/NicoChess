@@ -51,6 +51,8 @@ records the game, and shows it live and in replay on a phone or tablet.
 - FR-9. The live page shows a virtual board and the move list, updated by push.
 - FR-10. Promotion: the page asks which piece, defaulting to queen.
 - FR-11. End of game: checkmate and stalemate come from the rules. Resign, draw and abort are buttons. The result (1-0, 0-1, 1/2-1/2, or unfinished) is recorded.
+- FR-11a. Draw rules: fivefold repetition and the 75-move rule end the game at once (recorded as the termination). Threefold repetition and the 50-move rule do not: the page shows a "Claim the draw" button, and the server accepts the claim only when the position allows it. Positions are the same when pieces, side to move, castling rights and possible en passant captures are the same.
+- FR-11b. When two moves were played between two still pictures, the tracker recognises the pair (both are recorded, with the same time), or offers pairs among the candidates. A move entered by hand may be two moves ("e4 e5"): both or neither.
 - FR-12. Corrections (controller only): undo the last move, enter a move by hand, and choose from the candidates when the match is ambiguous.
 
 ### Past games
@@ -152,6 +154,5 @@ Known limits:
 - A game that was running when the power went off (or the program was stopped) is found at start and kept in the Idle state; the page offers **Resume** (the camera is opened and the squares are learned again from the position reached) or **Close it** (the game is ended as unfinished). The moves are on disk as they are recorded.
 - Promotion is guessed as a queen, and the page offers the other pieces.
 - Detection assumes a still camera. A small shift during a game (a knock, a phone slipping on its stand) is followed by the stabilization (FR-3c); after a larger move, calibrate again (the squares are learned again from the current position).
-- Repetition and the 50-move rule are not detected: the game ends by checkmate, stalemate or insufficient material, or by a button.
-- Two moves made between two still pictures (an instant reply) match no single legal move: the page stays unsure until the moves are entered by hand.
+- Two moves made between two still pictures are recognised as a pair only when it clearly fits better than any single move and any other pair (FR-11a); when two pairs leave the same colours on the same squares, the page stays unsure.
 - The warp keeps a 25 pixel margin around the board for the future "captured pieces" idea; nothing uses it yet.

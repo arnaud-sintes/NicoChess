@@ -39,7 +39,7 @@ Everything is built and tested on a PC with a synthetic camera. The integrated w
 | Stabilization: during a game the calibration follows the board if the camera shifts a little (can be switched off) | Tried only on synthetic pictures: not yet on a real board |
 | Camera and top-down pictures pushed as Motion JPEG streams (no polling) | Speed of the preview on a real phone not measured: see the figures under the picture |
 | Per-square empty / white / black detection, learned from the known start position | |
-| Stability gate and legal-move matching, with castling, en passant, promotion | |
+| Stability gate and legal-move matching, with castling, en passant, promotion; two moves played between two pictures; draws by repetition and the 50/75-move rules (claim button for the claimable ones) | |
 | Live board and move list with timestamps (offsets from the start of the game) | |
 | Manual corrections: undo, enter a move, pick among candidates, change a promotion | |
 | End of game by the rules, or by resignation, draw, abort | |

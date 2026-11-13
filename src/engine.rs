@@ -506,6 +506,11 @@ impl Engine {
                         changed = true;
                     }
                 }
+                Detection::Pair { first, second, since } => {
+                    inner.candidates.clear();
+                    self.apply_detected_pair(inner, first, second, since);
+                    changed = true;
+                }
                 Detection::Move { mv, since, promotion_guess } => {
                     inner.candidates.clear();
                     self.apply_detected_move(inner, mv, since, promotion_guess);
@@ -638,6 +643,30 @@ impl Engine {
                     inner.tracker.set_position(pos);
                 }
                 return;
+            }
+        }
+        self.after_game_change(inner);
+    }
+
+    /// Two moves were recognised at once: both are recorded, at the time the board became still.
+    fn apply_detected_pair(&self, inner: &mut Inner, first: shakmaty::Move, second: shakmaty::Move, since: Instant) {
+        let Some(game) = inner.game.as_mut() else { return };
+        let t = since.saturating_duration_since(inner.game_started.unwrap_or(since)).as_secs_f64();
+        let before = game.moves.len();
+        for mv in [first, second] {
+            match game.push_move(mv, t, mv.promotion().is_some()) {
+                Ok(record) => eprintln!("game: {} {} (two moves at once)", record.san, record.uci),
+                Err(e) => {
+                    // The tracker and the game disagree: trust the game, and keep neither move.
+                    while game.moves.len() > before {
+                        game.undo();
+                    }
+                    inner.notice = Some(format!("two detected moves were rejected ({e:#}); position kept"));
+                    if let Ok(pos) = game.position() {
+                        inner.tracker.set_position(pos);
+                    }
+                    return;
+                }
             }
         }
         self.after_game_change(inner);
@@ -781,6 +810,7 @@ impl Engine {
                 "result": g.result,
                 "termination": g.termination,
                 "over": g.result.is_some(),
+                "draw_claim": g.claimable_draw().ok().flatten(),
             })
         });
         let promotion_pending = inner.game.as_ref().and_then(|g| g.moves.last()).is_some_and(|m| m.promotion_guess);
@@ -1119,8 +1149,19 @@ impl Engine {
         if !["1-0", "0-1", "1/2-1/2", "*"].contains(&result) {
             return Err(ApiError::BadRequest("unknown result".into()));
         }
-        if !["resignation", "agreement", "abandoned", "other"].contains(&reason) {
+        // A draw by a rule that a player must claim: only when the position allows it.
+        const CLAIMS: [&str; 2] = ["threefold repetition", "50-move rule"];
+        if !["resignation", "agreement", "abandoned", "other"].contains(&reason) && !CLAIMS.contains(&reason) {
             return Err(ApiError::BadRequest("unknown reason".into()));
+        }
+        if CLAIMS.contains(&reason) {
+            if result != "1/2-1/2" {
+                return Err(ApiError::BadRequest("a claimed draw is a draw".into()));
+            }
+            let claimable = inner.game.as_ref().and_then(|g| g.claimable_draw().ok().flatten());
+            if claimable != Some(reason) {
+                return Err(ApiError::Conflict("that draw cannot be claimed in this position".into()));
+            }
         }
         let no_moves = inner.game.as_ref().is_none_or(|g| g.moves.is_empty());
         let mut forget = None;
@@ -1154,7 +1195,20 @@ impl Engine {
         }
         let t = inner.game_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
-        game.push_text(text, t)?;
+        // One move, or two ("e4 e5") when a reply was played before the first move was seen: all or nothing.
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.is_empty() || parts.len() > 2 {
+            return Err(ApiError::BadRequest("give one move, or two separated by a space".into()));
+        }
+        let before = game.moves.len();
+        for part in parts {
+            if let Err(e) = game.push_text(part, t) {
+                while game.moves.len() > before {
+                    game.undo();
+                }
+                return Err(e.into());
+            }
+        }
         let position = game.position().map_err(ApiError::internal)?;
         inner.tracker.set_position(position);
         inner.candidates.clear();
@@ -1171,10 +1225,12 @@ impl Engine {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         let reopenable = inner.mode != Mode::Playing
-            && inner
-                .game
-                .as_ref()
-                .is_some_and(|g| matches!(g.termination.as_deref(), Some("checkmate" | "stalemate" | "insufficient material")));
+            && inner.game.as_ref().is_some_and(|g| {
+                matches!(
+                    g.termination.as_deref(),
+                    Some("checkmate" | "stalemate" | "insufficient material" | "fivefold repetition" | "75-move rule")
+                )
+            });
         if inner.mode != Mode::Playing && !reopenable {
             return Err(ApiError::Conflict("no game is running".into()));
         }
@@ -1276,6 +1332,51 @@ fn status_name(status: Status) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine with a game that is being recorded, to feed the detections of the tracker by hand.
+    fn engine_playing(name: &str) -> (Arc<Engine>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let engine = Engine::new(EngineConfig::default(), store, dir.join("calibration.json"), None);
+        {
+            let mut inner = engine.inner.grab();
+            inner.game = Some(GameRecord::new("pair".into(), None, "A", "B", None).unwrap());
+            inner.mode = Mode::Playing;
+            inner.game_started = Some(Instant::now());
+        }
+        (engine, dir)
+    }
+
+    #[test]
+    fn two_detected_moves_are_both_recorded_and_an_illegal_pair_is_not() {
+        let (engine, dir) = engine_playing("detected-pair");
+        use shakmaty::Position;
+        let start = shakmaty::Chess::default();
+        let e4 = crate::game::parse_move(&start, "e2e4").unwrap();
+        let mut after = start.clone();
+        after.play_unchecked(e4);
+        let e5 = crate::game::parse_move(&after, "e7e5").unwrap();
+        {
+            let mut inner = engine.inner.grab();
+            engine.apply_detected_pair(&mut inner, e4, e5, Instant::now());
+            let game = inner.game.as_ref().unwrap();
+            assert_eq!(game.moves.len(), 2);
+            assert_eq!((game.moves[0].uci.as_str(), game.moves[1].uci.as_str()), ("e2e4", "e7e5"));
+            assert!(inner.pending_save.is_some(), "the game is marked to be written");
+        }
+        engine.flush_save().unwrap();
+        assert_eq!(engine.list_games().unwrap()[0].moves, 2);
+
+        // A pair that does not follow from the position (the tracker and the game disagree): neither is kept.
+        {
+            let mut inner = engine.inner.grab();
+            engine.apply_detected_pair(&mut inner, e4, e5, Instant::now());
+            assert_eq!(inner.game.as_ref().unwrap().moves.len(), 2);
+            assert!(inner.notice.as_deref().is_some_and(|n| n.contains("two detected moves were rejected")));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_lock_goes_on_working_after_a_thread_panicked_holding_it() {

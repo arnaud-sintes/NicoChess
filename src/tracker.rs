@@ -65,6 +65,14 @@ pub enum Detection {
         /// The promotion piece is assumed to be a queen: vision cannot tell.
         promotion_guess: bool,
     },
+    /// Two moves were recognised at once: the second player replied before the picture was taken
+    /// (or the first move was never seen still). The tracker has applied both.
+    Pair {
+        first: Move,
+        second: Move,
+        /// When the board became still after the second move.
+        since: Instant,
+    },
     /// The board changed but no single move fits well enough.
     Unsure {
         candidates: Vec<Candidate>,
@@ -162,6 +170,16 @@ struct Hypothesis {
     grid: Grid,
     /// `None` means "no move was played".
     mv: Option<Move>,
+}
+
+/// Two moves played one after the other, and what the board would look like after them.
+struct PairHypothesis {
+    cost: f32,
+    grid: Grid,
+    first: Move,
+    second: Move,
+    /// How many of the two moves are promotions to a queen (the one vision cannot tell apart from other pieces).
+    queens: u8,
 }
 
 impl Tracker {
@@ -306,14 +324,79 @@ impl Tracker {
             };
         }
 
+        // No single move explains the board (or two do equally well). Perhaps two moves were played
+        // between two still pictures: look at pairs. One is believed on the same terms as a single move
+        // (a good fit, and at least `margin` better than the runner-up) and must also beat the best single
+        // move by that margin.
+        let best_single = best.cost;
+        let pairs = if best_single > self.cfg.max_cost { self.pair_hypotheses(seen, confidence, best_single) } else { Vec::new() };
+        if let Some(found) = pairs.first() {
+            let next = pairs.get(1).map_or(f32::INFINITY, |p| p.cost);
+            if found.cost <= self.cfg.max_cost && next - found.cost >= self.cfg.margin && best_single - found.cost >= self.cfg.margin {
+                let (first, second) = (found.first, found.second);
+                self.position.play_unchecked(first);
+                self.position.play_unchecked(second);
+                self.unsure = false;
+                self.last_eval = Some(*seen);
+                return Detection::Pair { first, second, since };
+            }
+        }
+
         self.unsure = true;
-        let candidates = options
-            .iter()
-            .filter_map(|o| o.mv.map(|mv| Candidate { uci: uci_of(mv), san: san_of(&self.position, mv), cost: o.cost }))
-            .take(4)
-            .collect::<Vec<_>>();
-        self.candidates = candidates.clone();
-        Detection::Unsure { candidates }
+        // The moves to choose from: the likeliest singles, and the pairs that fit better than any single.
+        let mut offered: Vec<Candidate> = pairs.iter().take(2).map(|p| self.pair_candidate(p)).collect();
+        offered.extend(
+            options.iter().filter_map(|o| o.mv.map(|mv| Candidate { uci: uci_of(mv), san: san_of(&self.position, mv), cost: o.cost })),
+        );
+        offered.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+        offered.truncate(4);
+        self.candidates = offered.clone();
+        Detection::Unsure { candidates: offered }
+    }
+
+    /// The pairs of moves (one by each side) after which the board would look the most like the picture,
+    /// best first, at most four. Only those that fit better than `must_beat` are kept: a pair that does
+    /// not beat the best single move is of no use.
+    fn pair_hypotheses(&self, seen: &Grid, confidence: &[f32; 64], must_beat: f32) -> Vec<PairHypothesis> {
+        let mut found: Vec<PairHypothesis> = Vec::new();
+        for first in self.position.legal_moves() {
+            let mut after_first = self.position.clone();
+            after_first.play_unchecked(first);
+            for second in after_first.legal_moves() {
+                let mut after_second = after_first.clone();
+                after_second.play_unchecked(second);
+                let grid = expected_grid(&after_second);
+                let cost = cost(seen, confidence, &grid);
+                if cost >= must_beat {
+                    continue;
+                }
+                let queens = u8::from(first.promotion() == Some(Role::Queen)) + u8::from(second.promotion() == Some(Role::Queen));
+                // Promotions to different pieces look the same: keep the queens.
+                if let Some(existing) = found.iter_mut().find(|p| p.grid == grid) {
+                    if queens > existing.queens {
+                        *existing = PairHypothesis { cost, grid, first, second, queens };
+                    }
+                    continue;
+                }
+                found.push(PairHypothesis { cost, grid, first, second, queens });
+            }
+        }
+        found.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+        found.truncate(4);
+        found
+    }
+
+    /// A pair of moves as something the page can offer: "e2e4 e7e5" to send, "e4 e5" to show.
+    fn pair_candidate(&self, pair: &PairHypothesis) -> Candidate {
+        let mut after_first = self.position.clone();
+        let first_san = san_of(&after_first, pair.first);
+        after_first.play_unchecked(pair.first);
+        let second_san = san_of(&after_first, pair.second);
+        Candidate {
+            uci: format!("{} {}", uci_of(pair.first), uci_of(pair.second)),
+            san: format!("{first_san} {second_san}"),
+            cost: pair.cost,
+        }
     }
 }
 
@@ -395,6 +478,58 @@ mod tests {
         assert_eq!(rig.tracker.status(), Status::Moving);
         assert!(rig.show(&synthetic::start_grid(), 4).is_empty());
         assert_eq!(rig.tracker.status(), Status::Watching);
+    }
+
+    #[test]
+    fn two_moves_played_between_two_pictures_are_recognised() {
+        let steps = synthetic::game_steps(&["e4", "e5", "Nf3"]);
+        let mut rig = Rig::new(Chess::default());
+        assert!(rig.show(&synthetic::start_grid(), 7).is_empty());
+
+        // White moves and Black answers before the picture is taken: the board shows both.
+        let detections = rig.show(&steps[1].after, 4);
+        match detections.as_slice() {
+            [Detection::Pair { first, second, .. }] => {
+                assert_eq!((uci_of(*first), uci_of(*second)), ("e2e4".to_string(), "e7e5".to_string()))
+            }
+            other => panic!("expected one pair, got {other:?}"),
+        }
+        assert_eq!(rig.tracker.status(), Status::Watching);
+        // The tracker is in step with the game: the next ordinary move is a single move again.
+        let detections = rig.show(&steps[2].after, 4);
+        assert!(matches!(detections.as_slice(), [Detection::Move { mv, .. }] if uci_of(*mv) == "g1f3"), "{detections:?}");
+    }
+
+    #[test]
+    fn a_pair_with_captures_is_recognised_too() {
+        // 1.e4 e5 2.Nf3 d6 3.d4 Bg4 are seen one move at a time; then dxe5 Bxf3 at once.
+        let steps = synthetic::game_steps(&OPERA_GAME);
+        let mut rig = Rig::new(Chess::default());
+        assert!(rig.show(&synthetic::start_grid(), 7).is_empty());
+        for step in &steps[..6] {
+            assert!(matches!(rig.show(&step.after, 4).as_slice(), [Detection::Move { .. }]));
+        }
+        let detections = rig.show(&steps[7].after, 4);
+        match detections.as_slice() {
+            [Detection::Pair { first, second, .. }] => {
+                assert_eq!((uci_of(*first), uci_of(*second)), ("d4e5".to_string(), "g4f3".to_string()))
+            }
+            other => panic!("expected one pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsure_offers_the_pair_that_fits_best_but_is_not_believed_alone() {
+        // A board that matches no move and no pair well: three pieces vanish. Nothing is guessed.
+        let mut rig = Rig::new(Chess::default());
+        rig.show(&synthetic::start_grid(), 4);
+        let mut broken = synthetic::start_grid();
+        for sq in [Square::A2, Square::C2, Square::G7, Square::H8] {
+            broken[usize::from(sq)] = None;
+        }
+        let detections = rig.show(&broken, 4);
+        assert!(detections.iter().all(|d| matches!(d, Detection::Unsure { .. })), "{detections:?}");
+        assert_eq!(rig.tracker.status(), Status::Unsure);
     }
 
     #[test]

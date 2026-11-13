@@ -57,8 +57,8 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
 
 ## Known limits
 
-- Repetition and the 50-move rule are not detected: only checkmate, stalemate and insufficient material end a game by themselves.
-- Two moves made between two still pictures (an instant reply) match no single legal move: the page stays unsure until they are entered by hand.
+- Draws by repetition and by the 50-move rule follow the FIDE rules: fivefold repetition and the 75-move rule end the game by themselves; threefold repetition and the 50-move rule only show a "Claim the draw" button, because a player has to claim them.
+- Two moves made between two still pictures (an instant reply) are recognised as a pair when the board matches that pair clearly better than any single move and any other pair; otherwise the page stays unsure, offers the likeliest singles and pairs, and the moves can be entered by hand ("e4 e5"). Since the camera only sees empty, white or black squares, two different pairs that leave the same squares occupied by the same colours cannot be told apart: such a case stays unsure.
 - Promotion is guessed as a queen; the page offers the other pieces.
 - Detection quality on a real board, with real lighting and real pieces, is **not yet tested** with any camera. The auto-detect of the board was only tried on a few photos found on the web, and the stabilization only on synthetic pictures.
 - The Android app has been built but not yet run on a phone since the service and the settings were added; a USB camera works only on phones whose Android lists it to apps.

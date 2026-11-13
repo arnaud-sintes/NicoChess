@@ -49,6 +49,41 @@ pub fn parse_fen(fen: &str) -> Result<Chess> {
     parsed.into_position(CastlingMode::Standard).map_err(|e| anyhow!("illegal position: {e}"))
 }
 
+/// A draw rule about repeated positions or the number of moves without a capture or a pawn move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawRule {
+    /// The same position five times: the game is drawn at once.
+    Fivefold,
+    /// 75 moves each without a capture or a pawn move: drawn at once.
+    SeventyFive,
+    /// The same position three times: a player may claim the draw.
+    Threefold,
+    /// 50 moves each without a capture or a pawn move: a player may claim the draw.
+    FiftyMove,
+}
+
+impl DrawRule {
+    pub fn name(self) -> &'static str {
+        match self {
+            DrawRule::Fivefold => "fivefold repetition",
+            DrawRule::SeventyFive => "75-move rule",
+            DrawRule::Threefold => "threefold repetition",
+            DrawRule::FiftyMove => "50-move rule",
+        }
+    }
+
+    /// True when the game ends by itself, without a claim.
+    pub fn automatic(self) -> bool {
+        matches!(self, DrawRule::Fivefold | DrawRule::SeventyFive)
+    }
+}
+
+/// What makes two positions "the same" for the repetition rules: the first four fields of the
+/// FEN (pieces, side to move, castling, en passant), the last two being the move counters.
+fn repetition_key(pos: &Chess) -> String {
+    fen_of(pos).split(' ').take(4).collect::<Vec<_>>().join(" ")
+}
+
 pub fn fen_of(pos: &Chess) -> String {
     Fen::from_position(pos, EnPassantMode::Legal).to_string()
 }
@@ -193,11 +228,51 @@ impl GameRecord {
         }
     }
 
+    /// The strongest repetition or move-count rule that applies after the recorded moves, if any.
+    /// Positions are the same when the pieces, the side to move, the castling rights and the
+    /// possible en passant captures are the same (the FIDE definition).
+    pub fn draw_rule(&self) -> Result<Option<DrawRule>> {
+        let mut pos = self.start_position()?;
+        let mut keys = vec![repetition_key(&pos)];
+        for record in &self.moves {
+            let mv = parse_move(&pos, &record.uci).with_context(|| format!("bad stored move {}", record.uci))?;
+            pos.play_unchecked(mv);
+            keys.push(repetition_key(&pos));
+        }
+        let now = keys.last().cloned().unwrap_or_default();
+        let repeats = keys.iter().filter(|key| **key == now).count();
+        let clock = pos.halfmoves();
+        Ok(if repeats >= 5 {
+            Some(DrawRule::Fivefold)
+        } else if clock >= 150 {
+            Some(DrawRule::SeventyFive)
+        } else if repeats >= 3 {
+            Some(DrawRule::Threefold)
+        } else if clock >= 100 {
+            Some(DrawRule::FiftyMove)
+        } else {
+            None
+        })
+    }
+
+    /// The draw a player may claim now (threefold repetition, 50-move rule), if the game is
+    /// still going. The automatic ones end the game by themselves (see `rules_outcome`).
+    pub fn claimable_draw(&self) -> Result<Option<&'static str>> {
+        if self.result.is_some() {
+            return Ok(None);
+        }
+        Ok(self.draw_rule()?.filter(|rule| !rule.automatic()).map(DrawRule::name))
+    }
+
     /// The result and the reason if the rules say the game is over.
     pub fn rules_outcome(&self) -> Result<Option<(String, String)>> {
         let pos = self.position()?;
         Ok(match pos.outcome() {
-            Outcome::Unknown => None,
+            // Mate and stalemate come first; then the draws that need no claim.
+            Outcome::Unknown => match self.draw_rule()? {
+                Some(rule) if rule.automatic() => Some(("1/2-1/2".to_string(), rule.name().to_string())),
+                _ => None,
+            },
             Outcome::Known(known) => {
                 let reason = if pos.legal_moves().is_empty() {
                     if pos.is_check() { "checkmate" } else { "stalemate" }
@@ -433,6 +508,58 @@ mod tests {
         let back: GameRecord = serde_json::from_str(&text).unwrap();
         assert_eq!(back.moves, game.moves);
         assert_eq!(back.fens().unwrap(), game.fens().unwrap());
+    }
+
+    /// Plays knight moves out and back, from ply `from` to ply `to` (4 plies bring the start position back).
+    fn shuffle(game: &mut GameRecord, from: usize, to: usize) {
+        for ply in from..to {
+            game.push_text(["Nf3", "Nf6", "Ng1", "Ng8"][ply % 4], ply as f64).unwrap();
+        }
+    }
+
+    #[test]
+    fn threefold_repetition_can_be_claimed_and_fivefold_ends_the_game() {
+        let mut game = GameRecord::new("t".into(), None, "A", "B", None).unwrap();
+        shuffle(&mut game, 0, 4);
+        assert_eq!(game.claimable_draw().unwrap(), None, "the start position was seen twice");
+        shuffle(&mut game, 4, 8);
+        assert_eq!(game.claimable_draw().unwrap(), Some("threefold repetition"));
+        assert_eq!(game.rules_outcome().unwrap(), None, "a claim is up to the players");
+        shuffle(&mut game, 8, 15);
+        assert_eq!(game.rules_outcome().unwrap(), None, "the fifth time has not come yet");
+        shuffle(&mut game, 15, 16);
+        assert_eq!(game.rules_outcome().unwrap(), Some(("1/2-1/2".to_string(), "fivefold repetition".to_string())));
+    }
+
+    #[test]
+    fn the_fifty_move_rule_is_claimed_and_the_seventy_five_move_rule_ends_the_game() {
+        // A rook move is neither a capture nor a pawn move: the clock goes up by one.
+        let claim = "4k3/8/8/8/8/8/8/R3K3 w - - 99 80";
+        let mut game = GameRecord::new("t".into(), None, "A", "B", Some(claim.into())).unwrap();
+        assert_eq!(game.claimable_draw().unwrap(), None, "99 half-moves");
+        game.push_text("Ra2", 1.0).unwrap();
+        assert_eq!(game.claimable_draw().unwrap(), Some("50-move rule"));
+        assert_eq!(game.rules_outcome().unwrap(), None);
+
+        let forced = "4k3/8/8/8/8/8/8/R3K3 w - - 149 100";
+        let mut game = GameRecord::new("t".into(), None, "A", "B", Some(forced.into())).unwrap();
+        game.push_text("Ra2", 1.0).unwrap();
+        assert_eq!(game.rules_outcome().unwrap(), Some(("1/2-1/2".to_string(), "75-move rule".to_string())));
+
+        // A pawn move starts the count again.
+        let pawn = "4k3/8/8/8/8/8/4P3/4K3 w - - 120 90";
+        let mut game = GameRecord::new("t".into(), None, "A", "B", Some(pawn.into())).unwrap();
+        assert_eq!(game.claimable_draw().unwrap(), Some("50-move rule"));
+        game.push_text("e4", 1.0).unwrap();
+        assert_eq!(game.claimable_draw().unwrap(), None);
+    }
+
+    #[test]
+    fn a_finished_game_has_nothing_to_claim() {
+        let mut game = GameRecord::new("t".into(), None, "A", "B", Some("4k3/8/8/8/8/8/8/R3K3 w - - 110 80".into())).unwrap();
+        assert_eq!(game.claimable_draw().unwrap(), Some("50-move rule"));
+        game.finish("1/2-1/2", "50-move rule");
+        assert_eq!(game.claimable_draw().unwrap(), None);
     }
 
     #[test]

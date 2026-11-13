@@ -770,6 +770,78 @@ mod tests {
         assert!(rig.engine.list_games().unwrap().is_empty(), "the empty game is gone from the disk too");
     }
 
+    /// A running game on the synthetic source, with a calibration: for the commands that play moves.
+    fn running_game(name: &str) -> Rig {
+        let rig = rig(name, SourceSpec::Synthetic);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
+        rig
+    }
+
+    fn play(rig: &Rig, moves: &[&str]) {
+        for text in moves {
+            let body = json!({ "move": text }).to_string();
+            assert_eq!(rig.call("POST", "/api/game/move", ALICE, &body).0, 200, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_draw_by_repetition_is_claimed_by_a_player_and_ends_at_the_fifth_time() {
+        let rig = running_game("claim");
+        let claim = |reason: &str| rig.call("POST", "/api/game/end", ALICE, &json!({ "result": "1/2-1/2", "reason": reason }).to_string());
+        let shuffle = ["Nf3", "Nf6", "Ng1", "Ng8"];
+        play(&rig, &shuffle);
+        assert!(rig.state(ALICE)["game"]["draw_claim"].is_null(), "twice is not enough");
+        assert_eq!(claim("threefold repetition").0, 409, "nothing to claim yet");
+        play(&rig, &shuffle);
+        assert_eq!(rig.state(ALICE)["game"]["draw_claim"], "threefold repetition");
+        assert_eq!(rig.state(ALICE)["mode"], "playing", "a claim is up to the players");
+
+        // The wrong rule, or another result, is refused; the right claim ends the game.
+        assert_eq!(claim("50-move rule").0, 409);
+        let wrong = rig.call("POST", "/api/game/end", ALICE, r#"{"result": "1-0", "reason": "threefold repetition"}"#);
+        assert_eq!(wrong.0, 400);
+        assert_eq!(claim("threefold repetition").0, 200);
+        let state = rig.state(ALICE);
+        assert_eq!(
+            (state["game"]["result"].as_str(), state["game"]["termination"].as_str()),
+            (Some("1/2-1/2"), Some("threefold repetition"))
+        );
+        assert_eq!(state["mode"], "idle");
+    }
+
+    #[test]
+    fn fivefold_repetition_ends_the_game_by_itself() {
+        let rig = running_game("fivefold");
+        let shuffle = ["Nf3", "Nf6", "Ng1", "Ng8"];
+        for _ in 0..4 {
+            play(&rig, &shuffle);
+        }
+        let state = rig.state(ALICE);
+        assert_eq!(state["game"]["termination"], "fivefold repetition");
+        assert_eq!(state["game"]["result"], "1/2-1/2");
+        assert_eq!(state["mode"], "idle");
+        // It is taken back like a checkmate that was a misreading.
+        assert_eq!(rig.call("POST", "/api/game/undo", ALICE, "").0, 200);
+        assert_eq!(rig.state(ALICE)["mode"], "playing");
+    }
+
+    #[test]
+    fn two_moves_can_be_entered_at_once_all_or_nothing() {
+        let rig = running_game("pair");
+        play(&rig, &["e4 e5"]);
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 2);
+        // The second move is illegal: the first is not kept either.
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "Nf3 Nf3"}"#).0, 400);
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 2);
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "Nf3 Nc6 Bb5"}"#).0, 400, "three at once is too many");
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "   "}"#).0, 400);
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 2);
+    }
+
     fn corners_json() -> String {
         json!({ "corners": synthetic::corners().corners }).to_string()
     }

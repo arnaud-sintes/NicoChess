@@ -143,6 +143,10 @@
           <strong id="game-result"></strong><a id="game-pgn" href="#" download>Download PGN</a>
         </div>
         <div id="controls" hidden>
+          <div class="bar" id="draw-claim" hidden>
+            <span id="draw-claim-text"></span>
+            <button id="claim-draw" title="End the game as a draw">Claim the draw</button>
+          </div>
           <div class="bar">
             <input type="text" id="move" placeholder="Enter a move, e.g. Nf3 or e2e4" autocapitalize="off" autocomplete="off" style="flex:1 1 180px">
             <button id="send-move">Play</button>
@@ -438,7 +442,10 @@ function renderLive(ctl) {
     $('game-result').textContent = g.result + (g.termination ? ' (' + g.termination + ')' : '');
     $('game-pgn').href = '/api/games/' + encodeURIComponent(g.id) + '/pgn';
   }
-  $('controls').hidden = !(ctl && (playing || (g.termination && /^(checkmate|stalemate|insufficient)/.test(g.termination))));
+  $('controls').hidden = !(ctl && (playing || (g.termination && /^(checkmate|stalemate|insufficient|fivefold|75-move)/.test(g.termination))));
+  // A draw by the 50-move rule or by threefold repetition has to be claimed by a player.
+  $('draw-claim').hidden = !(ctl && playing && g.draw_claim);
+  if (g.draw_claim) $('draw-claim-text').textContent = 'A draw can be claimed: ' + g.draw_claim + '.';
   $('undo').disabled = !g.moves.length;
   $('end-bar').hidden = !playing;
   $('relearn').hidden = !playing;
@@ -476,6 +483,9 @@ $('start').onclick = async () => {
   });
 };
 $('to-calibrate').onclick = () => showTab('calibrate');
+$('claim-draw').onclick = () => S && S.game && S.game.draw_claim &&
+  confirm('Claim the draw (' + S.game.draw_claim + ') and end the game?') &&
+  api('POST', '/api/game/end', { result: '1/2-1/2', reason: S.game.draw_claim });
 $('resume').onclick = () => confirm('Set the pieces as they are in the position shown, then resume the game. Resume now?') && api('POST', '/api/game/resume');
 $('close-unfinished').onclick = () => confirm('Close this game as it is? It is kept, ended without a result (*).') && api('POST', '/api/game/end', { result: '*', reason: 'abandoned' });
 $('send-move').onclick = async () => {

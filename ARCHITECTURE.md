@@ -40,8 +40,8 @@
 | `boarddetect.rs` | Finds the 49 inner corners (saddle points), fits the lattice, gives the four outer corners and which one is a1; `refine` follows a board that moved |
 | `picture.rs` | Rotation, brightness, contrast, auto contrast, the follow switch; saved in `picture.json` |
 | `vision.rs` | Sampling of each square and the learned empty/white/black classifier |
-| `tracker.rs` | Stability gate and the choice of the legal move that best explains the picture |
-| `game.rs` | The game record (moves, result), SAN/UCI, PGN, file format version |
+| `tracker.rs` | Stability gate and the choice of the legal move (or, when none fits, the pair of moves) that best explains the picture |
+| `game.rs` | The game record (moves, result), SAN/UCI, PGN, file format version, the draw rules (repetition, 50 and 75 moves) |
 | `store.rs` | One JSON file per game, ids, listing |
 | `fsutil.rs` | `write_atomic`: temporary file, flush to disk, rename |
 | `roles.rs` | Controller and viewer, tokens, expiry |
@@ -70,7 +70,7 @@ camera --(FrameSource::next_frame)--> capture thread (engine::on_frame)
    rotate + brightness/contrast (picture.rs)  ->  Latest { image, raw, seq }   -> preview: /frame.mjpg, /warp.mjpg
    every track_interval, while Playing:
       warp (calibration.rs) -> sample squares (vision.rs) -> stability gate + legal-move match (tracker.rs)
-      -> Detection::Move  -> GameRecord::push_move (game.rs) -> pending_save -> flush_save after the lock is released (store.rs, atomic)
+      -> Detection::Move (or Detection::Pair: two moves)  -> GameRecord::push_move (game.rs) -> pending_save -> flush_save after the lock is released (store.rs, atomic)
    about every 1.5 s (longer on a slow machine: at least 20 times the search time), while Playing and quiet: boarddetect::refine
    -> move the calibration if the board shifted (never more than one square from where the game began; the file is written at most every 10 s)
 every change -> Hub::notify -> each event stream wakes, builds its snapshot (engine::snapshot) -> page
