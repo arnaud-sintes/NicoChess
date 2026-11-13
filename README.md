@@ -48,7 +48,7 @@ Everything is built and tested on a PC with a synthetic camera. The integrated w
 
 ## Download
 
-Releases are on GitHub (the repository is private: sign in to see them): the newest one has `NicoChess-windows.zip` (unzip, double-click `Start NicoChess.bat`), `nicochess-debug-apk.zip` (the Android app, a debug build) and `nicochess-linux-i386.tar.gz`. The version is shown at the bottom of the page and by `nicochess --version`. See [CHANGELOG.md](CHANGELOG.md).
+Releases are on GitHub, open to everyone (https://github.com/arnaud-sintes/NicoChess/releases/latest): the newest one has `NicoChess-windows.zip` (unzip, double-click `Start NicoChess.bat`), `nicochess-debug-apk.zip` (the Android app, a debug build) and `nicochess-linux-i386.tar.gz`. The version is shown at the bottom of the page and by `nicochess --version`. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Try it on a PC (no camera)
 
