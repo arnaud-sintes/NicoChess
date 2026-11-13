@@ -65,6 +65,17 @@ try {
         if (-not (Test-Path $asset)) { throw "missing $asset" }
         if (-not $SkipBuild -and (Get-Item $asset).LastWriteTime -lt $started) { throw "$asset was not rebuilt" }
     }
+    # Nothing of the person or the machine that built it may be in the programs (compilers write the
+    # paths of the sources into panic messages): look for the user name and the company in them.
+    $programs = @((Join-Path $dist 'NicoChess-windows\nicochess.exe'), $linux)
+    foreach ($program in $programs) {
+        $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($program))
+        foreach ($word in @($env:USERNAME, 'quantumsurgical')) {
+            if ($word -and $text.IndexOf($word, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw "$program contains '$word': build with the path remapping of package-windows.ps1 (or in Docker)"
+            }
+        }
+    }
     $sums = Join-Path $dist 'SHA256SUMS.txt'
     ($assets | ForEach-Object {
         '{0}  {1}' -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), (Split-Path -Leaf $_)

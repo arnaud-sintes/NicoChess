@@ -18,8 +18,21 @@ try {
 
 # The program says which commit it was built from (build.rs reads this, or git).
 $env:NICOCHESS_COMMIT = Get-NicoCommit
+# The paths of this machine (the user name in them) must not end up in the program, where panic
+# messages carry them. The compiler is told to write other names. These flags come from the
+# environment, which replaces the ones of .cargo\config.toml: the static runtime is repeated here.
+$separator = [char]0x1f
+$env:CARGO_ENCODED_RUSTFLAGS = @(
+    '-C', 'target-feature=+crt-static',
+    "--remap-path-prefix=$env:USERPROFILE=/home",
+    "--remap-path-prefix=$root=/nicochess"
+) -join $separator
 Write-Host 'Building the program (release)...'
-cargo build --release --locked
+try {
+    cargo build --release --locked
+} finally {
+    Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+}
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
 
 $exe = Join-Path $root 'target\release\nicochess.exe'
