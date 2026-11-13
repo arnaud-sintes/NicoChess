@@ -78,19 +78,27 @@ class AndroidBridge(context: Context) {
         changed(cameraAffected = false)
     }
 
-    /** Uses the external (USB) camera instead of one of the phone (or not). */
+    /** Uses the external (USB) camera instead of one of the phone (or not). Returns "" or why it was refused. */
     @JavascriptInterface
-    fun setExternal(on: Boolean) {
+    fun setExternal(on: Boolean): String {
+        refusedDuringGame()?.let { return it }
         Settings.setExternal(app, on)
         changed(cameraAffected = true)
+        return ""
     }
 
-    /** Chooses which camera of the phone to use, by its id. */
+    /** Chooses which camera of the phone to use, by its id. Returns "" or why it was refused. */
     @JavascriptInterface
-    fun setCamera(id: String) {
+    fun setCamera(id: String): String {
+        refusedDuringGame()?.let { return it }
         Settings.setCameraId(app, id)
         changed(cameraAffected = true)
+        return ""
     }
+
+    /** Changing the camera in the middle of a game would change the picture the squares were learned from. */
+    private fun refusedDuringGame(): String? =
+        if (NativeCore.isPlaying()) "The camera cannot be changed while a game is being recorded." else null
 
     @Synchronized
     private fun changed(cameraAffected: Boolean) {

@@ -137,7 +137,7 @@
         <div class="bar" id="unfinished" hidden>
           <span>An unfinished game was found.</span>
           <button class="primary" id="resume" title="Set the pieces as in the position shown, then press">Resume</button>
-          <button id="close-unfinished" title="Keep the game as it is, with no result">Close it</button>
+          <button id="close-unfinished" title="End the game as it is, without a result (*)">Close it</button>
         </div>
         <div class="bar" id="game-over" hidden>
           <strong id="game-result"></strong><a id="game-pgn" href="#" download>Download PGN</a>
@@ -477,7 +477,7 @@ $('start').onclick = async () => {
 };
 $('to-calibrate').onclick = () => showTab('calibrate');
 $('resume').onclick = () => confirm('Set the pieces as they are in the position shown, then resume the game. Resume now?') && api('POST', '/api/game/resume');
-$('close-unfinished').onclick = () => confirm('Close this game as it is? It is kept, with no result.') && api('POST', '/api/game/end', { result: '*', reason: 'abandoned' });
+$('close-unfinished').onclick = () => confirm('Close this game as it is? It is kept, ended without a result (*).') && api('POST', '/api/game/end', { result: '*', reason: 'abandoned' });
 $('send-move').onclick = async () => {
   const text = $('move').value.trim(); if (!text) return;
   if (await api('POST', '/api/game/move', { move: text })) $('move').value = '';
@@ -696,8 +696,9 @@ function andRender() {
 }
 if (NA) {
   $('and-remote').onchange = () => { NA.setRemote($('and-remote').checked); setTimeout(andRender, 700); };
-  $('and-external').onchange = () => { NA.setExternal($('and-external').checked); setTimeout(andRender, 700); };
-  $('and-camera').onchange = () => { NA.setCamera($('and-camera').value); setTimeout(andRender, 700); };
+  // The app answers "" or why it refused (not during a game); the card is drawn again from its answer.
+  $('and-external').onchange = () => { const refused = NA.setExternal($('and-external').checked); if (refused) toast(refused); setTimeout(andRender, 700); };
+  $('and-camera').onchange = () => { const refused = NA.setCamera($('and-camera').value); if (refused) toast(refused); setTimeout(andRender, 700); };
   // A USB camera can be plugged in or pulled out, and the network address can change.
   setInterval(() => { if (tab === 'calibrate' && !document.hidden) andRender(); }, 2000);
 }

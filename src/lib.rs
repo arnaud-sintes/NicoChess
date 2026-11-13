@@ -5,7 +5,7 @@
 //! The programs built on it supply the rest:
 //!
 //! - `src/main.rs`: the command-line program for Windows and Linux,
-//! - the Android app (to come): a native library fed with frames by the app.
+//! - the Android app (`android/`): a native library fed with frames by the app.
 //!
 //! Each platform provides its own camera as a [`camera::FrameSource`].
 

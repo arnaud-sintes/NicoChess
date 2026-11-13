@@ -40,7 +40,7 @@ First test (demo)
   - Click the 4 corners of the board in this order: a1, h1, h8, a8. On the demo image they are
     near (120,440), (520,425), (470,90), (190,100) in the 640x480 picture: bottom-left, bottom-right,
     top-right, top-left of the board.
-  - Go to "Live", press "Start game". The demo plays 33 moves, then the game ends by checkmate.
+  - Go to "Live", press "Start game". The demo plays 17 moves (33 plies), then the game ends by checkmate.
   - "Games" lists it, and the replay plays it back. "PGN" downloads it.
 
 Wi-Fi access point (optional, when the dongle is plugged in)

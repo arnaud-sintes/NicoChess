@@ -35,6 +35,7 @@ class PhoneCamera(private val context: Context) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private val main = Handler(Looper.getMainLooper())
     private var thread: HandlerThread? = null
+    private var imageHandler: Handler? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
@@ -78,6 +79,7 @@ class PhoneCamera(private val context: Context) {
             val worker = HandlerThread("nicochess-camera").also { it.start() }
             val workerHandler = Handler(worker.looper)
             thread = worker
+            imageHandler = workerHandler
 
             val imageReader = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
             imageReader.setOnImageAvailableListener({ source -> onImage(source, mine) }, workerHandler)
@@ -124,12 +126,25 @@ class PhoneCamera(private val context: Context) {
         }
         session?.close()
         device?.close()
-        reader?.close()
-        thread?.quitSafely()
+        // The reader is closed on its own thread, after a picture that may be in the middle of being
+        // handed to the core: closing it from here would pull the buffers from under that call.
+        val closing = reader
+        val worker = thread
+        val onWorker = imageHandler
+        if (closing != null && worker != null && onWorker != null) {
+            onWorker.post {
+                closing.close()
+                worker.quitSafely()
+            }
+        } else {
+            closing?.close()
+            worker?.quitSafely()
+        }
         session = null
         device = null
         reader = null
         thread = null
+        imageHandler = null
         Log.i(TAG, "camera closed")
     }
 

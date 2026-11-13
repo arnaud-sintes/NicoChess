@@ -33,12 +33,12 @@ The page is one HTML file built into the program. Everything works offline.
 ## Rules that matter most (details in DESIGN.md)
 
 1. Comments, errors and docs are plain English prose that explain why. No emojis.
-2. Errors: `anyhow` with context; the API answers 403 (not controller), 400 (bad request), 409 (not possible now), 500 (server-side I/O failure), as JSON `{"ok":false,"error":...}`.
+2. Errors: `anyhow` with context; the API answers 403 (not controller), 400 (bad request), 409 (not possible now), 500 (server-side I/O failure), as JSON `{"ok":false,"error":...}` (pictures, a refused Host, 404 and 503 are plain text).
 3. Files are written with `fsutil::write_atomic` (temporary file, flush, rename), never with a plain `fs::write`.
-4. The engine has one `inner` mutex: never hold it during slow work (detection, JPEG encoding, disk). Lock order: `inner` before `camera_wanted`, `frame`, `frame_count`.
+4. The engine has one `inner` mutex: the capture thread and the per-picture paths never hold it during slow work (detection, JPEG encoding). Games are written after it is released (`pending_save`, then `flush_save`). Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`.
 5. Everything user-supplied that reaches the page goes through `esc()`. The page has no external resource.
 6. Calibration corner order is a1, h1, h8, a8, counter-clockwise on screen, in the pixels of the rotated picture. Do not change it.
-7. Kotlin: camera state is touched only on the main thread; camera callbacks post to it; bridge methods run on a WebView thread.
+7. Kotlin: camera state is touched only on the main thread (Camera2 callbacks are given the main handler; only the pictures arrive on the image-reader thread); bridge methods run on a WebView thread.
 8. Tests drive the engine through `server::tests::rig` with the synthetic or demo source. No real camera in tests.
 9. Add a dependency only with a good reason (the target is a 32-bit Atom, and the Windows package is under 1 MB).
 10. Never commit unless asked. Scratch files go in the session scratchpad, never in the repository.

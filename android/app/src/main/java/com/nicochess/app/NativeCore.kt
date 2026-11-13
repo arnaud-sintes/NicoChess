@@ -22,6 +22,9 @@ object NativeCore {
      */
     external fun setRemote(enabled: Boolean, port: Int): String
 
+    /** True while a game is being recorded: the camera may not be changed then. */
+    external fun isPlaying(): Boolean
+
     /** True while the core needs pictures: the camera should be open. */
     external fun cameraWanted(): Boolean
 

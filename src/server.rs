@@ -1,6 +1,6 @@
 //! HTTP routes: the page, the camera images, the JSON API and the event stream.
 //!
-//!   GET    /                           the page
+//!   GET    / or /index.html            the page
 //!   GET    /frame.jpg                  latest camera frame
 //!   GET    /frame.mjpg                 the camera frames as they come (Motion JPEG stream)
 //!   GET    /warp.jpg[?grid=0]          top-down board (needs a calibration)
@@ -243,6 +243,7 @@ fn frame_stream(engine: &Arc<Engine>, top_down: bool) -> Reply {
             let _guard = guard;
             let mut last = None;
             let mut silent_since = std::time::Instant::now();
+            let mut uncalibrated_since: Option<std::time::Instant> = None;
             loop {
                 match engine.wait_for_frame(last.as_ref(), Duration::from_secs(1)) {
                     Some(frame) => {
@@ -254,9 +255,19 @@ fn frame_stream(engine: &Arc<Engine>, top_down: bool) -> Reply {
                             let made = engine.warped_jpeg_of(&newest, true);
                             last = Some(newest);
                             match made {
-                                Ok(bytes) => Arc::new(bytes),
-                                // Not calibrated (any more): nothing to show, keep waiting.
-                                Err(_) => continue,
+                                Ok(bytes) => {
+                                    uncalibrated_since = None;
+                                    Arc::new(bytes)
+                                }
+                                // Not calibrated (any more): nothing to show. Nothing is written, so a page that
+                                // has left would never be noticed: end the stream after a few seconds (the page
+                                // opens it again when there is a calibration).
+                                Err(_) => {
+                                    if uncalibrated_since.get_or_insert_with(std::time::Instant::now).elapsed() > Duration::from_secs(3) {
+                                        return Ok(());
+                                    }
+                                    continue;
+                                }
                             }
                         } else {
                             last = Some(Arc::clone(&frame));
@@ -595,8 +606,13 @@ mod tests {
             let distance = (x - f64::from(corner[0])).hypot(y - f64::from(corner[1]));
             assert!(distance < 2.0, "corner {n} is still {distance:.1} px off");
         }
-        let saved = crate::calibration::Calibration::load(&rig.dir.join("calibration.json")).unwrap().unwrap();
-        assert!((saved.corners[0][0] - truth[0][0]).abs() < 2.0, "the moved calibration is saved");
+        // The file is written just after the pages are told (not while the engine is locked).
+        wait_for("the moved calibration to be saved", || {
+            crate::calibration::Calibration::load(&rig.dir.join("calibration.json"))
+                .ok()
+                .flatten()
+                .is_some_and(|saved| (saved.corners[0][0] - truth[0][0]).abs() < 2.0)
+        });
     }
 
     #[test]
@@ -616,7 +632,9 @@ mod tests {
         rig.call("POST", "/api/calibration", ALICE, &body);
         rig.call("POST", "/api/game/start", ALICE, "{}");
         // Plenty of time for it to have happened.
-        std::thread::sleep(Duration::from_millis(3500));
+        // Waiting is the point of this test: it checks that nothing happens (any longer than the first
+        // look at the board, which comes at once, would not change the result)
+        std::thread::sleep(Duration::from_millis(2500));
         let state = rig.state(ALICE);
         assert_eq!(state["stabilize"]["adjusted"], 0);
         assert_eq!(state["calibration"][0][0].as_f64().unwrap() as f32, off[0][0]);
@@ -689,7 +707,7 @@ mod tests {
         // Not while nobody controls, and not without a calibration.
         assert_eq!(rig.call("POST", "/api/game/resume", BOB, "").0, 403);
         assert_eq!(rig.call("POST", "/api/game/resume", ALICE, "").0, 409);
-        // A finished game keeps its result: the promotion cannot be changed while nothing runs.
+        // Nothing is being recorded: the piece of a promotion cannot be changed.
         assert_eq!(rig.call("POST", "/api/game/promotion", ALICE, r#"{"piece": "n"}"#).0, 409);
 
         rig.call("POST", "/api/calibration/open", ALICE, "");
@@ -727,6 +745,31 @@ mod tests {
         wait_for("the warning", || rig.state(ALICE)["notice"].as_str().is_some_and(|n| n.contains("calibrate again")));
     }
 
+    #[test]
+    fn an_unfinished_game_can_be_closed_while_calibrating() {
+        let rig = rig_with_unfinished_game("close-cal", None);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        assert_eq!(rig.state(ALICE)["mode"], "calibrating");
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result": "*", "reason": "abandoned"}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["mode"], "idle");
+    }
+
+    #[test]
+    fn abandoning_a_game_with_no_move_leaves_no_file() {
+        let rig = rig_with_unfinished_game("empty", None);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/resume", ALICE, "").0, 200);
+        // Take the only move back: an empty game, which is saved like any other.
+        assert_eq!(rig.call("POST", "/api/game/undo", ALICE, "").0, 200);
+        assert_eq!(rig.engine.list_games().unwrap().len(), 1);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result": "*", "reason": "abandoned"}"#).0, 200);
+        assert!(rig.engine.list_games().unwrap().is_empty(), "the empty game is gone from the disk too");
+    }
+
     fn corners_json() -> String {
         json!({ "corners": synthetic::corners().corners }).to_string()
     }
@@ -757,7 +800,9 @@ mod tests {
         let id = state["game"]["id"].as_str().unwrap().to_string();
         assert_eq!(id, "20261104T101530");
 
-        // It was saved, listed, and can be replayed.
+        // It was saved (a moment after the pages were told: the file is written outside the lock),
+        // listed, and can be replayed.
+        wait_for("the game to be written", || rig.engine.list_games().unwrap().first().is_some_and(|g| g.moves == 33));
         let (_, list) = rig.call("GET", "/api/games", "", "");
         assert_eq!(list["games"][0]["id"], id.as_str());
         assert_eq!(list["games"][0]["moves"], 33);

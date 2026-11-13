@@ -377,7 +377,7 @@ The target is ready for development when all of these are true:
 - [ ] `v4l2-ctl --list-formats-ext` shows `640x480` (YUYV preferred).
 - [ ] Exposure and white balance can be locked, or the limitation is recorded.
 - [ ] A test capture looks sharp and shows the whole board.
-- [ ] A cross-compiled binary runs on the target and opens the camera.
+- [ ] The binary built by `scripts\build-target.ps1` runs on the target and opens the camera.
 - [ ] The systemd service starts at boot and restarts after a crash.
 - [ ] The page is reachable from the PC browser and from a phone.
 - [ ] `./nicochess --source demo` plays the whole demo game without stalling the Atom.
@@ -431,7 +431,7 @@ Keep the Ethernet interface as it is. Do not enable IP forwarding between the Wi
 
 ### 8.3 Design implications
 
-- Send the board state to the phone as JSON or SVG. Do not stream camera video to the phone, as it would load the N270 too much.
+- Send the board state to the phone as JSON or SVG. Camera video is only streamed (Motion JPEG) to the page of the controller on the Calibrate tab, and the top-down board view only while that tab is open: it loads the N270 as little as possible, but keep the number of pages on the Calibrate tab small.
 - A "start game", "set position" and "correct a square" interface on the phone replaces a local GUI.
 - The page must work on a phone browser without Internet access (no external fonts, scripts or CDNs).
 

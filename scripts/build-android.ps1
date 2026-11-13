@@ -29,7 +29,7 @@ docker run --rm `
     -v nicochess-gradle:/root/.gradle `
     -v nicochess-android-keystore:/root/.android `
     -v nicochess-cargo-registry-android:/opt/cargo/registry `
-    -v nicochess-android-target:/work/android/native/target `
+    -v nicochess-android-target:/work/target `
     -v "${dist}:/out" `
     nicochess-android `
     bash /src/docker/android-build.sh

@@ -63,6 +63,9 @@ const FOLLOW_MAX_DRIFT: f32 = 1.0;
 /// The moved calibration is written to disk at most this often.
 const FOLLOW_SAVE_EVERY: Duration = Duration::from_secs(10);
 
+/// Start of the notice shown when a game could not be written.
+const SAVE_FAILED: &str = "cannot save the game";
+
 /// Shown when the picture has another size than the one the board was calibrated on.
 const SIZE_NOTICE: &str =
     "The camera picture is not the size it had when the board was calibrated (another camera or resolution): calibrate again.";
@@ -264,6 +267,9 @@ struct Inner {
     /// The calibration when following began: the board may not drift further than a square from it.
     follow_anchor: Option<Calibration>,
     last_follow_save: Option<Instant>,
+    /// The game to write to the disk: set under the lock, written by `flush_save` once the lock is
+    /// released (writing and flushing a file can take long on a small machine).
+    pending_save: Option<GameRecord>,
 }
 
 /// Speed figures of the camera pipeline, smoothed.
@@ -291,6 +297,9 @@ pub struct Engine {
     frame_cv: Condvar,
     frame_streams: AtomicUsize,
     stats: Mutex<Stats>,
+    /// Held while a game is written: one writer at a time, so that an older version cannot land
+    /// after a newer one. Taken before `inner`, never while holding it.
+    save_lock: Mutex<()>,
 }
 
 /// Picture streams allowed at once (two per page: the camera and the top-down board).
@@ -342,6 +351,7 @@ impl Engine {
                 follow_every: FOLLOW_EVERY,
                 follow_anchor: None,
                 last_follow_save: None,
+                pending_save: None,
             }),
             frame: RwLock::new(None),
             camera_wanted: Mutex::new(false),
@@ -357,6 +367,7 @@ impl Engine {
             frame_cv: Condvar::new(),
             frame_streams: AtomicUsize::new(0),
             stats: Mutex::new(Stats::default()),
+            save_lock: Mutex::new(()),
         })
     }
 
@@ -421,6 +432,8 @@ impl Engine {
     fn go_idle(&self, inner: &mut Inner) {
         inner.mode = Mode::Idle;
         inner.calibrating_since = None;
+        // An error of a camera that is now off would only confuse.
+        inner.camera_error = None;
         self.set_camera(false);
     }
 
@@ -454,7 +467,7 @@ impl Engine {
         let inner = &mut *guard;
         let mut changed = inner.camera_error.take().is_some();
         // Time-based clean-up also runs with no page open (the camera must not stay on for ever).
-        self.housekeeping(inner, now);
+        changed |= self.housekeeping(inner, now);
 
         // A calibration is only good for the picture size it was made for.
         let size = [latest.image.width(), latest.image.height()];
@@ -506,6 +519,8 @@ impl Engine {
             }
         }
         drop(guard);
+        // A failure to save becomes the notice of the pages; nothing else to do here.
+        let _ = self.flush_save();
         if changed {
             self.hub.notify();
         }
@@ -523,6 +538,11 @@ impl Engine {
         }
         stats.last_frame = Some(started);
         stats.process_ms = smooth(stats.process_ms, started.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    /// True while a game is being recorded (the Android app refuses camera changes then).
+    pub fn is_playing(&self) -> bool {
+        self.inner.grab().mode == Mode::Playing
     }
 
     /// Pictures per second and milliseconds per picture, for the page.
@@ -592,16 +612,17 @@ impl Engine {
             _ => return,
         }
         inner.calibration = Some(moved);
-        if inner.last_follow_save.is_none_or(|t| now.duration_since(t) >= FOLLOW_SAVE_EVERY) {
+        let save_due = inner.last_follow_save.is_none_or(|t| now.duration_since(t) >= FOLLOW_SAVE_EVERY);
+        if save_due {
             inner.last_follow_save = Some(now);
-            if let Err(e) = moved.save(&self.calibration_path) {
-                eprintln!("calibration: cannot save the moved board: {e:#}");
-            }
         }
         inner.follow_count += 1;
         inner.follow_shift = shift;
         eprintln!("follow: the board moved by {shift:.2} squares, calibration moved along");
         drop(inner);
+        if save_due && let Err(e) = moved.save(&self.calibration_path) {
+            eprintln!("calibration: cannot save the moved board: {e:#}");
+        }
         self.hub.notify();
     }
 
@@ -641,14 +662,30 @@ impl Engine {
         }
     }
 
+    /// Marks the game to be written. The caller calls `flush_save` after releasing the lock.
     fn save(&self, inner: &mut Inner) {
-        if let Some(game) = &inner.game {
-            match self.store.save(game) {
-                Ok(()) => inner.notice = None,
-                Err(e) => {
-                    eprintln!("store: {e:#}");
-                    inner.notice = Some(format!("cannot save the game: {e:#}"));
+        inner.pending_save = inner.game.clone();
+    }
+
+    /// Writes the game marked by `save`. Call it with no lock held. Whoever gets here writes the
+    /// newest version. A failure becomes the notice of the pages and an error for the caller.
+    fn flush_save(&self) -> ApiResult {
+        let _writing = self.save_lock.grab();
+        let Some(game) = self.inner.grab().pending_save.take() else { return Ok(()) };
+        match self.store.save(&game) {
+            Ok(()) => {
+                let mut inner = self.inner.grab();
+                if inner.notice.as_deref().is_some_and(|n| n.starts_with(SAVE_FAILED)) {
+                    inner.notice = None;
                 }
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("store: {e:#}");
+                let message = format!("{SAVE_FAILED}: {e:#}");
+                self.inner.grab().notice = Some(message.clone());
+                self.hub.notify();
+                Err(ApiError::Internal(message))
             }
         }
     }
@@ -699,12 +736,12 @@ impl Engine {
 
     /// The top-down board from one given camera frame.
     pub fn warped_jpeg_of(&self, latest: &Latest, with_grid: bool) -> ApiResult<Vec<u8>> {
-        let calibration = self.inner.lock().unwrap().calibration.ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
-        let mut warped = calibration::warp_board(&latest.image, &calibration)?;
+        let calibration = self.inner.grab().calibration.ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
+        let mut warped = calibration::warp_board(&latest.image, &calibration).map_err(ApiError::internal)?;
         if with_grid {
             calibration::draw_grid(&mut warped);
         }
-        Ok(encode_jpeg(&warped, 85)?)
+        encode_jpeg(&warped, 85).map_err(ApiError::internal)
     }
 
     // ---- Pages: state and events --------------------------------------------
@@ -782,13 +819,16 @@ impl Engine {
     }
 
     /// Time-based clean-up: a controller who has gone silent loses the role.
-    fn housekeeping(&self, inner: &mut Inner, now: Instant) {
+    /// Returns true when the engine went idle (the pages must be told).
+    fn housekeeping(&self, inner: &mut Inner, now: Instant) -> bool {
         let playing = inner.mode == Mode::Playing;
         let lost_controller = inner.roles.expire(now, playing);
         let calibration_too_long = inner.calibrating_since.is_some_and(|s| now.duration_since(s) > CALIBRATION_LIMIT);
         if inner.mode == Mode::Calibrating && (lost_controller || calibration_too_long) {
             self.go_idle(inner);
+            return true;
         }
+        false
     }
 
     fn controlled(&self, token: &str) -> ApiResult<MutexGuard<'_, Inner>> {
@@ -1022,6 +1062,8 @@ impl Engine {
         let position = game.start_position()?;
         inner.game = Some(game);
         self.begin_playing(&mut inner, position, 0.0);
+        // A scripted source (the demo) begins its game again; a real camera does nothing.
+        self.restart_source.store(true, Ordering::SeqCst);
         drop(inner);
         self.hub.notify();
         Ok(())
@@ -1031,14 +1073,15 @@ impl Engine {
     /// of the game were already played (0 for a new game), so the timestamps carry on.
     fn begin_playing(&self, inner: &mut Inner, position: shakmaty::Chess, resume_at: f64) {
         inner.tracker.start(position);
-        inner.game_started = Some(Instant::now().checked_sub(Duration::from_secs_f64(resume_at)).unwrap_or_else(Instant::now));
+        // The time of the last move comes from a file: do not trust it to be a sane number.
+        let played = Duration::try_from_secs_f64(resume_at.max(0.0)).unwrap_or_default();
+        inner.game_started = Some(Instant::now().checked_sub(played).unwrap_or_else(Instant::now));
         inner.mode = Mode::Playing;
         inner.calibrating_since = None;
         inner.candidates.clear();
         inner.notice = None;
         inner.last_status = Status::Learning;
         inner.follow_anchor = None;
-        self.restart_source.store(true, Ordering::SeqCst);
         self.set_camera(true);
     }
 
@@ -1058,7 +1101,7 @@ impl Engine {
             .as_ref()
             .filter(|g| g.result.is_none())
             .ok_or_else(|| ApiError::Conflict("there is no unfinished game to resume".into()))?;
-        let position = game.position()?;
+        let position = game.position().map_err(ApiError::internal)?;
         let resume_at = game.moves.last().map_or(0.0, |m| m.t);
         self.begin_playing(inner, position, resume_at);
         drop(guard);
@@ -1069,7 +1112,7 @@ impl Engine {
     /// Ends the game with a result decided by the players.
     pub fn end_game(&self, token: &str, result: &str, reason: &str) -> ApiResult {
         let mut inner = self.controlled(token)?;
-        let unfinished_but_stopped = inner.mode == Mode::Idle && inner.game.as_ref().is_some_and(|g| g.result.is_none());
+        let unfinished_but_stopped = inner.mode != Mode::Playing && inner.game.as_ref().is_some_and(|g| g.result.is_none());
         if inner.mode != Mode::Playing && !unfinished_but_stopped {
             return Err(ApiError::Conflict("no game is running".into()));
         }
@@ -1080,9 +1123,11 @@ impl Engine {
             return Err(ApiError::BadRequest("unknown reason".into()));
         }
         let no_moves = inner.game.as_ref().is_none_or(|g| g.moves.is_empty());
+        let mut forget = None;
         if reason == "abandoned" && no_moves {
-            // Nothing was played: do not keep an empty game.
-            inner.game = None;
+            // Nothing was played: do not keep an empty game, in memory or on the disk.
+            forget = inner.game.take().map(|g| g.id);
+            inner.pending_save = None;
         } else if let Some(game) = inner.game.as_mut() {
             game.finish(result, reason);
             self.save(&mut inner);
@@ -1090,8 +1135,14 @@ impl Engine {
         self.go_idle(&mut inner);
         inner.candidates.clear();
         drop(inner);
+        if let Some(id) = forget
+            && let Err(e) = self.store.remove(&id)
+        {
+            eprintln!("store: {e:#}");
+        }
+        let saved = self.flush_save();
         self.hub.notify();
-        Ok(())
+        saved
     }
 
     /// Records a move entered by hand (UCI or SAN), or one picked from the candidates.
@@ -1104,13 +1155,14 @@ impl Engine {
         let t = inner.game_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         game.push_text(text, t)?;
-        let position = game.position()?;
+        let position = game.position().map_err(ApiError::internal)?;
         inner.tracker.set_position(position);
         inner.candidates.clear();
         self.after_game_change(inner);
         drop(guard);
+        let saved = self.flush_save();
         self.hub.notify();
-        Ok(())
+        saved
     }
 
     /// Takes back the last move. Also reopens a game that ended by the rules,
@@ -1118,7 +1170,7 @@ impl Engine {
     pub fn undo(&self, token: &str) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
-        let reopenable = inner.mode == Mode::Idle
+        let reopenable = inner.mode != Mode::Playing
             && inner
                 .game
                 .as_ref()
@@ -1131,7 +1183,7 @@ impl Engine {
         }
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         game.undo().ok_or_else(|| ApiError::Conflict("no move to take back".into()))?;
-        let position = game.position()?;
+        let position = game.position().map_err(ApiError::internal)?;
         let resume_at = game.moves.last().map_or(0.0, |m| m.t);
         if reopenable {
             // The board must show the position again before learning resumes.
@@ -1142,8 +1194,9 @@ impl Engine {
         inner.candidates.clear();
         self.save(inner);
         drop(guard);
+        let saved = self.flush_save();
         self.hub.notify();
-        Ok(())
+        saved
     }
 
     /// Changes the piece chosen for the last promotion.
@@ -1157,12 +1210,13 @@ impl Engine {
         }
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         game.set_last_promotion(piece)?;
-        let position = game.position()?;
+        let position = game.position().map_err(ApiError::internal)?;
         inner.tracker.set_position(position);
         self.after_game_change(inner);
         drop(guard);
+        let saved = self.flush_save();
         self.hub.notify();
-        Ok(())
+        saved
     }
 
     /// Learns the look of the squares again, from the position the game is in.

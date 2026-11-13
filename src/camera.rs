@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 /// app's business: see `pushed`).
 #[cfg(any(windows, target_os = "linux"))]
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long opening a camera may take.
+#[cfg(windows)]
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Something that produces camera frames.
 pub trait FrameSource: Send {
@@ -425,7 +428,12 @@ mod windows_camera {
                     }
                 })
                 .context("cannot start the camera thread")?;
-            let description = ready_rx.recv().context("the camera thread stopped")??;
+            // Opening a camera can hang in the driver: do not wait for it for ever.
+            let description = match ready_rx.recv_timeout(OPEN_TIMEOUT) {
+                Ok(opened) => opened?,
+                Err(mpsc::RecvTimeoutError::Timeout) => bail!("the camera did not open within {} seconds", OPEN_TIMEOUT.as_secs()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the camera thread stopped"),
+            };
             Ok(WindowsCamera { description, frames: frames_rx })
         }
     }

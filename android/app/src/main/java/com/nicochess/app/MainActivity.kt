@@ -59,9 +59,6 @@ class MainActivity : Activity() {
         }
         setContentView(web)
 
-        if (savedInstanceState != null) {
-            web.restoreState(savedInstanceState)
-        }
         askForPermissions(savedInstanceState == null)
 
         // The service starts the core too; starting is safe to ask twice, and this call
@@ -74,7 +71,7 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (error.isEmpty()) {
-                    if (web.url == null) web.loadUrl("http://127.0.0.1:${Settings.LOCAL_PORT}/")
+                    web.loadUrl("http://127.0.0.1:${Settings.LOCAL_PORT}/")
                 } else {
                     showError(error)
                 }
@@ -142,6 +139,15 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    override fun onResume() {
+        super.onResume()
+        // The camera permission may have been given since (in the settings of the phone): the service
+        // then goes to the foreground, which keeps the camera alive with the screen off.
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            CoreService.start(this)
+        }
+    }
+
     private fun showError(message: String) {
         val escaped = message.replace("&", "&amp;").replace("<", "&lt;")
         web.loadDataWithBaseURL(
@@ -151,11 +157,6 @@ class MainActivity : Activity() {
             "utf-8",
             null,
         )
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        super.onSaveInstanceState(outState)
-        web.saveState(outState)
     }
 
     @Deprecated("Back goes through the page history first.")

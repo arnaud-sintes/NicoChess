@@ -10,7 +10,7 @@ use crate::camera::FrameSource;
 use anyhow::{Result, bail};
 use image::RgbImage;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// How long the engine waits for a picture before it reports the camera as silent.
@@ -35,6 +35,11 @@ impl FrameInbox {
         Arc::new(FrameInbox::default())
     }
 
+    /// The state, also after a thread panicked while holding it (it is plain data).
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// True while the engine wants pictures: the host should have its camera open.
     pub fn wanted(&self) -> bool {
         self.wanted.load(Ordering::SeqCst)
@@ -43,7 +48,7 @@ impl FrameInbox {
     /// Hands over a picture. Only the newest one is kept: the engine reads a few
     /// per second, so there is no point in queueing the rest.
     pub fn push(&self, image: RgbImage) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         state.frame = Some(image);
         state.error = None;
         self.arrived.notify_all();
@@ -51,7 +56,7 @@ impl FrameInbox {
 
     /// The host could not open or keep its camera: the engine reports it on the page.
     pub fn fail(&self, message: impl Into<String>) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock();
         state.error = Some(message.into());
         self.arrived.notify_all();
     }
@@ -67,7 +72,7 @@ impl PushedSource {
     pub fn open(inbox: Arc<FrameInbox>) -> Self {
         {
             // A picture left over from the last time would be old.
-            let mut state = inbox.state.lock().unwrap();
+            let mut state = inbox.lock();
             state.frame = None;
             state.error = None;
         }
@@ -88,9 +93,12 @@ impl FrameSource for PushedSource {
     }
 
     fn next_frame(&mut self) -> Result<RgbImage> {
-        let state = self.inbox.state.lock().unwrap();
-        let (mut state, timeout) =
-            self.inbox.arrived.wait_timeout_while(state, FRAME_TIMEOUT, |s| s.frame.is_none() && s.error.is_none()).unwrap();
+        let state = self.inbox.lock();
+        let (mut state, timeout) = self
+            .inbox
+            .arrived
+            .wait_timeout_while(state, FRAME_TIMEOUT, |s| s.frame.is_none() && s.error.is_none())
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(message) = state.error.take() {
             bail!("{message}");
         }

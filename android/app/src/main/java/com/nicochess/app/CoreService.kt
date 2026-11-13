@@ -62,8 +62,9 @@ class CoreService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
         camera = PhoneCamera(this)
+        // Last: the bridge (another thread) reads the camera as soon as the instance is visible.
+        instance = this
         createChannel()
     }
 

@@ -23,7 +23,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A whole request (head and body) must arrive within this time, however slowly it is sent:
 /// the read timeout alone lets a client hold a connection by sending one byte now and then.
+#[cfg(not(test))]
 const REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+/// Short in the tests, so that the deadline is what ends a slow request, not the read timeout.
+#[cfg(test)]
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 /// A client that has vanished (Wi-Fi lost) is noticed after about this long on a stream.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(30);
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(10);
@@ -148,6 +152,14 @@ impl Drop for Slot {
 /// The open connections of a listener that can be stopped, so that stopping can close them.
 type Registry = Mutex<HashMap<u64, TcpStream>>;
 
+/// Shuts down every registered connection.
+fn close_all(registry: &Registry) {
+    let open: Vec<TcpStream> = registry.lock().unwrap_or_else(PoisonError::into_inner).drain().map(|(_, s)| s).collect();
+    for stream in open {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
 struct Registered {
     id: u64,
     registry: Arc<Registry>,
@@ -205,10 +217,7 @@ impl Listener {
     /// would otherwise go on for as long as their page stays).
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        let open: Vec<TcpStream> = self.open.lock().unwrap_or_else(PoisonError::into_inner).drain().map(|(_, s)| s).collect();
-        for stream in open {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
+        close_all(&self.open);
     }
 }
 
@@ -243,6 +252,9 @@ pub fn spawn(addr: &str, max_connections: usize, handler: Handler) -> Result<Lis
                 Err(_) => thread::sleep(Duration::from_millis(100)),
             }
         }
+        // A connection accepted just as stop() ran may have been registered after it emptied the
+        // registry: close what is left, now that nothing is accepted any more.
+        close_all(&registry);
         eprintln!("http: stopped listening on http://{local}");
     })?;
     Ok(Listener { stop, addr: local, open })
@@ -317,7 +329,13 @@ fn read_before(stream: &mut TcpStream, deadline: Instant, chunk: &mut [u8]) -> R
     let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
     let Some(left) = left else { return Err(ReadError::Bad(408, "request too slow")) };
     stream.set_read_timeout(Some(left.min(READ_TIMEOUT))).map_err(ReadError::Io)?;
-    stream.read(chunk).map_err(ReadError::Io)
+    match stream.read(chunk) {
+        // The read gave up exactly because the deadline came: that is a slow request, not a broken connection.
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) && Instant::now() >= deadline => {
+            Err(ReadError::Bad(408, "request too slow"))
+        }
+        other => other.map_err(ReadError::Io),
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Request, ReadError> {
@@ -387,7 +405,7 @@ fn host_allowed(host: &str) -> bool {
     if name.parse::<IpAddr>().is_ok() || name == "localhost" || !name.contains('.') {
         return true;
     }
-    [".local", ".lan", ".home", ".internal", ".localdomain"].iter().any(|suffix| name.ends_with(suffix))
+    [".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain"].iter().any(|suffix| name.ends_with(suffix))
 }
 
 fn reason(status: u16) -> &'static str {
@@ -480,6 +498,7 @@ mod tests {
             "nicochess:8080",
             "nico.local",
             "box.lan:80",
+            "nas.home.arpa",
         ] {
             assert!(host_allowed(ok), "{ok}");
         }
@@ -528,12 +547,36 @@ mod tests {
         let addr = start(handler);
         let mut stream = TcpStream::connect(&addr).unwrap();
         stream.write_all(b"GET / HTTP/1.1\r\nHost: t\r\n").unwrap();
-        // Never finishes the head: the server gives up by itself.
-        stream.set_read_timeout(Some(Duration::from_secs(REQUEST_DEADLINE.as_secs() + 10))).unwrap();
-        let mut out = String::new();
+        // A byte every half second never lets the read timeout fire, and never finishes the head:
+        // only the deadline of the whole request can end it. The client stops before the deadline
+        // and listens: sending on after the server has answered and closed would reset the
+        // connection, and the answer would be lost.
         let started = Instant::now();
+        while started.elapsed() < REQUEST_DEADLINE - Duration::from_millis(700) {
+            thread::sleep(Duration::from_millis(300));
+            stream.write_all(b"X-Slow: 1\r\n").unwrap();
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = String::new();
         let _ = stream.read_to_string(&mut out);
-        assert!(started.elapsed() < REQUEST_DEADLINE + Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+    }
+
+    #[test]
+    fn a_connection_slot_comes_back_even_if_the_handler_panics() {
+        // One slot only: if the panicking request kept it, the second request would get a 503.
+        let handler: Handler = Arc::new(|request: Request| {
+            if request.path == "/panic" {
+                panic!("a handler failed");
+            }
+            Reply::text(200, "hello")
+        });
+        let listener = spawn("127.0.0.1:0", 1, handler).unwrap();
+        let addr = listener.local_addr().to_string();
+        let _ = exchange(&addr, "GET /panic HTTP/1.1\r\nHost: t\r\n\r\n");
+        thread::sleep(Duration::from_millis(200));
+        let out = exchange(&addr, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
     }
 
     #[test]

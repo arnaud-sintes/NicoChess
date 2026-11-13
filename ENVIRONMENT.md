@@ -7,7 +7,7 @@ Cargo.toml, Cargo.lock      the Rust workspace: the root crate "nicochess" and a
 rust-toolchain.toml         pinned Rust version (rust-version is also set in Cargo.toml)
 rustfmt.toml                formatting rules
 .cargo/config.toml          Windows: link the C runtime into the program (no Visual C++ redistributable needed)
-.github/workflows/ci.yml    CI: fmt check, clippy, tests with --locked
+.github/workflows/ci.yml    CI: Linux (fmt, clippy -D warnings, tests, type check of the Android crate) and Windows (tests), all with --locked
 .gitignore, .gitattributes  ignored: target/ dist/ downloads/ usb/ data/ calibration.json picture.json android build dirs *.apk *.log
 CLAUDE.md PURPOSE.md ARCHITECTURE.md DESIGN.md ENVIRONMENT.md   these documents
 README.md  PLAN.md          user-level overview; setup of the Linux target
@@ -61,7 +61,7 @@ Notes:
 - Run the Docker scripts from Bash as `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android.ps1` (PowerShell takes Docker's stderr for an error).
 - **Read the log after a Docker build**, not only the exit code: look for `Finished` (Rust), `BUILD SUCCESSFUL` (Gradle), and the date and size of the file in `dist\`.
 - Toolchain: `rust-version` in `Cargo.toml` and `rust-toolchain.toml` pin the Rust version; the Dockerfiles install the same one. The Android crate shares the root `Cargo.lock`; builds use `--locked`.
-- Android: there is no Gradle wrapper; Gradle 8.10.2 is in the image. Only debug APKs are built. The debug signing key is kept in the Docker volume `nicochess-android-keystore` so that updates install over the old app. Gradle, cargo and target caches are named volumes too (`nicochess-gradle`, `nicochess-cargo-registry-android`, `nicochess-android-target`, `nicochess-cargo-registry`, `nicochess-target`).
+- Android: there is no Gradle wrapper; Gradle 8.10.2 is in the image. Only debug APKs are built. The debug signing key is kept in the Docker volume `nicochess-android-keystore` so that updates install over the old app. Gradle, cargo and target caches are named volumes too (`nicochess-gradle`, `nicochess-cargo-registry-android`, `nicochess-android-target` mounted at `/work/target` because the Android crate is a workspace member, `nicochess-cargo-registry`, `nicochess-target`).
 
 ## Run for development
 
@@ -77,9 +77,9 @@ cargo run --release -- --device 0 --width 1280 --height 720 --open    # Windows 
 
 ## Test
 
-- `cargo test` at the root. It covers: the chess rules and PGN, the vision and tracker on synthetic pictures (a whole 33-move game), board auto-detection (also rotated, noisy, scaled), picture settings, atomic file writes, the HTTP server (including the stoppable listener), and the engine through the API (roles, calibration, pictures, streams, a game from the demo camera to a PGN, resume, stabilization). It takes about a minute because the engine tests run real capture threads.
+- `cargo test` at the root. It covers: the chess rules and PGN, the vision and tracker on synthetic pictures (a whole game of 33 plies), board auto-detection (also rotated, noisy, scaled), picture settings, atomic file writes, the HTTP server (including the stoppable listener), and the engine through the API (roles, calibration, pictures, streams, a game from the demo camera to a PGN, resume, stabilization). It takes about a minute because the engine tests run real capture threads.
 - Temporary folders are `nicochess-<name>-<pid>` under the system temp folder and are removed afterwards.
-- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` must pass; CI runs them with the tests (`--locked`).
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` must pass; CI runs them with the tests (`--locked`), on Linux and Windows.
 - Android (Kotlin and JNI) has no unit tests: the Docker build is the compile check, and a run on a phone is the real test (not done yet).
 - The camera code cannot be tested without a camera: use `--probe` and a short run on the machine that has the camera.
 

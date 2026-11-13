@@ -93,6 +93,16 @@ impl Store {
         }
     }
 
+    /// Deletes a game (one that was never played, for example). A missing file is not an error.
+    pub fn remove(&self, id: &str) -> Result<()> {
+        let path = self.path(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("cannot delete {}", path.display())),
+        }
+    }
+
     /// The newest game, if it was never finished (a crash, a power cut or a stop in the middle of a game).
     pub fn latest_unfinished(&self) -> Result<Option<GameRecord>> {
         let Some(newest) = self.list()?.into_iter().next() else { return Ok(None) };
@@ -117,8 +127,8 @@ impl Store {
                 Err(e) => eprintln!("store: skipping {id}: {e:#}"),
             }
         }
-        // Ids start with the date; undated games sort last.
-        games.sort_by(|a, b| b.id.cmp(&a.id));
+        // Ids start with the date, newest first; undated games ("undated", "undated-2") come last.
+        games.sort_by(|a, b| a.id.starts_with("undated").cmp(&b.id.starts_with("undated")).then_with(|| b.id.cmp(&a.id)));
         Ok(games)
     }
 }
@@ -126,6 +136,35 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undated_games_come_last_and_do_not_count_as_the_newest() {
+        let dir = std::env::temp_dir().join(format!("nicochess-order-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir).unwrap();
+        let mut first = GameRecord::new("20260101T100000".into(), None, "A", "B", None).unwrap();
+        first.finish("1-0", "resignation");
+        let mut second = GameRecord::new("20260202T100000".into(), None, "A", "B", None).unwrap();
+        second.finish("0-1", "resignation");
+        let undated = GameRecord::new("undated".into(), None, "A", "B", None).unwrap(); // never finished
+        for game in [&first, &second, &undated] {
+            store.save(game).unwrap();
+        }
+        let ids: Vec<String> = store.list().unwrap().into_iter().map(|g| g.id).collect();
+        assert_eq!(ids, ["20260202T100000", "20260101T100000", "undated"]);
+        // The newest game is a finished one: nothing to offer, whatever the undated one is.
+        assert!(store.latest_unfinished().unwrap().is_none());
+
+        // A newer game that was not finished is the one offered.
+        let third = GameRecord::new("20260303T100000".into(), None, "A", "B", None).unwrap();
+        store.save(&third).unwrap();
+        assert_eq!(store.latest_unfinished().unwrap().unwrap().id, "20260303T100000");
+
+        store.remove("20260303T100000").unwrap();
+        store.remove("20260303T100000").unwrap(); // already gone: not an error
+        assert!(store.latest_unfinished().unwrap().is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));

@@ -33,7 +33,7 @@ records the game, and shows it live and in replay on a phone or tablet.
 - FR-3. Starting a game with no calibration sends the controller to calibration first.
 - FR-3a. **Auto-detect the board** finds the board in the picture and calibrates with it. It refuses (and says why) when it does not find a chessboard pattern, or when the pattern does not alternate light and dark; the corners can then be clicked by hand. White is taken to be on the side of the lighter pieces; **Swap sides** turns the labels when that is wrong.
 - FR-3b. The picture can be turned by 90° in either direction (the calibration turns with it), and has auto contrast, brightness and contrast. Not during a game.
-- FR-3c. Stabilization: during a game, while the board is quiet, the board is looked for again about every 1.5 s; if it shifted by 0.04 to 0.45 of a square, the calibration moves along and the learned squares are kept. It can be switched off, and the choice is kept.
+- FR-3c. Stabilization: during a game, while the board is quiet, the board is looked for again about every 1.5 s (less often on a slow machine); if it shifted by 0.04 to 0.45 of a square, the calibration moves along and the learned squares are kept. Over a whole game it may not move more than one square from where it began, and the file is written at most every 10 s. It can be switched off, and the choice is kept.
 
 ### Android app
 - AR-1. The app shows the page itself (no browser) and uses the camera of the phone by default. The page is served on the loopback address (127.0.0.1:8080), which only the phone itself can reach (other apps on the phone included, which is why the page of the app and its bridge are not a secret from them); other devices on the network can open it only when the owner switches the remote server on (AR-2).
@@ -103,7 +103,7 @@ The target may become a regular laptop, which has its own screen. What changes:
   Run `nicochess --listen 127.0.0.1:8080 --open`: the laptop's own browser opens the page and, being the first to connect, is the controller.
 - **Windows:** the server, the page, the tracker and the game store build and run on Windows, and since 2026-11-12 so does camera capture (Media Foundation, through the `nokhwa` crate, with a camera thread of its own). Tried on a PC's integrated webcam: the format list, 1280x720 MJPEG capture and the frame served by the page. Not yet tried: locking exposure and white balance, a real game.
 - `--open` opens the default browser of the computer once the server is up; use F11 there for full screen.
-- Decided (2026-11-04): if the target becomes a laptop, it runs Linux, the same distribution as the INEOS 600 (Debian). This was later overtaken: the Windows camera backend exists (2026-11-12) and a Windows package is built (`scriptspackage-windows.ps1`), so a Windows laptop works too. A 64-bit Debian can be a newer release than 12, since the 32-bit limit only applies to the Atom.
+- Decided (2026-11-04): if the target becomes a laptop, it runs Linux, the same distribution as the INEOS 600 (Debian). This was later overtaken: the Windows camera backend exists (2026-11-12) and a Windows package is built (`scripts\package-windows.ps1`), so a Windows laptop works too. A 64-bit Debian can be a newer release than 12, since the 32-bit limit only applies to the Atom.
 
 ### Engine analysis with Stockfish
 
@@ -138,7 +138,7 @@ Not verified on the real thing: detection quality on a real board with any camer
 | Step | Status |
 |---|---|
 | 1. Per-square detection, learned from the known start position | Done, tested with noise and a brightness shift. Real camera: not tried |
-| 2. Stability gate and move tracker | Done. Follows the whole 33-move Opera game, castling and captures included |
+| 2. Stability gate and move tracker | Done. Follows the whole Opera game (33 plies, 17 moves), castling and captures included |
 | 3. Game store and PGN | Done |
 | 4. API and push events | Done (own HTTP server: ready-made small servers buffer the events) |
 | 5. Interface | Done: live, calibration, games, replay, corrections |

@@ -52,7 +52,7 @@ Everything is built and tested on a PC with a synthetic camera. The integrated w
 cargo run --release -- --source demo
 ```
 
-Open http://localhost:8080. The demo source plays a whole game (Morphy's "Opera game", 33 moves) on a synthetic board.
+Open http://localhost:8080. The demo source plays a whole game (Morphy's "Opera game", 33 plies: 17 moves) on a synthetic board.
 
 1. Go to **Calibrate**, press **Open the camera**, and click the 4 corners of the board in the order a1, h1, h8, a8
    (counter-clockwise on screen). The corners are about (120,440), (520,425), (470,90), (190,100) in the 640x480 image.

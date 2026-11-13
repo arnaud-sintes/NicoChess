@@ -10,16 +10,22 @@ use jni::objects::{JByteBuffer, JClass, JString};
 use jni::sys::{jboolean, jint, jstring};
 use nicochess::app::{self, ServerOptions};
 use nicochess::camera::SourceSpec;
+use nicochess::engine::Engine;
 use nicochess::http::{self, Handler, Listener};
 use nicochess::pushed::{FrameInbox, yuv420_to_rgb};
 use nicochess::tracker::TrackerConfig;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock, mpsc};
 use std::time::Duration;
 
-/// True once the server is up. Held during the start, so that a second caller waits for the
-/// first one instead of believing the server is ready.
-static UP: Mutex<bool> = Mutex::new(false);
+/// Held during the start, so that a second caller waits for the first one instead of believing
+/// the server is ready.
+static UP: Mutex<()> = Mutex::new(());
+/// Set when the server accepts requests (also if that took longer than `start` waited).
+static READY: AtomicBool = AtomicBool::new(false);
+/// The engine, to ask whether a game is running.
+static ENGINE: OnceLock<Arc<Engine>> = OnceLock::new();
 /// What the listeners serve, and how many connections each may hold.
 static SERVER: OnceLock<(Handler, usize)> = OnceLock::new();
 /// The listener open to the network, while the owner allows it.
@@ -65,7 +71,7 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_cameraWanted<'l>(_env: 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nicochess_app_NativeCore_cameraFailed<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>, message: JString<'l>) {
     let text = env.get_string(&message).map(String::from).unwrap_or_else(|_| "the camera failed".to_string());
-    let _ = std::panic::catch_unwind(|| inbox().fail(text));
+    guarded(|| inbox().fail(text));
 }
 
 /// `String NativeCore.setRemote(boolean enabled, int port)`: opens (or closes) the listener on all
@@ -111,6 +117,12 @@ fn set_remote(enabled: bool, port: i32) -> Result<(), String> {
     Err(last)
 }
 
+/// `boolean NativeCore.isPlaying()`: a game is being recorded (the app then refuses to change camera).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nicochess_app_NativeCore_isPlaying<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) -> jboolean {
+    jboolean::from(ENGINE.get().is_some_and(|engine| engine.is_playing()))
+}
+
 /// `void NativeCore.pushFrame(...)`: one picture of the camera, as Android's
 /// YUV_420_888 planes (direct buffers). The buffers are only read during the call.
 #[unsafe(no_mangle)]
@@ -137,7 +149,7 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_pushFrame<'l>(
         Some(unsafe { std::slice::from_raw_parts(address, length) })
     };
     let (Some(y), Some(u), Some(v)) = (plane(&y), plane(&u), plane(&v)) else {
-        inbox().fail("the camera gave pictures that cannot be read (no direct buffers)");
+        guarded(|| inbox().fail("the camera gave pictures that cannot be read (no direct buffers)"));
         return;
     };
     let dimensions = (u32::try_from(width), u32::try_from(height));
@@ -145,21 +157,28 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_pushFrame<'l>(
     let (Ok(width), Ok(height), Ok(y_stride), Ok(uv_stride), Ok(uv_pixel_stride)) =
         (dimensions.0, dimensions.1, strides.0, strides.1, strides.2)
     else {
-        inbox().fail("the camera gave a picture with a negative size or stride");
+        guarded(|| inbox().fail("the camera gave a picture with a negative size or stride"));
         return;
     };
     // A panic must not cross into the JVM (it would abort the app); one bad picture is skipped, not
     // fatal: the next one is probably fine, and failing would close and reopen the camera.
     match std::panic::catch_unwind(|| yuv420_to_rgb(width, height, y, y_stride, u, v, uv_stride, uv_pixel_stride)) {
-        Ok(Ok(image)) => inbox().push(image),
+        Ok(Ok(image)) => guarded(|| inbox().push(image)),
         Ok(Err(e)) => eprintln!("camera: a picture was skipped: {e:#}"),
         Err(_) => eprintln!("camera: a picture was skipped (internal error)"),
     }
 }
 
+/// Runs `f`; a panic is logged and stops here: it must not unwind into the JVM, which would abort the app.
+fn guarded(f: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err() {
+        eprintln!("camera: internal error (a panic was stopped before it reached the app)");
+    }
+}
+
 fn start(data_dir: String, listen: String, source: String) -> Result<(), String> {
-    let mut up = UP.lock().unwrap_or_else(|e| e.into_inner());
-    if *up {
+    let _starting = UP.lock().unwrap_or_else(|e| e.into_inner());
+    if READY.load(Ordering::SeqCst) {
         return Ok(());
     }
     static LOGS: Once = Once::new();
@@ -205,11 +224,13 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
             }
         };
         let _ = SERVER.set((built.handler.clone(), built.max_connections));
+        let _ = ENGINE.set(Arc::clone(&built.engine));
         let ready: Box<dyn FnOnce()> = Box::new(move || {
+            READY.store(true, Ordering::SeqCst);
             let _ = ready_tx.send(Ok(()));
         });
         if let Err(e) = http::serve_on(listener, built.max_connections, built.handler, Some(ready)) {
-            eprintln!("server stopped: {e:#}");
+            eprintln!("http: server stopped: {e:#}");
             let _ = tx.send(Err(format!("{e:#}")));
         }
     });
@@ -218,10 +239,7 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
     }
 
     match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(())) => {
-            *up = true;
-            Ok(())
-        }
+        Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
         Err(_) => Err("the server did not start within 15 seconds".to_string()),
     }
@@ -254,7 +272,8 @@ fn redirect_output_to_logcat() {
     let _ = std::thread::Builder::new().name("logcat".into()).spawn(move || {
         // SAFETY: `read_end` is the read side of the pipe created above, owned by this thread.
         let file = unsafe { std::fs::File::from_raw_fd(read_end) };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
+        for line in BufReader::new(file).split(b'\n').map_while(Result::ok) {
+            let line = String::from_utf8_lossy(&line).into_owned();
             if let Ok(text) = std::ffi::CString::new(line) {
                 // SAFETY: both strings are valid and NUL-terminated.
                 unsafe { __android_log_write(ANDROID_LOG_INFO, c"nicochess".as_ptr(), text.as_ptr()) };

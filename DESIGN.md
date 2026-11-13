@@ -7,7 +7,7 @@ These rules describe how the code is written today. Follow them when you change 
 - **Comments and messages are plain English prose** and say why, not what. No emojis, no ticket numbers, no jokes. A comment that the code has outgrown is deleted or corrected, not left.
 - **Names**: Rust `snake_case` and `CamelCase` as usual; names say what a thing is for (`track_interval`, `FrameInbox`), not how it works. Avoid names that look like keywords or std types (`Option_`).
 - **Formatting and lint**: `rustfmt` with the repository's `rustfmt.toml`, and `clippy` with no warnings (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`). CI runs both.
-- **Logging** is `eprintln!` with a prefix that names the part: `camera:`, `game:`, `store:`, `http:`, `follow:`, `calibration:`. No levels, no timestamps (journald adds them). Messages are short sentences a user can act on.
+- **Logging** is `eprintln!` with a prefix that names the part: `camera:`, `game:`, `store:`, `http:`, `follow:`, `calibration:`, `picture:`; the command-line program prints its final failure as `error:`. No levels, no timestamps (journald adds them). Messages are short sentences a user can act on.
 
 ## Errors
 
@@ -26,8 +26,8 @@ These rules describe how the code is written today. Follow them when you change 
 
 ## Locking and threads
 
-- The engine has one `inner` mutex. Take it, change what must change, release it. **Never hold it during slow work**: board detection, JPEG encoding, warping, writing a file, a JNI call. Copy what you need, release, work, take the lock again and check that nothing changed in between (see `follow_board` for the pattern).
-- Lock order: `inner` before `camera_wanted`, `frame`, `frame_count`. Never the other way round.
+- The engine has one `inner` mutex. Take it, change what must change, release it. **The capture thread and the per-picture paths never hold it during slow work**: board detection, JPEG encoding, warping, writing a file, a JNI call. Copy what you need, release, work, take the lock again and check that nothing changed in between (see `follow_board`). A game is saved by marking it (`save` sets `pending_save` under the lock) and writing it after the lock is released (`flush_save`, which takes `save_lock`, so that one writer at a time writes the newest version). The rare commands of the owner (calibration, picture settings) write their small file while holding the lock: that takes milliseconds and is not on a per-picture path.
+- Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`. Never the other way round. (`wait_for_frame` takes `frame_count` and then only reads `frame`: it never touches `inner`.)
 - Locks are recovered when poisoned (a panic elsewhere must not make every later request panic).
 - The capture loop survives a panic in one frame. Connection threads release their slot even when they panic.
 - The hub only says "something changed" (`Hub::notify`); each stream builds its own snapshot. After any change that a page shows, call `hub.notify()` once the lock is released.
@@ -44,7 +44,7 @@ These rules describe how the code is written today. Follow them when you change 
 
 ## Android (Kotlin)
 
-- Camera objects (`device`, `session`, `reader`, handler thread) are touched **only on the main thread**. Camera callbacks run on the camera thread and only post to the main thread (`failLater`, the generation check).
+- Camera objects (`device`, `session`, `reader`, handler thread) are touched **only on the main thread**. Camera callbacks are given the main handler, so they run there too; only the pictures arrive on the image reader's own thread, and `close()` closes the reader on that thread, after a picture in flight.
 - Bridge methods (`AndroidBridge`) are called from a WebView thread: they read settings and post to the main thread; they never touch the camera directly.
 - JNI calls that can block (`NativeCore.start`, `setRemote`) run on a worker thread, never on the main thread.
 - Settings live in SharedPreferences through `Settings`; only camera settings restart the camera. A setting the owner cannot change during a game is refused in Kotlin, not only greyed out in the page.
@@ -55,7 +55,7 @@ These rules describe how the code is written today. Follow them when you change 
 
 - The engine is tested through `server::tests::rig`: a real engine with a capture thread on the **synthetic or demo source**, driven with `Request::for_test`, no sockets.
 - Vision and detection are tested on synthetic pictures (`synthetic.rs`: the board in perspective, the Opera game); detection is also checked after rotation, noise and scaling.
-- No real camera, no network, no sleeping longer than needed: wait for a condition with `wait_for(...)`. Temporary files go in `std::env::temp_dir()` under `nicochess-<name>-<pid>` and are removed.
+- No real camera, no network, no sleeping longer than needed: wait for a condition with `wait_for(...)` (a fixed sleep is only for checking that something does NOT happen). Temporary files go in `std::env::temp_dir()` under `nicochess-<name>-<pid>` and are removed.
 - A bug fix comes with a test that fails without it.
 - Kotlin and JNI code has no unit tests; its check is the Docker build. Say so when you change it.
 

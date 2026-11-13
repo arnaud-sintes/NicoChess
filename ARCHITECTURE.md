@@ -70,8 +70,9 @@ camera --(FrameSource::next_frame)--> capture thread (engine::on_frame)
    rotate + brightness/contrast (picture.rs)  ->  Latest { image, raw, seq }   -> preview: /frame.mjpg, /warp.mjpg
    every track_interval, while Playing:
       warp (calibration.rs) -> sample squares (vision.rs) -> stability gate + legal-move match (tracker.rs)
-      -> Detection::Move  -> GameRecord::push_move (game.rs) -> Store::save (store.rs, atomic)
-   every 1.5 s, while Playing and quiet: boarddetect::refine -> move the calibration if the board shifted
+      -> Detection::Move  -> GameRecord::push_move (game.rs) -> pending_save -> flush_save after the lock is released (store.rs, atomic)
+   about every 1.5 s (longer on a slow machine: at least 20 times the search time), while Playing and quiet: boarddetect::refine
+   -> move the calibration if the board shifted (never more than one square from where the game began; the file is written at most every 10 s)
 every change -> Hub::notify -> each event stream wakes, builds its snapshot (engine::snapshot) -> page
 page --POST /api/...--> server.rs route -> engine command (checks the token and the mode) -> Hub::notify
 ```
@@ -81,15 +82,17 @@ PGN is produced on request from the stored moves (`GameRecord::pgn`); positions 
 
 | Thread | What it does |
 |---|---|
-| `capture` (one) | Opens a `FrameSource` when the camera is wanted, loops over frames, runs `on_frame`; sleeps on a condvar when no camera is wanted. A panic is caught and the loop restarts |
+| `capture` (one) | Opens a `FrameSource` when the camera is wanted, loops over frames, runs `on_frame`; sleeps on a condvar when no camera is wanted. A panic while processing a picture is caught (the picture is skipped and the loop goes on); a panic inside the camera source itself ends the thread, which is logged |
 | `camera` (Windows only) | Owns the Media Foundation camera (it is not `Send`) and sends frames over a channel |
 | `http` (one per connection) | Reads one request, runs the handler, answers; stream replies (events, MJPEG) keep the thread until the page leaves |
 | `http-accept` (Android, remote listener) | Polls a non-blocking listener ten times a second so it can be stopped |
 | `nicochess-server` (Android) | Runs the loopback listener |
-| Camera2 thread (Android) | Camera callbacks, which only post work to the main thread |
+| `nicochess-camera` (Android) | The image reader's thread: receives the pictures and hands them to the core. Camera2 callbacks themselves run on the main thread |
+| `logcat` (Android) | Reads the program's stderr from a pipe and writes it to logcat |
+| `CoreService` worker (Android) | Starts the core and opens or closes the remote listener, which can take a moment |
 
-State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, picture settings, roles, notices. Separate small locks: `frame` (latest picture, `RwLock`), `camera_wanted` with a condvar, `frame_count` with a condvar (streams wait on it), the SSE hub's subscriber list.
-**Lock order: `inner` before `camera_wanted`, `frame`, `frame_count`. No cycle exists; keep it that way.** Poisoned locks are recovered, not propagated. Slow work (detection, JPEG encoding, disk writes) is done outside `inner`.
+State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, picture settings, roles, notices. Separate small locks: `frame` (latest picture, `RwLock`), `camera_wanted` with a condvar, `frame_count` with a condvar (streams wait on it), `stats` (speed figures), `save_lock` (one game writer at a time), the SSE hub's subscriber list.
+**Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`. No cycle exists; keep it that way.** (`wait_for_frame` takes `frame_count` and then only reads `frame`; it never takes `inner`.) Poisoned locks are recovered, not propagated. Slow work on the capture thread (detection, JPEG encoding, writing a game) is done outside `inner`; the rare commands of the owner write their small settings file under it.
 
 ## Persistence
 
@@ -105,7 +108,7 @@ All three are written by `fsutil::write_atomic`: after a power cut a file is the
 
 The full route list is the comment at the top of `src/server.rs`. Summary: `GET` for the page, pictures, state, event stream and games; `POST` for commands (claim, release, calibration, picture, camera, game start/end/move/undo/promotion/relearn/resume); one `DELETE` (forget the calibration).
 Identity is a token of 8 to 64 hexadecimal characters made by the page: header `X-Client-Token` on commands, `?token=` on the state and event `GET`s. The first token seen takes the controller role; a release disables auto-claim until someone presses Take control; the role expires after 60 s of silence outside a game (30 min during one). Commands check the controller and the mode (`ApiError`: 403, 400, 409, 500).
-The `Host` header is checked against the local addresses (DNS rebinding), and accepted sockets get TCP keepalive. There is no login: the network is the protection.
+The `Host` header must name an address, `localhost`, a name without a dot, or a local name (`.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, `.localdomain`): this stops DNS rebinding, and refuses a fully qualified name such as `pc.corp.example.com` (use the address), and accepted sockets get TCP keepalive. There is no login: the network is the protection.
 
 ## Platform abstraction
 
