@@ -1,0 +1,4 @@
+# Windows: link the C runtime into the program, so that it runs on a PC without the
+# "Visual C++ Redistributable" installed (nothing to install next to it).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

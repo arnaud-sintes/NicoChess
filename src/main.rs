@@ -6,7 +6,9 @@
 use anyhow::{Result, bail};
 use nicochess::app::{self, ServerOptions};
 use nicochess::camera::{self, CameraSettings, SourceSpec};
+use nicochess::http;
 use nicochess::tracker::TrackerConfig;
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,9 +19,10 @@ USAGE:
     nicochess [OPTIONS]
 
 OPTIONS:
-    --listen <ADDR>          HTTP address                        [default: 0.0.0.0:8080]
+    --listen <ADDR>          HTTP address                        [default: 0.0.0.0:8080; on Windows, if that
+                             port is reserved or taken, the next free one among 28080-28089, then any]
     --source <SRC>           camera | demo | synthetic | <image.jpg>   [default: camera]
-    --device <X>             camera: /dev/videoN (Linux) or its number 0, 1... (Windows)  [default: /dev/video0]
+    --device <X>             camera: /dev/videoN (Linux) or its number 0, 1... (Windows)  [default: /dev/video0, or 0 on Windows]
     --width <N>              camera width                        [default: 640]
     --height <N>             camera height                       [default: 480]
     --fps <N>                frames per second kept              [default: 3]
@@ -62,9 +65,10 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let listen: String = args.opt_value_from_str("--listen")?.unwrap_or_else(|| "0.0.0.0:8080".into());
+    let listen_option: Option<String> = args.opt_value_from_str("--listen")?;
     let source: String = args.opt_value_from_str("--source")?.unwrap_or_else(|| "camera".into());
-    let device: String = args.opt_value_from_str("--device")?.unwrap_or_else(|| "/dev/video0".into());
+    let default_device = if cfg!(windows) { "0" } else { "/dev/video0" };
+    let device: String = args.opt_value_from_str("--device")?.unwrap_or_else(|| default_device.into());
     let width: u32 = args.opt_value_from_str("--width")?.unwrap_or(640);
     let height: u32 = args.opt_value_from_str("--height")?.unwrap_or(480);
     let fps: f32 = args.opt_value_from_str("--fps")?.unwrap_or(3.0);
@@ -125,14 +129,37 @@ fn run() -> Result<()> {
         path => SourceSpec::Image(path.to_string()),
     };
 
-    let on_ready: Option<Box<dyn FnOnce()>> = if open {
-        let url = format!("http://{}", listen.replace("0.0.0.0", "localhost"));
-        Some(Box::new(move || open_browser(&url)))
-    } else {
-        None
+    // Where to listen. Without --listen: port 8080 and, on Windows, a way out when the system
+    // keeps that port for something else (Docker and Hyper-V reserve whole ranges of ports).
+    let candidates: Vec<String> = match &listen_option {
+        Some(addr) => vec![addr.clone()],
+        None if cfg!(windows) => ["0.0.0.0:8080"]
+            .into_iter()
+            .map(String::from)
+            .chain((28080..28090).map(|p| format!("0.0.0.0:{p}")))
+            .chain(["0.0.0.0:0".to_string()])
+            .collect(),
+        None => vec!["0.0.0.0:8080".to_string()],
     };
+    let listener = http::bind_first(&candidates).map_err(|e| anyhow::anyhow!("{e:#}{}", PORT_HINT))?;
+    let bound = listener.local_addr()?;
+    let local_url = format!("http://localhost:{}", bound.port());
+    let from_network = bound.ip().is_unspecified().then(|| local_ip().map(|ip| format!("http://{ip}:{}", bound.port()))).flatten();
+    let on_ready: Option<Box<dyn FnOnce()>> = Some(Box::new(move || {
+        eprintln!();
+        eprintln!("NicoChess is running.");
+        eprintln!("  On this computer:   {local_url}");
+        if let Some(url) = &from_network {
+            eprintln!("  From a phone or tablet on the same network:   {url}");
+        }
+        eprintln!("  Close this window (or press Ctrl+C) to stop.");
+        eprintln!();
+        if open {
+            open_browser(&local_url);
+        }
+    }));
     let options = ServerOptions {
-        listen,
+        listen: bound.to_string(),
         source: spec,
         frame_interval: interval,
         data_dir,
@@ -144,7 +171,18 @@ fn run() -> Result<()> {
         game_timeout: Duration::from_secs(game_mins * 60),
         max_viewers,
     };
-    app::serve(options, on_ready)
+    app::serve_on(options, listener, on_ready)
+}
+
+const PORT_HINT: &str = "\n  The port may be taken or reserved. On Windows, Docker Desktop and Hyper-V reserve ranges of ports\n  (see them with: netsh int ipv4 show excludedportrange protocol=tcp). Choose a free port with\n  --listen 0.0.0.0:PORT (for example 28080).";
+
+/// The address of this computer on the local network, if it has one. Nothing is sent: a UDP
+/// socket only works out which interface it would use.
+fn local_ip() -> Option<std::net::IpAddr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
 /// Opens an address in the default browser of this computer.

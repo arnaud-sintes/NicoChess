@@ -15,6 +15,13 @@ object NativeCore {
      */
     external fun start(dataDir: String, listen: String, source: String): String
 
+    /**
+     * Opens (or closes) the listener on the network, on [port], so that other devices on the
+     * same network can open the page. The local one on 127.0.0.1 is always there.
+     * Returns "" when done, otherwise the reason it did not work.
+     */
+    external fun setRemote(enabled: Boolean, port: Int): String
+
     /** True while the core needs pictures: the camera should be open. */
     external fun cameraWanted(): Boolean
 

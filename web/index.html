@@ -44,6 +44,7 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
   .muted { color: var(--muted); }
   .small { font-size: .85rem; }
+  select { font: inherit; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line, #ccc); background: var(--card, #fff); color: var(--fg); max-width: 100%; }
   label.check { display: flex; gap: 8px; align-items: center; color: var(--fg); margin: 6px 0 2px; }
   .status { margin: 8px 0; min-height: 1.4em; }
   .status.unsure { color: var(--warn); }
@@ -214,6 +215,15 @@
       <div class="stage" id="cal-stage" hidden><img id="live" alt="camera"><canvas id="overlay"></canvas></div>
       <div class="muted small" id="cam-stats"></div>
       <div class="status" id="cal-msg"></div>
+    </div>
+    <div class="card" id="android-card" hidden>
+      <h2>This phone</h2>
+      <label class="check"><input type="checkbox" id="and-remote"> Let other devices connect (remote server)</label>
+      <div class="muted small" id="and-remote-info"></div>
+      <label class="check"><input type="checkbox" id="and-external"> Use an external camera (USB)</label>
+      <div class="muted small" id="and-external-info"></div>
+      <label class="check" id="and-camera-row">Camera <select id="and-camera"></select></label>
+      <div class="muted small" id="and-camera-info"></div>
     </div>
     <div class="card" id="picture-card" hidden>
       <h2>Picture</h2>
@@ -519,6 +529,7 @@ function renderCalibrate(ctl) {
   $('warp-card').hidden = !(cameraOn && S.calibration);
   $('picture-card').hidden = !(cameraOn && ctl && S.mode !== 'playing');
   showPicture();
+  andRender();
   if (!cameraOn) { clicks = []; calNote = null; }
   if (cameraOn && ctl && !clicks.length && calNote) {
     $('cal-msg').className = 'status' + (calNote.bad ? ' unsure' : '');
@@ -632,6 +643,57 @@ setInterval(async () => {
     $('cam-stats').textContent = r.fps.toFixed(1) + ' pictures/s from the camera · ' + r.process_ms.toFixed(0) + ' ms to process · ' + r.encode_ms.toFixed(0) + ' ms to compress';
   } catch (e) { /* the next time */ }
 }, 1500);
+
+// ---------- the Android app: remote server, camera choice ----------
+// Only the WebView of the app has window.NicoAndroid; in a browser the card stays hidden.
+const NA = window.NicoAndroid;
+let andSignature = '';
+function andInfo() {
+  try { return JSON.parse(NA.info()); } catch (e) { return null; }
+}
+function andRender() {
+  if (!NA) return;
+  const card = $('android-card');
+  const info = andInfo();
+  card.hidden = !(info && S && S.role === 'controller');
+  if (!info || card.hidden) return;
+  const playing = S.mode === 'playing';
+  const busy = id => document.activeElement === $(id);
+
+  if (!busy('and-remote')) $('and-remote').checked = info.remote.enabled;
+  $('and-remote-info').textContent = !info.remote.enabled
+    ? 'Off: only this app can open the page.'
+    : info.remote.error ? 'Cannot open the server for other devices: ' + info.remote.error
+    : info.remote.urls.length
+      ? 'Open ' + info.remote.urls.join(' or ') + ' on another device on the same network. Anyone on the network can watch; the first page to connect while nobody controls can take control.'
+      : 'On, but this phone has no network address: connect it to Wi-Fi (or turn on its hotspot).';
+
+  if (!busy('and-external')) $('and-external').checked = info.external.enabled;
+  $('and-external').disabled = playing;
+  $('and-external-info').textContent = info.external.enabled
+    ? (info.external.present ? 'The external camera is in use.' : 'No external camera detected. Plug it in; Android only offers a USB camera to apps on phones that support it.')
+    : info.external.present ? 'An external camera is connected: switch this on to use it.' : '';
+
+  const own = info.camera.cameras.filter(c => c.facing !== 'external');
+  const signature = own.map(c => c.id + c.label).join('|') + '/' + info.camera.selected;
+  if (signature !== andSignature && !busy('and-camera')) {
+    andSignature = signature;
+    $('and-camera').innerHTML = own.map(c => '<option value="' + esc(c.id) + '">' + esc(c.label + ', up to ' + c.width + 'x' + c.height) + '</option>').join('');
+    $('and-camera').value = info.camera.selected;
+  }
+  $('and-camera-row').hidden = info.external.enabled || own.length < 2;
+  $('and-camera').disabled = playing;
+  $('and-camera-info').textContent = (info.camera.using ? 'In use: ' + info.camera.using + '. ' : '')
+    + (playing ? 'The camera cannot be changed during a game.' : '')
+    + (info.error ? ' ' + info.error : '');
+}
+if (NA) {
+  $('and-remote').onchange = () => { NA.setRemote($('and-remote').checked); setTimeout(andRender, 700); };
+  $('and-external').onchange = () => { NA.setExternal($('and-external').checked); setTimeout(andRender, 700); };
+  $('and-camera').onchange = () => { NA.setCamera($('and-camera').value); setTimeout(andRender, 700); };
+  // A USB camera can be plugged in or pulled out, and the network address can change.
+  setInterval(() => { if (tab === 'calibrate' && !document.hidden) andRender(); }, 2000);
+}
 
 // ---------- picture: turn, brightness, contrast ----------
 let pictureTimer = null, pictureDragging = false;

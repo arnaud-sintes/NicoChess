@@ -28,6 +28,8 @@ Everything is built and tested on a PC with a synthetic camera. **Nothing has ru
 | Controller / viewer roles: the first user controls, the others watch and replay | Tuning of the detection thresholds on real lighting |
 | Calibration by clicking the 4 corners, or by the **Auto-detect the board** button (tested on a few real photos, see below), kept on disk | Wi-Fi access point on the target ([PLAN.md](PLAN.md) section 8) |
 | Picture settings: turn by 90°, auto contrast, brightness and contrast (software, same on every camera) | Camera-side controls on Android (exposure compensation, focus, white balance) |
+| Android app: server and phone camera in one app, runs on with the screen off (foreground service), remote-server switch, choice of camera, external USB camera when Android offers it | The Android app has not been run on a phone since the service and the switches were added; the USB camera is untested |
+| Windows package: unzip and double-click, nothing to install ([below](#windows-package)) | Tried on this PC only |
 | Stabilization: during a game the calibration follows the board if the camera shifts a little (can be switched off) | Tried only on synthetic pictures: not yet on a real board |
 | Camera and top-down pictures pushed as Motion JPEG streams (no polling) | Speed of the preview on a real phone not measured: see the figures under the picture |
 | Per-square empty / white / black detection, learned from the known start position | |
@@ -69,6 +71,32 @@ Other sources: `--source synthetic` (the starting position only) or `--source so
 builds `usb\`: the program, an installer, the Debian packages for an offline install, a Wi-Fi access point script and a README.
 Copy its content to a FAT32 key and follow `README.txt` on the target. Details in [PLAN.md](PLAN.md) section 10.
 `scripts\deploy.ps1 -Target user@host` updates the program over SSH when a network is available.
+
+## Android app
+
+`.\scripts\build-android.ps1` (Docker Desktop must be running) builds `dist\nicochess-debug.apk` for 64-bit and 32-bit ARM phones and tablets; `-Abis arm64-v8a` builds only the 64-bit one, which is faster (an x86 emulator build is not set up).
+The app is the same program as on the PC: the server runs inside the app and the page is shown in a WebView, so everything works offline.
+The phone camera is the default. On the **Calibrate** tab, a **This phone** card (only in the app) has:
+
+- **Let other devices connect (remote server)**: off by default. When on, the page is also served on port 8081 to the network, and the card shows the addresses.
+  Anyone on the network can then watch; the first page to connect while nobody controls can take control (for example a tablet while the phone only films).
+- **Use an external camera (USB)**: uses the first camera Android lists as external. Android only offers a USB camera to apps on phones that support it; when none is seen the card says so.
+- **Camera**: which camera of the phone, when it has several (back, ultra-wide, telephoto, front). Not changeable during a game.
+
+A notification shows while the app runs (Android requires it for a service that uses the camera); its **Stop** button ends everything.
+The app asks for the camera permission, and for notifications on Android 13 and later, when it opens.
+
+## Windows package
+
+`.\scripts\package-windows.ps1` builds `dist\NicoChess-windows.zip` (under 1 MB): `nicochess.exe`, three launchers and a README.
+Nothing to install: the C runtime is linked into the program. Unzip, then:
+
+- **Start NicoChess.bat** opens the page; `Start NicoChess.bat 1` uses camera number 1.
+- **Demo (no camera).bat** plays a whole game on a drawn board.
+- **List cameras.bat** shows the cameras, their formats and controls.
+
+Games, calibration and picture settings are kept in `%LOCALAPPDATA%\NicoChess`. Without `--listen` the program takes port 8080 and, if Windows reserves it
+(Docker Desktop and Hyper-V do), the next free one, and prints the addresses to use from a phone.
 
 ## Cameras
 

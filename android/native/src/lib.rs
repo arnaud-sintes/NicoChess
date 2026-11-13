@@ -1,22 +1,29 @@
 //! The Android side of NicoChess: the core library behind a JNI entry point.
 //!
-//! The app (Kotlin) calls `NativeCore.start(...)` once. That starts the web
-//! server in a thread of this process, on the loopback address, and the app
-//! shows the page in a WebView.
+//! The app (Kotlin) calls `NativeCore.start(...)`. That starts the web server in a
+//! thread of this process, on the loopback address, and the app shows the page in a
+//! WebView. `NativeCore.setRemote(...)` opens or closes a second listener on the
+//! network, so that other devices can watch (or control) from their own browser.
 
 use jni::JNIEnv;
 use jni::objects::{JByteBuffer, JClass, JString};
 use jni::sys::{jboolean, jint, jstring};
 use nicochess::app::{self, ServerOptions};
 use nicochess::camera::SourceSpec;
+use nicochess::http::{self, Handler, Listener};
 use nicochess::pushed::{FrameInbox, yuv420_to_rgb};
 use nicochess::tracker::TrackerConfig;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, Once, OnceLock, mpsc};
 use std::time::Duration;
 
-static STARTED: AtomicBool = AtomicBool::new(false);
+/// True once the server is up. Held during the start, so that a second caller waits for the
+/// first one instead of believing the server is ready.
+static UP: Mutex<bool> = Mutex::new(false);
+/// What the listeners serve, and how many connections each may hold.
+static SERVER: OnceLock<(Handler, usize)> = OnceLock::new();
+/// The listener open to the network, while the owner allows it.
+static REMOTE: Mutex<Option<Listener>> = Mutex::new(None);
 
 /// Where the app drops the pictures of the phone's camera.
 fn inbox() -> Arc<FrameInbox> {
@@ -66,6 +73,49 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_cameraFailed<'l>(
     inbox().fail(text);
 }
 
+/// `String NativeCore.setRemote(boolean enabled, int port)`: opens (or closes) the listener on all
+/// the addresses of the phone. Returns "" or the reason it did not work.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nicochess_app_NativeCore_setRemote<'l>(
+    env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    enabled: jboolean,
+    port: jint,
+) -> jstring {
+    let result = std::panic::catch_unwind(|| set_remote(enabled != 0, port))
+        .unwrap_or_else(|_| Err("the native code panicked".to_string()));
+    env.new_string(result.err().unwrap_or_default()).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+fn set_remote(enabled: bool, port: i32) -> Result<(), String> {
+    let Some((handler, max_connections)) = SERVER.get() else {
+        return Err("the server is not running yet".to_string());
+    };
+    let port = u16::try_from(port).ok().filter(|p| *p >= 1024).ok_or("the port must be between 1024 and 65535")?;
+    let mut remote = REMOTE.lock().unwrap_or_else(|e| e.into_inner());
+    if !enabled {
+        *remote = None; // dropping the listener stops it
+        return Ok(());
+    }
+    if remote.as_ref().is_some_and(|l| l.local_addr().port() == port) {
+        return Ok(());
+    }
+    *remote = None;
+    // A listener that was just stopped lets go of its port within a fraction of a second.
+    let mut last = String::new();
+    for _ in 0..10 {
+        match http::spawn(&format!("0.0.0.0:{port}"), *max_connections, handler.clone()) {
+            Ok(listener) => {
+                *remote = Some(listener);
+                return Ok(());
+            }
+            Err(e) => last = format!("{e:#}"),
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    Err(last)
+}
+
 /// `void NativeCore.pushFrame(...)`: one picture of the camera, as Android's
 /// YUV_420_888 planes (direct buffers). The buffers are only read during the call.
 #[unsafe(no_mangle)]
@@ -110,19 +160,18 @@ pub extern "system" fn Java_com_nicochess_app_NativeCore_pushFrame<'l>(
 }
 
 fn start(data_dir: String, listen: String, source: String) -> Result<(), String> {
-    if STARTED.swap(true, Ordering::SeqCst) {
+    let mut up = UP.lock().unwrap_or_else(|e| e.into_inner());
+    if *up {
         return Ok(());
     }
-    redirect_output_to_logcat();
+    static LOGS: Once = Once::new();
+    LOGS.call_once(redirect_output_to_logcat);
 
     let spec = match source.as_str() {
         "phone" => SourceSpec::Pushed(inbox()),
         "demo" => SourceSpec::Demo { move_interval: Duration::from_secs(4) },
         "synthetic" => SourceSpec::Synthetic,
-        other => {
-            STARTED.store(false, Ordering::SeqCst);
-            return Err(format!("unknown source \"{other}\" (this build has: phone, demo, synthetic)"));
-        }
+        other => return Err(format!("unknown source \"{other}\" (this build has: phone, demo, synthetic)")),
     };
 
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
@@ -142,29 +191,33 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
             game_timeout: Duration::from_secs(30 * 60),
             max_viewers: 8,
         };
+        let built = match app::build(options) {
+            Ok(built) => built,
+            Err(e) => {
+                let _ = tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
+        let _ = SERVER.set((built.handler.clone(), built.max_connections));
         let ready: Box<dyn FnOnce()> = Box::new(move || {
             let _ = ready_tx.send(Ok(()));
         });
-        if let Err(e) = app::serve(options, Some(ready)) {
+        if let Err(e) = http::serve(&built.listen, built.max_connections, built.handler, Some(ready)) {
             eprintln!("server stopped: {e:#}");
             let _ = tx.send(Err(format!("{e:#}")));
         }
     });
     if let Err(e) = spawned {
-        STARTED.store(false, Ordering::SeqCst);
         return Err(format!("cannot start the server thread: {e}"));
     }
 
     match rx.recv_timeout(Duration::from_secs(15)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => {
-            STARTED.store(false, Ordering::SeqCst);
-            Err(e)
+        Ok(Ok(())) => {
+            *up = true;
+            Ok(())
         }
-        Err(_) => {
-            STARTED.store(false, Ordering::SeqCst);
-            Err("the server did not start within 15 seconds".to_string())
-        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("the server did not start within 15 seconds".to_string()),
     }
 }
 

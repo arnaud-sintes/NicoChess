@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -110,34 +110,117 @@ pub fn serve(
     on_ready: Option<Box<dyn FnOnce()>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("cannot listen on {addr}"))?;
-    eprintln!("http: listening on http://{addr}");
+    serve_on(listener, max_connections, handler, on_ready)
+}
+
+/// Binds the first address of the list that works (an address can be taken, or reserved by
+/// the system, as Docker and Hyper-V do on Windows). Says which one it took.
+pub fn bind_first(addresses: &[String]) -> Result<TcpListener> {
+    let mut last = None;
+    for addr in addresses {
+        match TcpListener::bind(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => last = Some(anyhow::Error::new(e).context(format!("cannot listen on {addr}"))),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no address to listen on")))
+}
+
+/// Like [`serve`], on a listener that is already open.
+pub fn serve_on(
+    listener: TcpListener,
+    max_connections: usize,
+    handler: Handler,
+    on_ready: Option<Box<dyn FnOnce()>>,
+) -> Result<()> {
+    let shown = listener.local_addr().map_or_else(|_| "?".to_string(), |a| a.to_string());
+    eprintln!("http: listening on http://{shown}");
     if let Some(on_ready) = on_ready {
         on_ready();
     }
     let active = Arc::new(AtomicUsize::new(0));
-
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        if active.fetch_add(1, Ordering::SeqCst) >= max_connections {
-            active.fetch_sub(1, Ordering::SeqCst);
-            let _ = write_bytes(&mut stream, 503, "text/plain", b"busy", &[]);
-            close_politely(&mut stream);
-            continue;
-        }
-        let (handler, active) = (Arc::clone(&handler), Arc::clone(&active));
-        let spawned = thread::Builder::new()
-            .name("http".into())
-            .stack_size(512 * 1024)
-            .spawn(move || {
-                let _ = connection(stream, &handler);
-                active.fetch_sub(1, Ordering::SeqCst);
-            });
-        if spawned.is_err() {
-            // Could not start a thread: give the slot back.
-            eprintln!("http: cannot start a connection thread");
-        }
+        let Ok(stream) = stream else { continue };
+        accept(stream, max_connections, &handler, &active);
     }
     Ok(())
+}
+
+/// Hands a new connection to a thread of its own, or refuses it when too many are open.
+fn accept(mut stream: TcpStream, max_connections: usize, handler: &Handler, active: &Arc<AtomicUsize>) {
+    if active.fetch_add(1, Ordering::SeqCst) >= max_connections {
+        active.fetch_sub(1, Ordering::SeqCst);
+        let _ = write_bytes(&mut stream, 503, "text/plain", b"busy", &[]);
+        close_politely(&mut stream);
+        return;
+    }
+    let (handler, active) = (Arc::clone(handler), Arc::clone(active));
+    let spawned = thread::Builder::new().name("http".into()).stack_size(512 * 1024).spawn({
+        let active = Arc::clone(&active);
+        move || {
+            let _ = connection(stream, &handler);
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
+    });
+    if spawned.is_err() {
+        // Could not start a thread: give the slot back.
+        active.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("http: cannot start a connection thread");
+    }
+}
+
+/// A server that can be stopped: the Android app opens one for other devices when the
+/// owner switches that on, and closes it when they switch it off.
+pub struct Listener {
+    stop: Arc<AtomicBool>,
+    addr: std::net::SocketAddr,
+}
+
+impl Listener {
+    /// The address it listens on (with the real port when 0 was asked for).
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// Stops accepting. Connections already open (event streams) end by themselves when
+    /// their page goes away.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Starts serving on a thread of its own and returns at once. The listener is checked for
+/// new connections ten times a second so that it can be stopped.
+pub fn spawn(addr: &str, max_connections: usize, handler: Handler) -> Result<Listener> {
+    let listener = TcpListener::bind(addr).with_context(|| format!("cannot listen on {addr}"))?;
+    listener.set_nonblocking(true)?;
+    let local = listener.local_addr()?;
+    eprintln!("http: also listening on http://{local}");
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    thread::Builder::new().name("http-accept".into()).spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
+        while !flag.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Some systems hand on the non-blocking mode of the listener.
+                    if stream.set_nonblocking(false).is_ok() {
+                        accept(stream, max_connections, &handler, &active);
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(100)),
+                Err(_) => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        eprintln!("http: stopped listening on http://{local}");
+    })?;
+    Ok(Listener { stop, addr: local })
 }
 
 fn connection(mut stream: TcpStream, handler: &Handler) -> io::Result<()> {
@@ -308,6 +391,30 @@ mod tests {
         let mut out = String::new();
         stream.read_to_string(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn a_stoppable_server_serves_and_then_stops() {
+        let handler: Handler = Arc::new(|_| Reply::text(200, "hello"));
+        let listener = spawn("127.0.0.1:0", 8, handler).unwrap();
+        let addr = listener.local_addr().to_string();
+        assert!(exchange(&addr, "GET / HTTP/1.1\r\nHost: t\r\n\r\n").ends_with("hello"));
+        listener.stop();
+        // New connections are refused soon after.
+        let started = std::time::Instant::now();
+        while TcpStream::connect(&addr).is_ok() {
+            assert!(started.elapsed() < Duration::from_secs(3), "still listening after stop");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn the_first_free_address_is_taken() {
+        let busy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = busy.local_addr().unwrap().to_string();
+        let listener = bind_first(&[taken.clone(), "127.0.0.1:0".to_string()]).unwrap();
+        assert_ne!(listener.local_addr().unwrap().to_string(), taken);
+        assert!(bind_first(&[taken]).is_err());
     }
 
     #[test]

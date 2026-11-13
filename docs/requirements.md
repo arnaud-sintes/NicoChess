@@ -35,6 +35,12 @@ records the game, and shows it live and in replay on a phone or tablet.
 - FR-3b. The picture can be turned by 90° in either direction (the calibration turns with it), and has auto contrast, brightness and contrast. Not during a game.
 - FR-3c. Stabilization: during a game, while the board is quiet, the board is looked for again about every 1.5 s; if it shifted by 0.04 to 0.45 of a square, the calibration moves along and the learned squares are kept. It can be switched off, and the choice is kept.
 
+### Android app
+- AR-1. The app shows the page itself (no browser) and uses the camera of the phone by default. Nothing outside the phone can reach the page unless the owner allows it.
+- AR-2. A switch lets other devices on the network open the page (remote server), and shows the addresses. It is off by default and kept between runs.
+- AR-3. A switch uses an external USB camera, when Android lists one; the owner can also choose among the cameras of the phone. Neither can change during a game.
+- AR-4. A foreground service keeps the server and the camera running with the screen off or another app in front, with a notification and a Stop button.
+
 ### Recording a game
 - FR-4. The controller starts a new game. The standard position is the default; an optional FEN allows resuming a position.
 - FR-5. Player names are optional and default to "White" and "Black".

@@ -3,6 +3,10 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- A service that goes on recording with the screen off, and its notification. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Not required, so the app also installs on a device without a camera or without autofocus. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -25,5 +29,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Runs the server and owns the camera, so a game is still recorded when another app is in
+             front or the phone is locked. -->
+        <service
+            android:name=".CoreService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
     </application>
 </manifest>

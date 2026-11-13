@@ -11,24 +11,27 @@ import android.hardware.camera2.CaptureRequest
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import kotlin.math.abs
 
 /**
- * The camera of the phone (or tablet), through the Camera2 API.
+ * A camera of the phone (or tablet), or an external USB camera when Android lists it,
+ * through the Camera2 API. Which one is decided by [Settings].
  *
- * It captures YUV pictures and hands a few per second to the Rust core. It is opened
+ * It captures YUV pictures and hands a good many per second to the Rust core. It is opened
  * and closed on request: the core says through [NativeCore.cameraWanted] when it needs
  * pictures. After a short moment the exposure, white balance and focus are locked,
  * because a picture that keeps changing upsets the detection of moves.
  *
- * Call [open] and [close] from one thread (the main thread); the camera callbacks
- * run on a thread of their own.
+ * Call [open] and [close] from the main thread. The camera callbacks run on a thread of
+ * their own and only ask the main thread to act.
  */
-class PhoneCamera(context: Context) {
+class PhoneCamera(private val context: Context) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+    private val main = Handler(Looper.getMainLooper())
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
     private var device: CameraDevice? = null
@@ -43,20 +46,34 @@ class PhoneCamera(context: Context) {
     private var lastPushed = 0L
 
     /** True from [open] until [close], also while the camera is still starting. */
+    @Volatile
     var active = false
+        private set
+
+    /** Which camera is open, and at which size: for the page to show. Empty when none. */
+    @Volatile
+    var description = ""
         private set
 
     fun open() {
         if (active) return
         active = true
         val mine = ++generation
+        description = ""
         try {
-            val id = chooseCamera() ?: run {
-                fail("This device has no camera")
+            val choice = CameraCatalog.choose(
+                CameraCatalog.list(manager),
+                Settings.external(context),
+                Settings.cameraId(context),
+            )
+            val chosen = choice.camera
+            if (chosen == null) {
+                failNow(choice.error ?: "No camera")
                 return
             }
-            val characteristics = manager.getCameraCharacteristics(id)
+            val characteristics = manager.getCameraCharacteristics(chosen.id)
             val size = chooseSize(characteristics)
+            description = "${chosen.label}, ${size.width}x${size.height}"
             val worker = HandlerThread("nicochess-camera").also { it.start() }
             val workerHandler = Handler(worker.looper)
             thread = worker
@@ -65,9 +82,9 @@ class PhoneCamera(context: Context) {
             val imageReader = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 2)
             imageReader.setOnImageAvailableListener({ source -> onImage(source, mine) }, workerHandler)
             reader = imageReader
-            Log.i(TAG, "opening camera $id at ${size.width}x${size.height}")
+            Log.i(TAG, "opening $description")
 
-            manager.openCamera(id, object : CameraDevice.StateCallback() {
+            manager.openCamera(chosen.id, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (mine != generation) {
                         camera.close()
@@ -79,20 +96,20 @@ class PhoneCamera(context: Context) {
 
                 override fun onDisconnected(camera: CameraDevice) {
                     camera.close()
-                    if (mine == generation) fail("The camera was disconnected")
+                    failLater(mine, "The camera was disconnected")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     camera.close()
-                    if (mine == generation) fail("The camera failed (error $error)")
+                    failLater(mine, "The camera failed (error $error)")
                 }
             }, workerHandler)
         } catch (e: SecurityException) {
-            fail("Camera permission refused: allow it in the settings of the app")
+            failNow("Camera permission refused: allow it in the settings of the app")
         } catch (e: CameraAccessException) {
-            fail("Cannot open the camera: ${e.message}")
+            failNow("Cannot open the camera: ${e.message}")
         } catch (e: RuntimeException) {
-            fail("Cannot open the camera: ${e.message}")
+            failNow("Cannot open the camera: ${e.message}")
         }
     }
 
@@ -100,6 +117,7 @@ class PhoneCamera(context: Context) {
         if (!active) return
         active = false
         generation++
+        description = ""
         try {
             session?.stopRepeating()
         } catch (_: Exception) {
@@ -116,18 +134,16 @@ class PhoneCamera(context: Context) {
         Log.i(TAG, "camera closed")
     }
 
-    private fun fail(message: String) {
+    /** From the main thread: gives the camera up and tells the core why. The core asks again soon. */
+    private fun failNow(message: String) {
         Log.w(TAG, message)
+        close()
         NativeCore.cameraFailed(message)
     }
 
-    /** The back camera if there is one, else the first camera. */
-    private fun chooseCamera(): String? {
-        val ids = manager.cameraIdList
-        return ids.firstOrNull {
-            manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
-                CameraCharacteristics.LENS_FACING_BACK
-        } ?: ids.firstOrNull()
+    /** From a camera thread: the main thread does it, unless the camera has been closed since. */
+    private fun failLater(mine: Int, message: String) {
+        main.post { if (mine == generation && active) failNow(message) }
     }
 
     /** About 1280x720: sharp enough for the pieces, light enough to convert a few times a second. */
@@ -162,13 +178,13 @@ class PhoneCamera(context: Context) {
                     }
 
                     override fun onConfigureFailed(failed: CameraCaptureSession) {
-                        if (mine == generation) fail("The camera could not be configured")
+                        failLater(mine, "The camera could not be configured")
                     }
                 },
                 handler,
             )
         } catch (e: Exception) {
-            fail("Cannot start the camera: ${e.message}")
+            failLater(mine, "Cannot start the camera: ${e.message}")
         }
     }
 
@@ -182,7 +198,10 @@ class PhoneCamera(context: Context) {
         try {
             val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             builder.addTarget(imageReader.surface)
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            // An external camera may have a fixed focus: only ask for what it offers.
+            if (offers(characteristics, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)) {
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            }
             session.setRepeatingRequest(builder.build(), null, handler)
 
             // Let exposure, white balance and focus settle on the board, then freeze them.
@@ -190,9 +209,12 @@ class PhoneCamera(context: Context) {
                 if (mine == generation) lock(camera, session, imageReader, characteristics)
             }, SETTLE_MS)
         } catch (e: Exception) {
-            fail("Cannot start the camera: ${e.message}")
+            failLater(mine, "Cannot start the camera: ${e.message}")
         }
     }
+
+    private fun offers(characteristics: CameraCharacteristics, afMode: Int): Boolean =
+        characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)?.contains(afMode) == true
 
     /**
      * Best effort: a device that cannot lock a setting keeps it automatic. Switching
@@ -217,8 +239,10 @@ class PhoneCamera(context: Context) {
                 builder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
                 applied += "white balance"
             }
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            applied += "focus"
+            if (offers(characteristics, CaptureRequest.CONTROL_AF_MODE_AUTO)) {
+                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                applied += "focus"
+            }
             session.setRepeatingRequest(builder.build(), null, handler)
             Log.i(TAG, "locked: ${applied.joinToString()}")
         } catch (e: Exception) {

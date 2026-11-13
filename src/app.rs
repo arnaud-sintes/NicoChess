@@ -7,8 +7,10 @@ use crate::calibration::Calibration;
 use crate::camera::{self, SourceSpec};
 use crate::engine::{Engine, EngineConfig};
 use crate::tracker::TrackerConfig;
+use crate::http::Handler;
 use crate::{http, server, store::Store};
 use anyhow::Result;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -31,9 +33,16 @@ pub struct ServerOptions {
     pub max_viewers: usize,
 }
 
-/// Runs the server until it fails: this call does not return normally.
-/// `on_ready` is called once the address is bound and requests are accepted.
-pub fn serve(options: ServerOptions, on_ready: Option<Box<dyn FnOnce()>>) -> Result<()> {
+/// The engine is running and the web handler is ready; nothing listens yet.
+pub struct Built {
+    pub handler: Handler,
+    /// Connections allowed at once on one listener.
+    pub max_connections: usize,
+    pub listen: String,
+}
+
+/// Loads the calibration, opens the store, starts the camera thread and makes the handler.
+pub fn build(options: ServerOptions) -> Result<Built> {
     let calibration = Calibration::load(&options.calibration_path)?;
     match &calibration {
         Some(_) => eprintln!("calibration: loaded {}", options.calibration_path.display()),
@@ -52,5 +61,22 @@ pub fn serve(options: ServerOptions, on_ready: Option<Box<dyn FnOnce()>>) -> Res
     engine.spawn_capture(camera::factory(options.source, options.frame_interval))?;
 
     // Event streams each hold a connection, so leave room for ordinary requests too.
-    http::serve(&options.listen, options.max_viewers + 16, server::handler(engine, options.max_viewers), on_ready)
+    Ok(Built {
+        handler: server::handler(engine, options.max_viewers),
+        max_connections: options.max_viewers + 16,
+        listen: options.listen,
+    })
+}
+
+/// Runs the server until it fails: this call does not return normally.
+/// `on_ready` is called once the address is bound and requests are accepted.
+pub fn serve(options: ServerOptions, on_ready: Option<Box<dyn FnOnce()>>) -> Result<()> {
+    let built = build(options)?;
+    http::serve(&built.listen, built.max_connections, built.handler, on_ready)
+}
+
+/// Like [`serve`], on a listener that is already open (the options' `listen` is not used).
+pub fn serve_on(options: ServerOptions, listener: TcpListener, on_ready: Option<Box<dyn FnOnce()>>) -> Result<()> {
+    let built = build(options)?;
+    http::serve_on(listener, built.max_connections, built.handler, on_ready)
 }
