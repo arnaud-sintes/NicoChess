@@ -11,10 +11,13 @@
   .\scripts\package-windows.ps1
 #>
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\common.ps1"
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
 
+# The program says which commit it was built from (build.rs reads this, or git).
+$env:NICOCHESS_COMMIT = Get-NicoCommit
 Write-Host 'Building the program (release)...'
 cargo build --release --locked
 if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
@@ -41,8 +44,8 @@ foreach ($file in Get-ChildItem (Join-Path $root 'scripts\windows') -File) {
 }
 
 # Which version this is, for the README.
-$version = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-$commit = (git rev-parse --short HEAD 2>$null)
+$version = Get-NicoVersion
+$commit = $env:NICOCHESS_COMMIT
 Add-Content -Path (Join-Path $out 'README.txt') -Encoding ASCII -Value "`r`nVersion $version ($commit)"
 
 $zip = Join-Path $root 'dist\NicoChess-windows.zip'

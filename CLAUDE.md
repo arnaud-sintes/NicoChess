@@ -26,6 +26,7 @@ The page is one HTML file built into the program. Everything works offline.
 | Windows package | `.\scripts\package-windows.ps1` gives `dist\NicoChess-windows.zip` |
 | Linux 32-bit program | `.\scripts\build-target.ps1` gives `dist\nicochess` (Docker Desktop running) |
 | Android app | `.\scripts\build-android.ps1 [-Abis arm64-v8a]` gives `dist\nicochess-debug.apk` (Docker Desktop running) |
+| Version and release | version in `Cargo.toml` `[workspace.package]` (one place); `.\scripts\release.ps1` builds all packages and publishes the GitHub release `vX.Y.Z` (needs a section in `CHANGELOG.md`, a clean pushed tree); `nicochess --version` |
 | USB key / SSH deploy | `.\scripts\make-usb-bundle.ps1`, `.\scripts\deploy.ps1 -Target user@host` |
 
 `web/index.html` is built into the program with `include_str!`: after editing it, rebuild.

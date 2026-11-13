@@ -816,6 +816,7 @@ impl Engine {
         let promotion_pending = inner.game.as_ref().and_then(|g| g.moves.last()).is_some_and(|m| m.promotion_guess);
 
         json!({
+            "version": crate::version_text(),
             "role": if role == Role::Controller { "controller" } else { "viewer" },
             "can_claim": inner.roles.is_free(now, playing),
             "mode": inner.mode.name(),

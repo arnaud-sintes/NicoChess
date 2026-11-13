@@ -397,6 +397,8 @@ mod tests {
         let rig = rig("roles", SourceSpec::Synthetic);
         assert_eq!(rig.state(ALICE)["role"], "controller");
         assert_eq!(rig.state(BOB)["role"], "viewer");
+        // The page shows the version of the program.
+        assert!(rig.state(ALICE)["version"].as_str().unwrap().starts_with(crate::VERSION));
 
         let (status, body) = rig.call("POST", "/api/calibration/open", BOB, "");
         assert_eq!((status, body["ok"].clone()), (403, json!(false)));

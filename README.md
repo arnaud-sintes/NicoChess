@@ -46,6 +46,10 @@ Everything is built and tested on a PC with a synthetic camera. The integrated w
 | Games stored as JSON, list by date, replay (real time, as fast as possible, step by step), PGN export | |
 | 32-bit Linux build, run in a Debian 12 i386 container | Run on the INEOS 600 |
 
+## Download
+
+Releases are on GitHub (the repository is private: sign in to see them): the newest one has `NicoChess-windows.zip` (unzip, double-click `Start NicoChess.bat`), `nicochess-debug-apk.zip` (the Android app, a debug build) and `nicochess-linux-i386.tar.gz`. The version is shown at the bottom of the page and by `nicochess --version`. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Try it on a PC (no camera)
 
 ```

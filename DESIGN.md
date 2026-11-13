@@ -76,6 +76,11 @@ These rules describe how the code is written today. Follow them when you change 
 
 **A camera source.** Implement `camera::FrameSource` (`describe`, `next_frame`, and `restart` if it is scripted). `next_frame` must return within a few seconds, with an error if the camera went silent. Add a `SourceSpec` variant and its arm in `camera::factory`; add the option in `main.rs` (and in `--help`). Frames are `RgbImage`; keep platform code behind `cfg` and out of the engine. Test the conversion code on small hand-made buffers.
 
+## Versions
+
+- The version lives only in `Cargo.toml` (`[workspace.package]`). Never write it anywhere else: take it from `crate::VERSION` / `crate::version_text()`, from `scripts/common.ps1` (`Get-NicoVersion`), or from the Gradle file that reads `Cargo.toml`.
+- Every change that users will see goes into `CHANGELOG.md` under the version it ships in.
+
 ## Rules added by the audits (keep them)
 
 - A new picture source or long-running read must have a timeout: `FrameSource::next_frame` returns an error within a few seconds if the camera stays silent.

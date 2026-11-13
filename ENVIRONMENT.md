@@ -63,6 +63,14 @@ Notes:
 - Toolchain: `rust-version` in `Cargo.toml` and `rust-toolchain.toml` pin the Rust version; the Dockerfiles install the same one. The Android crate shares the root `Cargo.lock`; builds use `--locked`.
 - Android: there is no Gradle wrapper; Gradle 8.10.2 is in the image. Only debug APKs are built. The debug signing key is kept in the Docker volume `nicochess-android-keystore` so that updates install over the old app. Gradle, cargo and target caches are named volumes too (`nicochess-gradle`, `nicochess-cargo-registry-android`, `nicochess-android-target` mounted at `/work/target` because the Android crate is a workspace member, `nicochess-cargo-registry`, `nicochess-target`).
 
+## Version and releases
+
+- **One version, in one place:** `version = "x.y.z"` under `[workspace.package]` in `Cargo.toml`. The program, the page footer, `nicochess --version`, the Android app (`versionName`, and `versionCode` = x*10000 + y*100 + z, read by `android/app/build.gradle.kts`) and the packages all take it from there. A test checks that the first `version = "..."` line of `Cargo.toml` is the program's version, because Gradle relies on it.
+- **The commit** the program was built from is added by `build.rs` ("0.2.0 (3f2a9c1e)", "-dirty" with uncommitted changes). The Docker builds cannot run git, so the scripts pass it as `NICOCHESS_COMMIT`.
+- **Versioning:** semantic versioning, below 1.0 a new minor number may change behaviour. Describe each version in `CHANGELOG.md` (a section `## x.y.z`: it becomes the release notes).
+- **To release:** change the version, write the CHANGELOG section, commit, push, then `.\scripts\release.ps1` (from Bash: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release.ps1`). It refuses unless the tree is clean and pushed and the version is new, builds the three packages, checks that the program reports the version, and publishes a GitHub release `vx.y.z` with: `NicoChess-windows.zip`, `nicochess-debug-apk.zip` (the APK zipped with install notes; `build-android.ps1` also makes it), `nicochess-linux-i386.tar.gz` and `SHA256SUMS.txt`. `-NoPublish` builds and stops. The release is the newest one on the page, so `releases/latest` always points at it. The repository is private: only people with access see the release.
+- The APK is a **debug** build, signed with the debug key kept in the Docker volume `nicochess-android-keystore`; there is no release signing yet.
+
 ## Run for development
 
 ```

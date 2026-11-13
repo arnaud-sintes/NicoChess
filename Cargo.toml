@@ -1,6 +1,11 @@
+# The version of NicoChess: the one place to change it. The program, the page, the Android app
+# (versionName and versionCode, see android/app/build.gradle.kts) and the packages all take it from here.
+[workspace.package]
+version = "0.2.0"
+
 [package]
 name = "nicochess"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 # The oldest compiler that builds it (let-chains, slice::as_chunks). The Docker images pin an exact one.
 rust-version = "1.88"

@@ -44,6 +44,7 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
   .muted { color: var(--muted); }
   .small { font-size: .85rem; }
+  footer { text-align: center; margin: 28px 0 10px; }
   select { max-width: 100%; }
   label.check { display: flex; gap: 8px; align-items: center; color: var(--fg); margin: 6px 0 2px; }
   .status { margin: 8px 0; min-height: 1.4em; }
@@ -254,6 +255,8 @@
   </div>
 </section>
 
+<footer id="version" class="muted small"></footer>
+
 <script>
 'use strict';
 // ---------- identity ----------
@@ -399,6 +402,7 @@ function apply(state) {
 
 function render() {
   if (!S) return;
+  $('version').textContent = 'NicoChess ' + S.version;
   const ctl = S.role === 'controller';
   $('role').textContent = ctl ? 'Controller' : 'Viewer';
   $('role').classList.toggle('ctl', ctl);

@@ -43,6 +43,7 @@
 | `tracker.rs` | Stability gate and the choice of the legal move (or, when none fits, the pair of moves) that best explains the picture |
 | `game.rs` | The game record (moves, result), SAN/UCI, PGN, file format version, the draw rules (repetition, 50 and 75 moves) |
 | `store.rs` | One JSON file per game, ids, listing |
+| `build.rs` (root) | Adds the git commit to the program (`COMMIT`, with `VERSION` from Cargo.toml: `lib.rs`) |
 | `fsutil.rs` | `write_atomic`: temporary file, flush to disk, rename |
 | `roles.rs` | Controller and viewer, tokens, expiry |
 | `synthetic.rs` | A chessboard drawn in perspective, the Opera game; used by the demo source and by the tests |

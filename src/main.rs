@@ -46,7 +46,7 @@ OPTIONS:
     --max-cost <X>           largest mismatch accepted for a move  [default: 1.6]
     --margin <X>             how much better than the runner-up    [default: 1]
 
-    -h, --help               show this help
+    -V, --version            show the version
 
 'demo' plays a whole game on a synthetic board and 'synthetic' shows the starting
 position: both let you try everything on a PC without a camera.";
@@ -62,6 +62,10 @@ fn run() -> Result<()> {
     let mut args = pico_args::Arguments::from_env();
     if args.contains(["-h", "--help"]) {
         println!("{HELP}");
+        return Ok(());
+    }
+    if args.contains(["-V", "--version"]) {
+        println!("nicochess {}", nicochess::version_text());
         return Ok(());
     }
 
@@ -137,7 +141,7 @@ fn run() -> Result<()> {
     let from_network = bound.ip().is_unspecified().then(|| local_ip().map(|ip| format!("http://{ip}:{}", bound.port()))).flatten();
     let on_ready: Option<Box<dyn FnOnce()>> = Some(Box::new(move || {
         eprintln!();
-        eprintln!("NicoChess is running.");
+        eprintln!("NicoChess {} is running.", nicochess::version_text());
         eprintln!("  On this computer:   {local_url}");
         if let Some(url) = &from_network {
             eprintln!("  From a phone or tablet on the same network:   {url}");

@@ -1,6 +1,6 @@
 [package]
 name = "nicochess-android"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.88"
 description = "NicoChess for Android: the core library behind a JNI entry point"
