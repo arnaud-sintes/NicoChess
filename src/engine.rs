@@ -4,9 +4,11 @@
 //! One mutex guards the state that matters (`Inner`). The capture thread takes it
 //! once per frame, for a few milliseconds; commands from the pages take it briefly.
 
+use crate::boarddetect;
 use crate::calibration::{self, Calibration};
 use crate::camera::SourceFactory;
 use crate::game::{self, GameRecord};
+use crate::picture::{self, Picture};
 use crate::roles::{self, Role, Roles};
 use crate::store::{Store, Summary};
 use crate::tracker::{Candidate, Detection, Status, Tracker, TrackerConfig};
@@ -15,7 +17,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageEncoder, RgbImage};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread;
@@ -25,12 +27,23 @@ use std::time::{Duration, Instant};
 const CALIBRATION_LIMIT: Duration = Duration::from_secs(10 * 60);
 /// How long to wait before trying the camera again after a failure.
 const CAMERA_RETRY: Duration = Duration::from_secs(2);
+/// During a game, how often the board is looked for again, to follow a camera that moved.
+const FOLLOW_EVERY: Duration = Duration::from_millis(1500);
+/// A shift smaller than this (in squares) is noise; one larger than this is not the same board.
+const FOLLOW_MIN_SHIFT: f32 = 0.04;
+const FOLLOW_MAX_SHIFT: f32 = 0.45;
+
+/// Microseconds the last preview JPEG took to make (for the speed figures on the page).
+static ENCODE_US: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub idle_timeout: Duration,
     pub game_timeout: Duration,
     pub tracker: TrackerConfig,
+    /// The tracker looks at a picture at most this often, however fast the camera
+    /// delivers (the preview can be faster than the detection needs to be).
+    pub track_interval: Duration,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +52,7 @@ impl Default for EngineConfig {
             idle_timeout: Duration::from_secs(60),
             game_timeout: Duration::from_secs(30 * 60),
             tracker: TrackerConfig::default(),
+            track_interval: Duration::ZERO,
         }
     }
 }
@@ -101,19 +115,29 @@ impl Mode {
 
 /// The latest camera frame. The JPEG for the preview is made only if someone asks.
 pub struct Latest {
+    /// What everyone sees: turned and adjusted (brightness, contrast).
     pub image: Arc<RgbImage>,
+    /// Turned, but not adjusted: the same picture as `image` when nothing is adjusted.
+    pub raw: Arc<RgbImage>,
     pub seq: u64,
     jpeg: OnceLock<Arc<Vec<u8>>>,
 }
 
 impl Latest {
-    fn new(image: RgbImage, seq: u64) -> Latest {
-        Latest { image: Arc::new(image), seq, jpeg: OnceLock::new() }
+    fn new(raw: RgbImage, adjusted: Option<RgbImage>, seq: u64) -> Latest {
+        let raw = Arc::new(raw);
+        let image = adjusted.map_or_else(|| Arc::clone(&raw), Arc::new);
+        Latest { image, raw, seq, jpeg: OnceLock::new() }
     }
 
     pub fn jpeg(&self) -> Arc<Vec<u8>> {
         self.jpeg
-            .get_or_init(|| Arc::new(encode_jpeg(&self.image, 80).unwrap_or_default()))
+            .get_or_init(|| {
+                let started = Instant::now();
+                let bytes = Arc::new(encode_jpeg(&self.image, 80).unwrap_or_default());
+                ENCODE_US.store(started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32, Ordering::Relaxed);
+                bytes
+            })
             .clone()
     }
 }
@@ -147,6 +171,17 @@ impl Hub {
     }
 }
 
+/// Counts open picture streams while it lives.
+pub struct FrameStreamGuard {
+    engine: Arc<Engine>,
+}
+
+impl Drop for FrameStreamGuard {
+    fn drop(&mut self) {
+        self.engine.frame_streams.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Counts open event streams while it lives.
 pub struct ClientGuard {
     engine: Arc<Engine>,
@@ -173,6 +208,21 @@ struct Inner {
     camera_error: Option<String>,
     source: String,
     last_status: Status,
+    picture: Picture,
+    last_feed: Option<Instant>,
+    /// When the board was last looked for (to follow it), how many times the calibration was
+    /// moved, and by how much (in squares) the last time.
+    last_follow: Option<Instant>,
+    follow_count: u32,
+    follow_shift: f32,
+}
+
+/// Speed figures of the camera pipeline, smoothed.
+#[derive(Default)]
+struct Stats {
+    last_frame: Option<Instant>,
+    interval_ms: f32,
+    process_ms: f32,
 }
 
 pub struct Engine {
@@ -185,7 +235,17 @@ pub struct Engine {
     restart_source: AtomicBool,
     store: Store,
     calibration_path: PathBuf,
+    picture_path: PathBuf,
+    track_interval: Duration,
+    /// Counts the pictures received; the picture streams wait on it.
+    frame_count: Mutex<u64>,
+    frame_cv: Condvar,
+    frame_streams: AtomicUsize,
+    stats: Mutex<Stats>,
 }
+
+/// Picture streams allowed at once (two per page: the camera and the top-down board).
+const MAX_FRAME_STREAMS: usize = 8;
 
 #[derive(Debug, Default)]
 pub struct StartRequest {
@@ -199,6 +259,11 @@ impl Engine {
     pub fn new(config: EngineConfig, store: Store, calibration_path: PathBuf, calibration: Option<Calibration>) -> Arc<Engine> {
         let mut tracker = Tracker::new(config.tracker);
         tracker.set_calibration(calibration.as_ref());
+        let picture_path = calibration_path.with_file_name("picture.json");
+        let picture = Picture::load(&picture_path).unwrap_or_else(|e| {
+            eprintln!("picture: {e:#}; using the defaults");
+            Picture::default()
+        });
         Arc::new(Engine {
             inner: Mutex::new(Inner {
                 roles: Roles::new(config.idle_timeout, config.game_timeout),
@@ -213,6 +278,11 @@ impl Engine {
                 camera_error: None,
                 source: String::new(),
                 last_status: Status::NoCalibration,
+                picture,
+                last_feed: None,
+                last_follow: None,
+                follow_count: 0,
+                follow_shift: 0.0,
             }),
             frame: RwLock::new(None),
             camera_wanted: Mutex::new(false),
@@ -222,6 +292,12 @@ impl Engine {
             restart_source: AtomicBool::new(false),
             store,
             calibration_path,
+            picture_path,
+            track_interval: config.track_interval,
+            frame_count: Mutex::new(0),
+            frame_cv: Condvar::new(),
+            frame_streams: AtomicUsize::new(0),
+            stats: Mutex::new(Stats::default()),
         })
     }
 
@@ -294,16 +370,26 @@ impl Engine {
 
     /// Handles one camera frame.
     fn on_frame(&self, image: RgbImage) {
+        let started = Instant::now();
         let seq = self.frame.read().unwrap().as_ref().map_or(1, |l| l.seq + 1);
-        let latest = Arc::new(Latest::new(image, seq));
+        let picture = self.inner.lock().unwrap().picture;
+        let raw = picture.rotate(image);
+        let adjusted = picture.adjust(&raw);
+        let latest = Arc::new(Latest::new(raw, adjusted, seq));
         *self.frame.write().unwrap() = Some(Arc::clone(&latest));
+        {
+            *self.frame_count.lock().unwrap() += 1;
+            self.frame_cv.notify_all();
+        }
 
         let now = Instant::now();
         let mut guard = self.inner.lock().unwrap();
         let inner = &mut *guard;
         let mut changed = inner.camera_error.take().is_some();
 
-        if inner.mode == Mode::Playing {
+        let feed_due = inner.last_feed.is_none_or(|t| now.duration_since(t) >= self.track_interval);
+        if inner.mode == Mode::Playing && feed_due {
+            inner.last_feed = Some(now);
             match inner.tracker.feed(&latest.image, now) {
                 Detection::Nothing => {
                     if inner.tracker.status() != Status::Unsure && !inner.candidates.is_empty() {
@@ -331,6 +417,88 @@ impl Engine {
         if changed {
             self.hub.notify();
         }
+        self.follow_board(&latest, now);
+        self.note_speed(started);
+    }
+
+    /// Keeps the figures shown under the camera picture: pictures per second, and the time
+    /// one picture takes here.
+    fn note_speed(&self, started: Instant) {
+        let mut stats = self.stats.lock().unwrap();
+        let smooth = |old: f32, new: f32| if old == 0.0 { new } else { 0.8 * old + 0.2 * new };
+        if let Some(last) = stats.last_frame {
+            stats.interval_ms = smooth(stats.interval_ms, started.duration_since(last).as_secs_f32() * 1000.0);
+        }
+        stats.last_frame = Some(started);
+        stats.process_ms = smooth(stats.process_ms, started.elapsed().as_secs_f32() * 1000.0);
+    }
+
+    /// Pictures per second and milliseconds per picture, for the page.
+    pub fn camera_stats(&self) -> Value {
+        let stats = self.stats.lock().unwrap();
+        let fps = match stats.last_frame {
+            Some(last) if last.elapsed() < Duration::from_secs(3) && stats.interval_ms > 0.0 => 1000.0 / stats.interval_ms,
+            _ => 0.0,
+        };
+        json!({
+            "fps": (fps * 10.0).round() / 10.0,
+            "process_ms": (stats.process_ms * 10.0).round() / 10.0,
+            "encode_ms": (ENCODE_US.load(Ordering::Relaxed) as f32 / 100.0).round() / 10.0,
+            "streams": self.frame_streams.load(Ordering::SeqCst),
+        })
+    }
+
+    /// Stabilization: during a game, look for the board again now and then. If the camera or
+    /// the board has shifted a little (a knock, a phone slipping on its stand), the calibration
+    /// moves with it, so the squares stay where the detection looks for them.
+    fn follow_board(&self, latest: &Latest, now: Instant) {
+        let calibration = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.mode != Mode::Playing || !inner.picture.follow {
+                return;
+            }
+            if inner.last_follow.is_some_and(|t| now.duration_since(t) < FOLLOW_EVERY) {
+                return;
+            }
+            // Only while the board is quiet: no hand, no move being made.
+            if !matches!(inner.tracker.status(), Status::Watching | Status::Learning) {
+                return;
+            }
+            inner.last_follow = Some(now);
+            match inner.calibration {
+                Some(c) => c,
+                None => return,
+            }
+        };
+        // The search runs without the lock: it takes a few tens of milliseconds.
+        let Ok(found) = boarddetect::refine(&latest.image, &calibration) else { return };
+        let moved = Calibration { corners: found.corners };
+        let shift = boarddetect::shift_in_squares(&calibration, &moved);
+        if !(FOLLOW_MIN_SHIFT..=FOLLOW_MAX_SHIFT).contains(&shift)
+            || moved.validate(latest.image.width(), latest.image.height()).is_err()
+        {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // Things may have changed while looking.
+        if inner.mode != Mode::Playing || inner.calibration != Some(calibration) {
+            return;
+        }
+        match inner.tracker.status() {
+            // Nothing learned yet: learn from the better grid.
+            Status::Learning => inner.tracker.set_calibration(Some(&moved)),
+            Status::Watching => inner.tracker.move_calibration(&moved),
+            _ => return,
+        }
+        inner.calibration = Some(moved);
+        if let Err(e) = moved.save(&self.calibration_path) {
+            eprintln!("calibration: cannot save the moved board: {e:#}");
+        }
+        inner.follow_count += 1;
+        inner.follow_shift = shift;
+        eprintln!("follow: the board moved by {shift:.2} squares, calibration moved along");
+        drop(inner);
+        self.hub.notify();
     }
 
     fn apply_detected_move(&self, inner: &mut Inner, mv: shakmaty::Move, since: Instant, guess: bool) {
@@ -385,15 +553,52 @@ impl Engine {
         self.frame.read().unwrap().clone()
     }
 
+    /// Registers an open picture stream. Returns `None` if there are too many.
+    pub fn open_frame_stream(self: &Arc<Self>) -> Option<FrameStreamGuard> {
+        if self.frame_streams.fetch_add(1, Ordering::SeqCst) >= MAX_FRAME_STREAMS {
+            self.frame_streams.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(FrameStreamGuard { engine: Arc::clone(self) })
+    }
+
+    /// Waits for a picture other than `last`. Returns `None` if none comes in time.
+    pub fn wait_for_frame(&self, last: Option<&Arc<Latest>>, timeout: Duration) -> Option<Arc<Latest>> {
+        let deadline = Instant::now() + timeout;
+        let mut count = self.frame_count.lock().unwrap();
+        loop {
+            if let Some(frame) = self.latest_frame() {
+                if last.is_none_or(|l| !Arc::ptr_eq(l, &frame)) {
+                    return Some(frame);
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            count = self.frame_cv.wait_timeout(count, deadline - now).unwrap().0;
+        }
+    }
+
+    /// True when the camera is off or about to be: a picture stream can end.
+    pub fn camera_is_idle(&self) -> bool {
+        self.inner.lock().unwrap().mode == Mode::Idle
+    }
+
     /// The top-down board for the current calibration, as JPEG.
     pub fn warped_jpeg(&self, with_grid: bool) -> ApiResult<Vec<u8>> {
+        let latest = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off".into()))?;
+        self.warped_jpeg_of(&latest, with_grid)
+    }
+
+    /// The top-down board from one given camera frame.
+    pub fn warped_jpeg_of(&self, latest: &Latest, with_grid: bool) -> ApiResult<Vec<u8>> {
         let calibration = self
             .inner
             .lock()
             .unwrap()
             .calibration
             .ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
-        let latest = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off".into()))?;
         let mut warped = calibration::warp_board(&latest.image, &calibration)?;
         if with_grid {
             calibration::draw_grid(&mut warped);
@@ -458,6 +663,16 @@ impl Engine {
                 "height": frame.as_ref().map_or(0, |f| f.image.height()),
             },
             "calibration": inner.calibration.map(|c| c.corners),
+            "picture": {
+                "rotation": inner.picture.rotation,
+                "brightness": inner.picture.brightness,
+                "contrast": inner.picture.contrast,
+            },
+            "stabilize": {
+                "on": inner.picture.follow,
+                "adjusted": inner.follow_count,
+                "last_shift": (inner.follow_shift * 100.0).round() / 100.0,
+            },
             "corner_names": calibration::CORNER_NAMES,
             "tracker": {
                 "status": status_name(inner.tracker.status()),
@@ -565,6 +780,127 @@ impl Engine {
         drop(inner);
         self.hub.notify();
         Ok(())
+    }
+
+    /// Finds the board in the picture by itself and calibrates with it.
+    /// Returns a sentence for the page: what was found, and what to check.
+    pub fn detect_calibration(&self, token: &str) -> ApiResult<String> {
+        drop(self.controlled(token)?);
+        let frame = self
+            .latest_frame()
+            .ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
+        // Without the lock: searching takes a fraction of a second.
+        let found = boarddetect::find_board(&frame.image).map_err(|e| ApiError::Conflict(format!("{e:#}")))?;
+        self.set_calibration(token, found.corners)?;
+        let mut text = format!("Board found ({} of 49 inner corners seen). ", found.matched);
+        if found.sides_from_pieces {
+            text.push_str("White is on the side of the lighter pieces.");
+        } else {
+            text.push_str("I could not tell White's side, so a1 is at the lower left: use Swap sides if it is the other way.");
+        }
+        Ok(text)
+    }
+
+    /// Switches on or off the following of the board during a game.
+    pub fn set_follow(&self, token: &str, on: bool) -> ApiResult {
+        let mut inner = self.controlled(token)?;
+        let settings = Picture { follow: on, ..inner.picture };
+        settings.save(&self.picture_path)?;
+        inner.picture = settings;
+        drop(inner);
+        self.hub.notify();
+        Ok(())
+    }
+
+    /// The picture settings may not change during a game: the squares were learned
+    /// from the picture as it was.
+    fn picture_guard(&self, token: &str) -> ApiResult<MutexGuard<'_, Inner>> {
+        let inner = self.controlled(token)?;
+        if inner.mode == Mode::Playing {
+            return Err(ApiError::Conflict("a game is running: end it first".into()));
+        }
+        Ok(inner)
+    }
+
+    /// Keeps new picture settings. `turns` is how many quarter turns clockwise the picture
+    /// was just turned by (0 when only brightness or contrast changed).
+    fn store_picture(&self, inner: &mut Inner, picture: Picture, turns: i32) -> ApiResult {
+        picture.validate()?;
+        picture.save(&self.picture_path)?;
+        inner.picture = picture;
+        // The next picture will have the new settings. Redo the one on show too, so the
+        // page does not have to wait for it.
+        if let Some(latest) = self.latest_frame() {
+            let raw = Picture::default().turned(turns).rotate((*latest.raw).clone());
+            let adjusted = picture.adjust(&raw);
+            *self.frame.write().unwrap() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq)));
+            *self.frame_count.lock().unwrap() += 1;
+            self.frame_cv.notify_all();
+        }
+        Ok(())
+    }
+
+    /// Turns the picture by `turns` quarter turns clockwise (negative: counter-clockwise).
+    /// The calibration is turned with it, so it stays valid.
+    pub fn rotate_picture(&self, token: &str, turns: i32) -> ApiResult {
+        let mut inner = self.picture_guard(token)?;
+        let turns = turns.rem_euclid(4);
+        if turns == 0 {
+            return Ok(());
+        }
+        let mut turned_calibration = None;
+        if let Some(calibration) = inner.calibration {
+            let frame = self
+                .latest_frame()
+                .ok_or_else(|| ApiError::Conflict("the camera is off: open it first, so the calibration can be turned with the picture".into()))?;
+            let (corners, width, height) =
+                picture::turn_points(&calibration.corners, frame.raw.width(), frame.raw.height(), turns);
+            let turned = Calibration { corners };
+            turned.validate(width, height)?;
+            turned_calibration = Some(turned);
+        }
+        let settings = inner.picture.turned(turns);
+        if let Some(turned) = turned_calibration {
+            turned.save(&self.calibration_path)?;
+            inner.calibration = Some(turned);
+            inner.tracker.set_calibration(Some(&turned));
+        }
+        self.store_picture(&mut inner, settings, turns)?;
+        drop(inner);
+        self.hub.notify();
+        Ok(())
+    }
+
+    /// Sets brightness and contrast.
+    pub fn set_picture_adjust(&self, token: &str, brightness: f32, contrast: f32) -> ApiResult {
+        let mut inner = self.picture_guard(token)?;
+        let settings = Picture { brightness, contrast, ..inner.picture };
+        self.store_picture(&mut inner, settings, 0)?;
+        drop(inner);
+        self.hub.notify();
+        Ok(())
+    }
+
+    /// Stretches the picture so that the board (or the whole picture, if the board is
+    /// not calibrated yet) uses most of the range from dark to light.
+    pub fn auto_contrast(&self, token: &str) -> ApiResult {
+        let mut inner = self.picture_guard(token)?;
+        let frame = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off: open it first".into()))?;
+        let measured = match inner.calibration {
+            Some(calibration) => calibration::warp_board(&frame.raw, &calibration)?,
+            None => (*frame.raw).clone(),
+        };
+        let (contrast, brightness) = Picture::auto_contrast(&measured)?;
+        let settings = Picture { brightness, contrast, ..inner.picture };
+        self.store_picture(&mut inner, settings, 0)?;
+        drop(inner);
+        self.hub.notify();
+        Ok(())
+    }
+
+    /// Back to the picture as the camera gives it (the rotation stays).
+    pub fn reset_picture_adjust(&self, token: &str) -> ApiResult {
+        self.set_picture_adjust(token, 0.0, 1.0)
     }
 
     pub fn clear_calibration(&self, token: &str) -> ApiResult {

@@ -31,6 +31,9 @@ records the game, and shows it live and in replay on a phone or tablet.
 - FR-1. The interface has an always-reachable **Calibrate** button (controller only).
 - FR-2. Calibration is done once by clicking the 4 board corners (a1, h1, h8, a8) and is kept on the target.
 - FR-3. Starting a game with no calibration sends the controller to calibration first.
+- FR-3a. **Auto-detect the board** finds the board in the picture and calibrates with it. It refuses (and says why) when it does not find a chessboard pattern, or when the pattern does not alternate light and dark; the corners can then be clicked by hand. White is taken to be on the side of the lighter pieces; **Swap sides** turns the labels when that is wrong.
+- FR-3b. The picture can be turned by 90° in either direction (the calibration turns with it), and has auto contrast, brightness and contrast. Not during a game.
+- FR-3c. Stabilization: during a game, while the board is quiet, the board is looked for again about every 1.5 s; if it shifted by 0.04 to 0.45 of a square, the calibration moves along and the learned squares are kept. It can be switched off, and the choice is kept.
 
 ### Recording a game
 - FR-4. The controller starts a new game. The standard position is the default; an optional FEN allows resuming a position.
@@ -66,7 +69,7 @@ records the game, and shows it live and in replay on a phone or tablet.
 - NFR-2. Fully offline. The interface uses no external fonts, scripts or images.
 - NFR-3. Phone-friendly pages that also work on a tablet.
 - NFR-4. A loss of power or a browser closing must not lose the game: moves are written to disk as they are recorded.
-- NFR-5. Push to browsers with Server-Sent Events (agreed). The camera preview during calibration is polled.
+- NFR-5. Push to browsers with Server-Sent Events (agreed). The camera picture and the top-down board are pushed as Motion JPEG streams (`/frame.mjpg`, `/warp.mjpg`); the page only polls a small figure of speed.
 
 ## Out of scope for now
 

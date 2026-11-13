@@ -2,7 +2,10 @@
 //!
 //!   GET    /                           the page
 //!   GET    /frame.jpg                  latest camera frame
+//!   GET    /frame.mjpg                 the camera frames as they come (Motion JPEG stream)
 //!   GET    /warp.jpg[?grid=0]          top-down board (needs a calibration)
+//!   GET    /warp.mjpg                  the top-down board as a Motion JPEG stream
+//!   GET    /api/camera/stats           pictures per second and time per picture
 //!   GET    /api/state?token=T          full state for one user (JSON)
 //!   GET    /api/events?token=T         the same state, pushed on every change (SSE)
 //!   GET    /api/games                  list of games, most recent first
@@ -16,7 +19,13 @@
 //!   POST   /api/calibration/open       camera on for the calibration page
 //!   POST   /api/calibration/close      camera off again
 //!   POST   /api/calibration            {"corners": [[x,y] x4]}  order a1, h1, h8, a8
+//!   POST   /api/calibration/detect     find the board in the picture and calibrate with it
+//!   POST   /api/camera/follow          {"on": true}  follow the board if it moves during a game
 //!   DELETE /api/calibration            forget the calibration
+//!   POST   /api/camera/rotate          {"turns": 1}  quarter turns clockwise (-1: counter-clockwise)
+//!   POST   /api/camera/picture         {"brightness": 0, "contrast": 1}
+//!   POST   /api/camera/auto-contrast   stretch the picture of the board over the whole range
+//!   POST   /api/camera/picture/reset   brightness and contrast back to neutral
 //!   POST   /api/game/start             {"white","black","fen"?,"started_at"?}
 //!   POST   /api/game/end               {"result","reason"}
 //!   POST   /api/game/move              {"move": "e2e4" or "Nf3"}
@@ -34,6 +43,9 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+
+/// The top-down board is redrawn at most about every this long.
+const TOP_DOWN_PAUSE: Duration = Duration::from_millis(100);
 
 /// Longest silence on an event stream before a keep-alive line is sent.
 const KEEPALIVE: Duration = Duration::from_secs(15);
@@ -73,6 +85,9 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             Some(frame) => Reply::bytes(200, "image/jpeg", frame.jpeg().as_ref().clone()),
             None => Reply::text(503, "the camera is off"),
         },
+        ("GET", "/frame.mjpg") => frame_stream(engine, false),
+        ("GET", "/warp.mjpg") => frame_stream(engine, true),
+        ("GET", "/api/camera/stats") => Reply::json(200, &engine.camera_stats()),
         ("GET", "/warp.jpg") => {
             let grid = !request.query.split('&').any(|q| q == "grid=0");
             match engine.warped_jpeg(grid) {
@@ -105,7 +120,36 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             }
             done(body_json::<Body>(&request).and_then(|b| engine.set_calibration(&token, b.corners)))
         }
+        ("POST", "/api/calibration/detect") => match engine.detect_calibration(&token) {
+            Ok(message) => Reply::json(200, &json!({ "ok": true, "message": message })),
+            Err(e) => failure(e),
+        },
         ("DELETE", "/api/calibration") => done(engine.clear_calibration(&token)),
+        ("POST", "/api/camera/follow") => {
+            #[derive(Deserialize)]
+            struct Body {
+                on: bool,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.set_follow(&token, b.on)))
+        }
+
+        ("POST", "/api/camera/rotate") => {
+            #[derive(Deserialize)]
+            struct Body {
+                turns: i32,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.rotate_picture(&token, b.turns)))
+        }
+        ("POST", "/api/camera/picture") => {
+            #[derive(Deserialize)]
+            struct Body {
+                brightness: f32,
+                contrast: f32,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.set_picture_adjust(&token, b.brightness, b.contrast)))
+        }
+        ("POST", "/api/camera/auto-contrast") => done(engine.auto_contrast(&token)),
+        ("POST", "/api/camera/picture/reset") => done(engine.reset_picture_adjust(&token)),
 
         ("POST", "/api/game/start") => {
             #[derive(Deserialize, Default)]
@@ -183,6 +227,59 @@ fn game_route(engine: &Engine, rest: &str) -> Reply {
             Ok(None) => Reply::text(404, "no such game"),
             Err(e) => Reply::text(500, &format!("{e:#}")),
         }
+    }
+}
+
+/// The camera frames as a Motion JPEG stream: one connection, a new picture as soon as
+/// there is one. The page shows it in a plain <img>. Only the newest picture is sent,
+/// so a slow link skips pictures instead of falling behind.
+fn frame_stream(engine: &Arc<Engine>, top_down: bool) -> Reply {
+    let Some(guard) = engine.open_frame_stream() else {
+        return Reply::text(503, "too many picture streams are open");
+    };
+    let engine = Arc::clone(engine);
+    Reply::Stream {
+        content_type: "multipart/x-mixed-replace; boundary=frame".to_string(),
+        run: Box::new(move |out: &mut dyn Write| {
+            let _guard = guard;
+            let mut last = None;
+            let mut silent_since = std::time::Instant::now();
+            loop {
+                match engine.wait_for_frame(last.as_ref(), Duration::from_secs(1)) {
+                    Some(frame) => {
+                        silent_since = std::time::Instant::now();
+                        let jpeg: Arc<Vec<u8>> = if top_down {
+                            // The board view needs no more than a few pictures per second.
+                            std::thread::sleep(TOP_DOWN_PAUSE);
+                            let newest = engine.latest_frame().unwrap_or_else(|| Arc::clone(&frame));
+                            let made = engine.warped_jpeg_of(&newest, true);
+                            last = Some(newest);
+                            match made {
+                                Ok(bytes) => Arc::new(bytes),
+                                // Not calibrated (any more): nothing to show, keep waiting.
+                                Err(_) => continue,
+                            }
+                        } else {
+                            last = Some(Arc::clone(&frame));
+                            frame.jpeg()
+                        };
+                        // One write: a header, the picture and the line end go out together.
+                        let mut part = Vec::with_capacity(jpeg.len() + 80);
+                        write!(part, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n", jpeg.len())?;
+                        part.extend_from_slice(&jpeg);
+                        part.extend_from_slice(b"\r\n");
+                        out.write_all(&part)?;
+                        out.flush()?;
+                    }
+                    None => {
+                        // The camera is off, or silent: do not hold the connection for ever.
+                        if engine.camera_is_idle() && silent_since.elapsed() > Duration::from_secs(10) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }),
     }
 }
 
@@ -340,6 +437,232 @@ mod tests {
         assert_eq!(rig.call("POST", "/api/calibration/close", ALICE, "").0, 200);
         wait_for("camera off", || rig.engine.latest_frame().is_none());
         assert_eq!(rig.state(ALICE)["mode"], "idle");
+    }
+
+    #[test]
+    fn turning_the_picture_turns_the_calibration_with_it() {
+        let rig = rig("turn", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        let before = rig.state(ALICE);
+        let (w, h) = (before["camera"]["width"].as_u64().unwrap(), before["camera"]["height"].as_u64().unwrap());
+
+        // Only the controller may turn it.
+        assert_eq!(rig.call("POST", "/api/camera/rotate", BOB, r#"{"turns": 1}"#).0, 403);
+        assert_eq!(rig.call("POST", "/api/camera/rotate", ALICE, r#"{"turns": 1}"#).0, 200);
+        let turned = rig.state(ALICE);
+        assert_eq!(turned["picture"]["rotation"], 90);
+        // The picture is on its side now, at once, without waiting for the next frame.
+        assert_eq!((turned["camera"]["width"].as_u64().unwrap(), turned["camera"]["height"].as_u64().unwrap()), (h, w));
+        // The corner a1 moved from (x, y) to (h - y, x).
+        let a1 = turned["calibration"][0].as_array().unwrap();
+        let old = before["calibration"][0].as_array().unwrap();
+        assert_eq!(a1[0].as_f64().unwrap(), h as f64 - old[1].as_f64().unwrap());
+        assert_eq!(a1[1].as_f64().unwrap(), old[0].as_f64().unwrap());
+        assert!(rig.dir.join("picture.json").exists());
+        assert_eq!(rig.call("GET", "/warp.jpg", "", "").0, 200, "the calibration is still valid");
+
+        // The other way brings everything back.
+        assert_eq!(rig.call("POST", "/api/camera/rotate", ALICE, r#"{"turns": -1}"#).0, 200);
+        let back = rig.state(ALICE);
+        assert_eq!(back["picture"]["rotation"], 0);
+        assert_eq!(back["calibration"], before["calibration"]);
+        assert_eq!(rig.call("POST", "/api/camera/rotate", ALICE, r#"{"turns": 4}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["picture"]["rotation"], 0);
+
+        // Not during a game.
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
+        assert_eq!(rig.call("POST", "/api/camera/rotate", ALICE, r#"{"turns": 1}"#).0, 409);
+    }
+
+    #[test]
+    fn brightness_contrast_and_auto_contrast() {
+        let rig = rig("picture", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        // The camera is off: there is nothing to measure.
+        assert_eq!(rig.call("POST", "/api/camera/auto-contrast", ALICE, "").0, 409);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+
+        assert_eq!(rig.call("POST", "/api/camera/picture", BOB, r#"{"brightness": 10, "contrast": 1}"#).0, 403);
+        assert_eq!(rig.call("POST", "/api/camera/picture", ALICE, r#"{"brightness": 10, "contrast": 0}"#).0, 400);
+        assert_eq!(rig.call("POST", "/api/camera/picture", ALICE, r#"{"brightness": 40, "contrast": 1.5}"#).0, 200);
+        let state = rig.state(ALICE);
+        assert_eq!(state["picture"]["brightness"], 40.0);
+        assert_eq!(state["picture"]["contrast"], 1.5);
+        // What the page shows is adjusted, the raw picture is not.
+        wait_for("the adjusted picture", || {
+            let frame = rig.engine.latest_frame().unwrap();
+            !Arc::ptr_eq(&frame.image, &frame.raw) && frame.image.as_raw() != frame.raw.as_raw()
+        });
+
+        assert_eq!(rig.call("POST", "/api/camera/picture/reset", ALICE, "").0, 200);
+        let state = rig.state(ALICE);
+        assert_eq!((state["picture"]["brightness"].as_f64(), state["picture"]["contrast"].as_f64()), (Some(0.0), Some(1.0)));
+
+        assert_eq!(rig.call("POST", "/api/camera/auto-contrast", ALICE, "").0, 200);
+        let contrast = rig.state(ALICE)["picture"]["contrast"].as_f64().unwrap();
+        assert!((0.25..=4.0).contains(&contrast), "{contrast}");
+
+        // The settings survive a restart.
+        let saved = crate::picture::Picture::load(&rig.dir.join("picture.json")).unwrap();
+        assert_eq!(saved.contrast as f64, contrast as f32 as f64);
+    }
+
+    #[test]
+    fn the_picture_stream_sends_new_pictures() {
+        struct Collect {
+            data: Vec<u8>,
+            parts: usize,
+        }
+        impl Write for Collect {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if buf.starts_with(b"--frame") {
+                    self.parts += 1;
+                    if self.parts > 3 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the page went away"));
+                    }
+                }
+                self.data.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let rig = rig("stream", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+
+        let reply = (rig.handler)(Request::for_test("GET", "/frame.mjpg", &[], ""));
+        let Reply::Stream { content_type, run } = reply else { panic!("expected a stream") };
+        assert!(content_type.starts_with("multipart/x-mixed-replace"));
+        let mut out = Collect { data: Vec::new(), parts: 0 };
+        let result = run(&mut out);
+        assert!(result.is_err(), "the stream ends when the page goes away");
+        assert_eq!(out.parts, 4);
+        let text = String::from_utf8_lossy(&out.data);
+        assert_eq!(text.matches("Content-Type: image/jpeg").count(), 3);
+        assert!(out.data.windows(2).any(|w| w == [0xff, 0xd8]), "there are JPEG pictures in it");
+    }
+
+    #[test]
+    fn the_board_is_found_by_itself() {
+        let rig = rig("detect", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        // The camera is off: nothing to look at.
+        assert_eq!(rig.call("POST", "/api/calibration/detect", ALICE, "").0, 409);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+
+        assert_eq!(rig.call("POST", "/api/calibration/detect", BOB, "").0, 403);
+        let (status, body) = rig.call("POST", "/api/calibration/detect", ALICE, "");
+        assert_eq!(status, 200, "{body}");
+        assert!(body["message"].as_str().unwrap().contains("Board found"), "{body}");
+
+        let found = rig.state(ALICE)["calibration"].clone();
+        let truth = synthetic::corners().corners;
+        for (n, corner) in truth.iter().enumerate() {
+            let (x, y) = (found[n][0].as_f64().unwrap(), found[n][1].as_f64().unwrap());
+            let distance = (x - f64::from(corner[0])).hypot(y - f64::from(corner[1]));
+            assert!(distance < 2.5, "corner {n} is {distance:.1} px off");
+        }
+        assert_eq!(rig.call("GET", "/warp.jpg", "", "").0, 200);
+        assert!(rig.dir.join("calibration.json").exists());
+    }
+
+    #[test]
+    fn the_calibration_follows_a_board_that_moved_during_a_game() {
+        let truth = synthetic::corners().corners;
+        // A calibration that is a few pixels off, as after a knock to the camera.
+        let off = truth.map(|c| [c[0] + 4.0, c[1] - 3.0]);
+        let body = serde_json::to_string(&json!({ "corners": off })).unwrap();
+
+        let rig = rig("follow", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        assert_eq!(rig.state(ALICE)["stabilize"]["on"], true, "on unless switched off");
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &body).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
+        wait_for("the calibration to move", || rig.state(ALICE)["stabilize"]["adjusted"].as_u64().unwrap() >= 1);
+        let state = rig.state(ALICE);
+        for (n, corner) in truth.iter().enumerate() {
+            let (x, y) = (state["calibration"][n][0].as_f64().unwrap(), state["calibration"][n][1].as_f64().unwrap());
+            let distance = (x - f64::from(corner[0])).hypot(y - f64::from(corner[1]));
+            assert!(distance < 2.0, "corner {n} is still {distance:.1} px off");
+        }
+        let saved = crate::calibration::Calibration::load(&rig.dir.join("calibration.json")).unwrap().unwrap();
+        assert!((saved.corners[0][0] - truth[0][0]).abs() < 2.0, "the moved calibration is saved");
+    }
+
+    #[test]
+    fn following_can_be_switched_off() {
+        let truth = synthetic::corners().corners;
+        let off = truth.map(|c| [c[0] + 4.0, c[1] - 3.0]);
+        let body = serde_json::to_string(&json!({ "corners": off })).unwrap();
+
+        let rig = rig("nofollow", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        assert_eq!(rig.call("POST", "/api/camera/follow", BOB, r#"{"on": false}"#).0, 403);
+        assert_eq!(rig.call("POST", "/api/camera/follow", ALICE, r#"{"on": false}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["stabilize"]["on"], false);
+        assert!(!crate::picture::Picture::load(&rig.dir.join("picture.json")).unwrap().follow, "kept for next time");
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        rig.call("POST", "/api/calibration", ALICE, &body);
+        rig.call("POST", "/api/game/start", ALICE, "{}");
+        // Plenty of time for it to have happened.
+        std::thread::sleep(Duration::from_millis(3500));
+        let state = rig.state(ALICE);
+        assert_eq!(state["stabilize"]["adjusted"], 0);
+        assert_eq!(state["calibration"][0][0].as_f64().unwrap() as f32, off[0][0]);
+    }
+
+    struct PartCounter {
+        parts: usize,
+        pictures: usize,
+    }
+
+    impl Write for PartCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if buf.starts_with(b"--frame") {
+                self.parts += 1;
+                if self.parts > 3 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the page went away"));
+                }
+                self.pictures += buf.windows(2).filter(|w| *w == [0xff, 0xd8]).count().min(1);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_board_stream_and_the_speed_figures() {
+        let rig = rig("board-stream", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+
+        let Reply::Stream { content_type, run } = (rig.handler)(Request::for_test("GET", "/warp.mjpg", &[], "")) else {
+            panic!("expected a stream")
+        };
+        assert!(content_type.starts_with("multipart/x-mixed-replace"));
+        let mut out = PartCounter { parts: 0, pictures: 0 };
+        assert!(run(&mut out).is_err(), "ends when the page goes away");
+        assert_eq!((out.parts, out.pictures), (4, 3));
+
+        let stats = rig.call("GET", "/api/camera/stats", "", "").1;
+        assert!(stats["fps"].as_f64().unwrap() > 0.0, "{stats}");
+        assert!(stats["process_ms"].as_f64().unwrap() >= 0.0 && stats["encode_ms"].is_number(), "{stats}");
     }
 
     fn corners_json() -> String {

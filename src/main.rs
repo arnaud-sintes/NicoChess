@@ -138,6 +138,8 @@ fn run() -> Result<()> {
         data_dir,
         calibration_path,
         tracker,
+        // A little less than the time between pictures, so jitter never skips one.
+        track_interval: interval.mul_f32(0.8),
         idle_timeout: Duration::from_secs(idle_secs),
         game_timeout: Duration::from_secs(game_mins * 60),
         max_viewers,

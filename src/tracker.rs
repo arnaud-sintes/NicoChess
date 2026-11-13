@@ -203,6 +203,15 @@ impl Tracker {
         self.relearn();
     }
 
+    /// The board moved a little in the picture: look at the squares where they are now, but
+    /// keep what was learned about them (the position is still the same).
+    pub fn move_calibration(&mut self, calibration: &Calibration) {
+        if let Some(sampler) = Sampler::new(calibration) {
+            self.sampler = Some(sampler);
+            self.gate.reset();
+        }
+    }
+
     /// Starts following a game from `position`, which the board must show.
     pub fn start(&mut self, position: Chess) {
         self.position = position;

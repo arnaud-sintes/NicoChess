@@ -10,11 +10,14 @@
 //! Each platform provides its own camera as a [`camera::FrameSource`].
 
 pub mod app;
+pub mod boarddetect;
 pub mod calibration;
 pub mod camera;
 pub mod engine;
 pub mod game;
 pub mod http;
+pub mod picture;
+pub mod pushed;
 pub mod roles;
 pub mod server;
 pub mod store;

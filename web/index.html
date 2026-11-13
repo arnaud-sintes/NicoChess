@@ -43,6 +43,8 @@
   .layout { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); max-width: 1100px; align-items: start; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
   .muted { color: var(--muted); }
+  .small { font-size: .85rem; }
+  label.check { display: flex; gap: 8px; align-items: center; color: var(--fg); margin: 6px 0 2px; }
   .status { margin: 8px 0; min-height: 1.4em; }
   .status.unsure { color: var(--warn); }
   svg.board { width: 100%; max-width: 480px; height: auto; display: block; border-radius: 4px; touch-action: manipulation; }
@@ -57,6 +59,9 @@
   label { display: block; font-size: .85rem; color: var(--muted); margin: 8px 0 2px; }
   input[type=text] { width: 100%; }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .slider { display: grid; grid-template-columns: 6.5rem 1fr 3rem; align-items: center; gap: 8px; color: var(--fg); margin: 6px 0; }
+  .slider output { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .slider input[type=range] { width: 100%; margin: 0; }
   .stage { position: relative; line-height: 0; }
   .stage img { width: 100%; height: auto; border-radius: 6px; background: #000; }
   .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -198,12 +203,29 @@
       <div id="cal-controls">
         <div class="bar">
           <button id="cal-open" class="primary">Open the camera</button>
+          <button id="cal-detect" class="primary" hidden title="Look for the chessboard in the picture and calibrate with it">Auto-detect the board</button>
+          <button id="cal-swap" hidden title="a1 is at the wrong dark corner: swap White and Black sides">Swap sides</button>
           <button id="cal-close" hidden>Close the camera</button>
           <button id="cal-clear" class="danger" hidden>Forget calibration</button>
         </div>
+        <label class="check"><input type="checkbox" id="follow"> Keep the board aligned if the camera moves</label>
+        <div class="muted small" id="follow-info"></div>
       </div>
       <div class="stage" id="cal-stage" hidden><img id="live" alt="camera"><canvas id="overlay"></canvas></div>
+      <div class="muted small" id="cam-stats"></div>
       <div class="status" id="cal-msg"></div>
+    </div>
+    <div class="card" id="picture-card" hidden>
+      <h2>Picture</h2>
+      <div class="bar">
+        <button id="rot-ccw" title="Turn the picture a quarter turn counter-clockwise">&#x27F2; 90&deg;</button>
+        <button id="rot-cw" title="Turn the picture a quarter turn clockwise">&#x27F3; 90&deg;</button>
+        <button id="auto-contrast" class="primary" title="Stretch the board's lightest and darkest parts over the whole range">Auto contrast</button>
+        <button id="pic-reset" title="Brightness and contrast back to neutral">Reset</button>
+      </div>
+      <label class="slider">Brightness <input type="range" id="bright" min="-255" max="255" step="5"><output id="bright-val"></output></label>
+      <label class="slider">Contrast <input type="range" id="contrast" min="0.25" max="4" step="0.05"><output id="contrast-val"></output></label>
+      <p class="muted">Turning the picture turns the calibration with it. Auto contrast measures the board once it is calibrated (otherwise the whole picture). Both are kept for the next time. They cannot be changed during a game.</p>
     </div>
     <div class="card" id="warp-card" hidden>
       <h2>Board, top-down</h2>
@@ -240,6 +262,7 @@ const $ = id => document.getElementById(id);
 let S = null;                       // latest state from the server
 let tab = 'live';
 
+let lastApiError = '';
 async function api(method, path, body) {
   try {
     const res = await fetch(path, {
@@ -247,7 +270,7 @@ async function api(method, path, body) {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.ok === false) { toast(data.error || ('Error ' + res.status)); return null; }
+    if (!res.ok || data.ok === false) { lastApiError = data.error || ('Error ' + res.status); toast(lastApiError); return null; }
     return data;
   } catch (e) { toast('Server not reachable'); return null; }
 }
@@ -474,18 +497,33 @@ document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b
 const NAMES = ['a1', 'h1', 'h8', 'a8'];
 const live = $('live'), warp = $('warp'), overlay = $('overlay');
 let clicks = [];
+let calNote = null;                 // a message about the last auto-detect, kept until the next click
 
 function renderCalibrate(ctl) {
   if (!S) return;
   const cameraOn = S.mode !== 'idle';
   $('cal-viewer').hidden = ctl; $('cal-controls').hidden = !ctl;
   $('cal-open').hidden = cameraOn;
+  $('cal-detect').hidden = !(cameraOn && S.mode === 'calibrating');
+  $('cal-swap').hidden = !(S.calibration && S.mode === 'calibrating');
   $('cal-close').hidden = !(cameraOn && S.mode === 'calibrating');
+  if (S.stabilize) {
+    $('follow').checked = S.stabilize.on;
+    const st = S.stabilize;
+    $('follow-info').textContent = !st.on ? '' : st.adjusted
+      ? 'Realigned ' + st.adjusted + (st.adjusted === 1 ? ' time' : ' times') + ' this session, the last time by ' + st.last_shift.toFixed(2) + ' of a square.'
+      : 'During a game, the board is looked for every second or two and the calibration moves along if it shifted a little.';
+  }
   $('cal-clear').hidden = !(S.calibration && S.mode !== 'playing');
   $('cal-stage').hidden = !(cameraOn && ctl);
   $('warp-card').hidden = !(cameraOn && S.calibration);
-  if (!cameraOn) clicks = [];
-  if (cameraOn && ctl && !clicks.length) {
+  $('picture-card').hidden = !(cameraOn && ctl && S.mode !== 'playing');
+  showPicture();
+  if (!cameraOn) { clicks = []; calNote = null; }
+  if (cameraOn && ctl && !clicks.length && calNote) {
+    $('cal-msg').className = 'status' + (calNote.bad ? ' unsure' : '');
+    $('cal-msg').textContent = calNote.text;
+  } else if (cameraOn && ctl && !clicks.length) {
     $('cal-msg').className = 'status';
     $('cal-msg').textContent = S.calibration
       ? 'Calibrated. Click anywhere on the image to do it again.'
@@ -514,6 +552,7 @@ function drawOverlay() {
 
 live.addEventListener('click', async ev => {
   if (!live.naturalWidth) return;
+  calNote = null;
   if (clicks.length === 4 || (S && S.calibration && !clicks.length)) clicks = [];
   const r = live.getBoundingClientRect();
   clicks.push([(ev.clientX - r.left) * live.naturalWidth / r.width, (ev.clientY - r.top) * live.naturalHeight / r.height]);
@@ -527,29 +566,97 @@ live.addEventListener('click', async ev => {
   drawOverlay();
 });
 $('cal-open').onclick = () => api('POST', '/api/calibration/open');
+$('cal-detect').onclick = async () => {
+  const b = $('cal-detect'); b.disabled = true; b.textContent = 'Looking for the board…';
+  clicks = [];
+  const res = await api('POST', '/api/calibration/detect');
+  b.disabled = false; b.textContent = 'Auto-detect the board';
+  calNote = res
+    ? { text: res.message + ' Check that the outline and the labels a1, h1, h8, a8 sit on the board, or click the corners to adjust.', bad: false }
+    : { text: (lastApiError || 'The board was not found.') + ' You can still click the 4 corners by hand.', bad: true };
+  renderCalibrate(true); drawOverlay();
+};
+// a1 and h8 are both dark: when the other one was picked, turn the labels half way round.
+$('cal-swap').onclick = async () => {
+  const c = S && S.calibration; if (!c) return;
+  clicks = [];
+  if (await api('POST', '/api/calibration', { corners: [c[2], c[3], c[0], c[1]] })) {
+    calNote = { text: 'Sides swapped: a1 is now at the other dark corner.', bad: false };
+    renderCalibrate(true);
+  }
+};
+$('follow').onchange = () => api('POST', '/api/camera/follow', { on: $('follow').checked });
 $('cal-close').onclick = () => api('POST', '/api/calibration/close');
 $('cal-clear').onclick = () => confirm('Forget the calibration?') && api('DELETE', '/api/calibration');
 window.addEventListener('resize', drawOverlay);
 
-// Reload an image after the previous one has loaded, only while it is visible.
-let loopsOn = { live: false, warp: false };
-function loop(img, url, every, key, wanted) {
-  if (!wanted()) { loopsOn[key] = false; return; }
-  if (loopsOn[key]) return;
-  loopsOn[key] = true;
-  const next = () => setTimeout(() => {
-    if (!wanted()) { loopsOn[key] = false; return; }
-    img.src = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now();
-  }, every);
-  img.onload = () => { if (img === live) drawOverlay(); next(); };
-  img.onerror = next;
-  img.src = url + '?t=' + Date.now();
+// The camera picture is one Motion JPEG stream: the server sends each picture as soon as
+// it has it, with no request and no pause in between.
+let liveOn = false, liveSize = '';
+function liveStream(wanted) {
+  if (wanted && !liveOn) { liveOn = true; live.src = '/frame.mjpg?t=' + Date.now(); }
+  else if (!wanted && liveOn) { liveOn = false; live.removeAttribute('src'); liveSize = ''; }
 }
+// Draw the overlay again only when the picture changes size, not for every picture.
+live.onload = () => {
+  const size = live.naturalWidth + 'x' + live.naturalHeight;
+  if (size !== liveSize) { liveSize = size; drawOverlay(); }
+};
+// The server ends the stream when the camera has been off for a while: start it again if still wanted.
+live.onerror = () => { if (liveOn) { liveOn = false; setTimeout(cameraLoops, 1000); } };
+// A new picture size (after a turn) needs the overlay drawn again.
+setInterval(() => {
+  if (!liveOn) return;
+  const size = live.naturalWidth + 'x' + live.naturalHeight;
+  if (size !== liveSize) { liveSize = size; drawOverlay(); }
+}, 300);
+
+// The top-down board is a stream too (a few pictures per second).
+let warpOn = false;
+function warpStream(wanted) {
+  if (wanted && !warpOn) { warpOn = true; warp.src = '/warp.mjpg?t=' + Date.now(); }
+  else if (!wanted && warpOn) { warpOn = false; warp.removeAttribute('src'); }
+}
+warp.onerror = () => { if (warpOn) { warpOn = false; setTimeout(cameraLoops, 1000); } };
+
 function cameraLoops() {
-  const cal = tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle';
-  loop(live, '/frame.jpg', 400, 'live', () => tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle');
-  loop(warp, '/warp.jpg', 700, 'warp', () => tab === 'calibrate' && S && S.mode !== 'idle' && S.calibration);
+  liveStream(tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle');
+  warpStream(tab === 'calibrate' && S && S.mode !== 'idle' && S.calibration);
 }
+
+// Speed figures under the camera picture, once in a while.
+setInterval(async () => {
+  if (!liveOn) { $('cam-stats').textContent = ''; return; }
+  try {
+    const r = await (await fetch('/api/camera/stats')).json();
+    $('cam-stats').textContent = r.fps.toFixed(1) + ' pictures/s from the camera · ' + r.process_ms.toFixed(0) + ' ms to process · ' + r.encode_ms.toFixed(0) + ' ms to compress';
+  } catch (e) { /* the next time */ }
+}, 1500);
+
+// ---------- picture: turn, brightness, contrast ----------
+let pictureTimer = null, pictureDragging = false;
+function showPicture() {
+  const p = S && S.picture;
+  if (!p) return;
+  if (!pictureDragging) { $('bright').value = p.brightness; $('contrast').value = p.contrast; }
+  $('bright-val').textContent = Math.round(p.brightness);
+  $('contrast-val').textContent = p.contrast.toFixed(2);
+  drawOverlay();
+}
+function sendPicture() {
+  $('bright-val').textContent = Math.round(+$('bright').value);
+  $('contrast-val').textContent = (+$('contrast').value).toFixed(2);
+  clearTimeout(pictureTimer);
+  pictureTimer = setTimeout(() => api('POST', '/api/camera/picture', { brightness: +$('bright').value, contrast: +$('contrast').value }), 120);
+}
+for (const id of ['bright', 'contrast']) {
+  $(id).oninput = () => { pictureDragging = true; sendPicture(); };
+  $(id).onchange = () => { pictureDragging = false; };
+}
+$('rot-cw').onclick = () => api('POST', '/api/camera/rotate', { turns: 1 });
+$('rot-ccw').onclick = () => api('POST', '/api/camera/rotate', { turns: -1 });
+$('auto-contrast').onclick = () => api('POST', '/api/camera/auto-contrast');
+$('pic-reset').onclick = () => api('POST', '/api/camera/picture/reset');
 
 // ---------- past games and replay ----------
 let gamesTimer = null;

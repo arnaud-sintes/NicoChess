@@ -47,7 +47,7 @@ It needs a labeled dataset for this board, lighting and angle.
 7. Infer the move with a rules library.
 8. Output: board display and PGN, optionally feed an engine.
 
-Auto-detecting corners with pieces on the board is fragile, so manual 4-click calibration is the pragmatic choice.
+Auto-detecting the corners of the board is done from the 49 inner corners of the squares (saddle points), not from the outline of the board, so pieces on the board do not stop it as long as about half of those corners stay visible. Manual 4-click calibration stays available when it fails.
 
 ## Rust stack
 

@@ -712,6 +712,8 @@ pub enum SourceSpec {
     Demo { move_interval: Duration },
     /// A fixed image file.
     Image(String),
+    /// Pictures pushed in by the host program (the Android app), see [`crate::pushed`].
+    Pushed(std::sync::Arc<crate::pushed::FrameInbox>),
 }
 
 /// Opens a source each time the camera is needed, and drops it when it is not.
@@ -724,6 +726,7 @@ pub fn factory(spec: SourceSpec, interval: Duration) -> SourceFactory {
             SourceSpec::Synthetic => Ok(Box::new(Synthetic::new(interval))),
             SourceSpec::Demo { move_interval } => Ok(Box::new(DemoGame::new(interval, *move_interval))),
             SourceSpec::Image(path) => Ok(Box::new(StillImage::open(path, interval)?)),
+            SourceSpec::Pushed(inbox) => Ok(Box::new(crate::pushed::PushedSource::open(inbox.clone()))),
         }
     })
 }

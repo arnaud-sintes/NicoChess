@@ -19,12 +19,15 @@ $ErrorActionPreference = 'Continue'
 docker build -t nicochess-android -f "$root\docker\android.Dockerfile" "$root\docker"
 if ($LASTEXITCODE -ne 0) { throw 'docker build failed' }
 
-# Dependencies and build output live in named volumes: rebuilds are incremental.
+# Dependencies and build output live in named volumes: rebuilds are incremental. The
+# debug signing key lives in one too: with a new key each time, Android would refuse to
+# update the installed app (it would have to be uninstalled first).
 $env:MSYS_NO_PATHCONV = '1'
 docker run --rm `
     -e "ABIS=$Abis" `
     -v "${root}:/src:ro" `
     -v nicochess-gradle:/root/.gradle `
+    -v nicochess-android-keystore:/root/.android `
     -v nicochess-cargo-registry-android:/opt/cargo/registry `
     -v nicochess-android-target:/work/android/native/target `
     -v "${dist}:/out" `

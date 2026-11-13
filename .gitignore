@@ -3,6 +3,7 @@ target/
 dist/
 /data/
 /calibration.json
+/picture.json
 /usb/
 
 # Android build

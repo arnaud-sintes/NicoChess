@@ -495,7 +495,7 @@ The reasoning is in `docs/requirements.md`, "Targets".
 **Windows laptop**
 - The laptop would run Linux, like the INEOS 600. The program also runs on Windows, camera included (Media Foundation, added 2026-11-12): `cargo run --release -- --probe` lists the cameras, then `cargo run --release -- --device 0 --width 1280 --height 720 --open` uses one.
   `cargo run --release -- --source demo --open` plays the demo game in the local browser, without a camera.
-  If the page does not open on Windows with "forbidden by its access permissions", the port is reserved (Docker Desktop and Hyper-V reserve ranges that include 8080): check with `netsh int ipv4 show excludedportrange protocol=tcp` and pass another port, e.g. `--listen 127.0.0.1:18080`.
+  If the page does not open on Windows with "forbidden by its access permissions", the port is reserved (Docker Desktop and Hyper-V reserve ranges that include 8080): check with `netsh int ipv4 show excludedportrange protocol=tcp` and pass another port. The reserved ranges change from one start of Docker to the next (18080 worked one day and not the next), so look at the list and pick a port outside it, e.g. `--listen 127.0.0.1:28080`.
 
 **Both**
 - Raise the resolution and the frame rate: the Atom limits (640x480, 3 fps, no heavy decoding) no longer apply.

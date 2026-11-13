@@ -26,7 +26,10 @@ Everything is built and tested on a PC with a synthetic camera. **Nothing has ru
 |---|---|
 | Web page for phone, tablet and PC (no external resources), updates pushed by server-sent events | Real webcam: formats, exposure lock, detection quality on a C170 |
 | Controller / viewer roles: the first user controls, the others watch and replay | Tuning of the detection thresholds on real lighting |
-| Calibration by clicking the 4 corners, kept on disk | Wi-Fi access point on the target ([PLAN.md](PLAN.md) section 8) |
+| Calibration by clicking the 4 corners, or by the **Auto-detect the board** button (tested on a few real photos, see below), kept on disk | Wi-Fi access point on the target ([PLAN.md](PLAN.md) section 8) |
+| Picture settings: turn by 90°, auto contrast, brightness and contrast (software, same on every camera) | Camera-side controls on Android (exposure compensation, focus, white balance) |
+| Stabilization: during a game the calibration follows the board if the camera shifts a little (can be switched off) | Tried only on synthetic pictures: not yet on a real board |
+| Camera and top-down pictures pushed as Motion JPEG streams (no polling) | Speed of the preview on a real phone not measured: see the figures under the picture |
 | Per-square empty / white / black detection, learned from the known start position | |
 | Stability gate and legal-move matching, with castling, en passant, promotion | |
 | Live board and move list with timestamps (offsets from the start of the game) | |
@@ -48,11 +51,13 @@ Open http://localhost:8080. The demo source plays a whole game (Morphy's "Opera 
 2. Go back to **Live**, press **Start game**. The moves appear as the demo plays them, and the game ends by checkmate.
 3. Open **Games** to replay it, or download the PGN.
 
+Instead of clicking, press **Auto-detect the board**: it finds the 49 inner corners of the squares and works out the 4 outer corners. If a1 is at the wrong dark corner (a1 and h8 are both dark), press **Swap sides**.
+
 Open the same address from a second browser or a phone on the same network: it is a viewer and cannot start anything.
 Other sources: `--source synthetic` (the starting position only) or `--source some-image.jpg`.
 `--open` opens the page in this computer’s browser once the server is up (handy when the target is a laptop).
 
-`cargo test` runs the 46 tests, including a full game recorded from the demo camera to a PGN.
+`cargo test` runs the 83 tests, including a full game recorded from the demo camera to a PGN.
 `cargo run -- --help` lists all the options.
 
 ## Go to the target with a USB key
@@ -95,6 +100,9 @@ It needs the container because the camera crate generates its bindings at build 
 | `src/engine.rs` | State machine: camera on/off, game, tracker, store, roles, push to pages |
 | `src/camera.rs` | Frame sources: V4L2 camera, demo game, synthetic board, image file |
 | `src/calibration.rs` | Corner validation, save/load, warp to the top-down board |
+| `src/boarddetect.rs` | Finds the board by itself (inner corners of the squares, lattice fit) and follows it when the camera moves |
+| `src/picture.rs` | Turn, brightness, contrast, and the follow switch, saved in `picture.json` |
+| `src/pushed.rs` | Camera driven from outside (the Android app pushes its pictures in) |
 | `src/vision.rs` | Per-square sampling and the learned classifier |
 | `src/tracker.rs` | Stability gate and the match of the board to a legal move |
 | `src/game.rs` | Game record, SAN/UCI, PGN export |
