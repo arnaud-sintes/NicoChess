@@ -30,6 +30,7 @@ pub struct TrackerOverrides {
     pub max_excess: Option<f32>,
     pub margin: Option<f32>,
     pub max_plies: Option<usize>,
+    pub soft_margin: Option<f32>,
 }
 
 impl TrackerOverrides {
@@ -41,6 +42,7 @@ impl TrackerOverrides {
             max_excess: self.max_excess.unwrap_or(config.max_excess),
             margin: self.margin.unwrap_or(config.margin),
             max_plies: self.max_plies.unwrap_or(config.max_plies),
+            soft_margin: self.soft_margin.unwrap_or(config.soft_margin),
         }
     }
 
@@ -60,6 +62,9 @@ impl TrackerOverrides {
         }
         if let Some(v) = self.max_plies {
             parts.push(format!("max_plies={v}"));
+        }
+        if let Some(v) = self.soft_margin {
+            parts.push(format!("soft_margin={v}"));
         }
         parts.join(", ")
     }
@@ -169,11 +174,12 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     );
     let _ = writeln!(
         text,
-        "  tracker: stable_frames={} motion_threshold={} max_excess={} margin={} max_plies={}{}",
+        "  tracker: stable_frames={} motion_threshold={} max_excess={} margin={} soft_margin={} max_plies={}{}",
         config.stable_frames,
         config.motion_threshold,
         config.max_excess,
         config.margin,
+        config.soft_margin,
         config.max_plies,
         if overrides.describe().is_empty() { " (as recorded)".to_string() } else { format!("  (changed: {})", overrides.describe()) }
     );
@@ -196,12 +202,14 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                     Detection::Move { mv, .. } => vec![mv],
                     Detection::Sequence { moves, .. } => moves,
                     Detection::Unsure { candidates } if verbose => {
-                        let best = candidates.first().map_or(String::new(), |c| format!("{} ({:+.1})", c.san, c.cost));
-                        let _ = writeln!(text, "{:>8.1}s  replay unsure, likeliest: {best}   [{last_file}]", event.t);
+                        let best = candidates.first().map_or(String::new(), |c| format!("{} ({:.0}% sure)", c.san, 100.0 * c.chance));
+                        let why = why_unsure(candidates.get(1).map(|c| f64::from(c.cost)), config.margin);
+                        let _ = writeln!(text, "{:>8.1}s  replay unsure ({why}), likeliest: {best}   [{last_file}]", event.t);
                         continue;
                     }
                     _ => Vec::new(),
                 };
+                let doubtful = tracker.take_doubt().map_or(String::new(), |d| format!("   (doubtful, {:.0}% sure)", 100.0 * d.certainty));
                 let status = status_text(tracker.status());
                 if verbose && status != last_status {
                     let _ = writeln!(text, "{:>8.1}s  replay status: {status}   [{last_file}]", event.t);
@@ -219,9 +227,10 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                 }
                 let _ = writeln!(
                     text,
-                    "{:>8.1}s  replay found {}{}   [{last_file}]",
+                    "{:>8.1}s  replay found {}{}{}   [{last_file}]",
                     event.t,
                     sans_of(&before, &moves),
+                    doubtful,
                     if ok { "" } else { "   WRONG: a position the game never had" }
                 );
             }
@@ -258,7 +267,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                     );
                 }
             }
-            "undo" | "promotion" => {
+            "undo" | "promotion" | "doubt" => {
                 if event.kind == "undo" {
                     summary.live_undone += 1;
                 }
@@ -282,7 +291,8 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                 }
             }
             "unsure" if verbose => {
-                let _ = writeln!(text, "{:>8.1}s  live was unsure: {}", event.t, event.data["candidates"]);
+                let why = why_unsure(event.data["candidates"][1]["cost"].as_f64(), config.margin);
+                let _ = writeln!(text, "{:>8.1}s  live was unsure ({why}): {}", event.t, event.data["candidates"]);
             }
             "end" => {
                 let _ = writeln!(text, "{:>8.1}s  game over: {} {}", event.t, event.text("result"), event.text("reason"));
@@ -319,6 +329,15 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
         summary.live_typed
     );
     Ok(Report { text, summary })
+}
+
+/// Why a tracker was unsure, from the cost of the second candidate (how far it is behind the first): two moves that
+/// look alike (which the soft margin takes on), or a picture that no move explains well enough (which it does not).
+fn why_unsure(second_cost: Option<f64>, margin: f32) -> &'static str {
+    match second_cost {
+        Some(cost) if cost < f64::from(margin) => "two moves look alike",
+        _ => "the picture is not explained well enough",
+    }
 }
 
 fn status_text(status: Status) -> &'static str {

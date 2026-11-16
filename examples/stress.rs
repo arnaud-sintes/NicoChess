@@ -59,13 +59,19 @@ fn key(pos: &Chess) -> String {
     Fen::from_position(pos, EnPassantMode::Legal).to_string().split(' ').take(4).collect::<Vec<_>>().join(" ")
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct Outcome {
     plies: usize,
     auto: usize,
     wrong: usize,
     manual: usize,
     longest_manual_run: usize,
+    /// For every ply where the tracker was unsure and offered candidates: how far the first was ahead of the
+    /// second (nats), and whether the first was the move that was played.
+    unsure: Vec<(f32, bool)>,
+    /// For every ply where moves were taken although the tracker was not sure: the certainty it gave, and whether
+    /// the game was right after them.
+    doubts: Vec<(f32, bool)>,
 }
 
 /// The moves a detection brings (none for the other kinds).
@@ -84,12 +90,19 @@ fn play(game: &Game, conditions: &Conditions, config: &TrackerConfig, unseen: Op
     tracker.start(game.positions[0].clone());
     let mut now = Instant::now();
     let mut frames = 0u64;
+    // The certainty of the last moves taken in doubt, read after the pictures of a ply were shown.
+    let doubt_cell = std::cell::Cell::new(None::<f32>);
     let mut show = |tracker: &mut Tracker, pos: &Chess, progress: f32, times: usize| -> Vec<Detection> {
         let mut out = Vec::new();
         for _ in 0..times {
             frames += 1;
             now += Duration::from_millis(333);
             let detection = tracker.feed(&synthetic::frame_from_position(pos, conditions, progress, frames), now);
+            if matches!(detection, Detection::Move { .. } | Detection::Sequence { .. })
+                && let Some(doubt) = tracker.take_doubt()
+            {
+                doubt_cell.set(Some(doubt.certainty));
+            }
             if !matches!(detection, Detection::Nothing) {
                 out.push(detection);
             }
@@ -112,7 +125,9 @@ fn play(game: &Game, conditions: &Conditions, config: &TrackerConfig, unseen: Op
         if std::env::var("STRESS_VERBOSE").is_ok() {
             println!("--- ply {} {}", k + 1, nicochess::game::uci_of(game.moves[k]));
         }
+        doubt_cell.set(None);
         let detections = show(&mut tracker, truth, (k + 1) as f32 / total as f32, 4);
+        let doubt_taken = doubt_cell.take();
         let mut brought_moves = false;
         for detection in &detections {
             for mv in moves_of(detection) {
@@ -123,7 +138,18 @@ fn play(game: &Game, conditions: &Conditions, config: &TrackerConfig, unseen: Op
             }
         }
         let verbose = std::env::var("STRESS_VERBOSE").is_ok();
+        if !brought_moves && skipped == 0 {
+            let last_unsure =
+                detections.iter().rev().find_map(|d| if let Detection::Unsure { candidates } = d { Some(candidates) } else { None });
+            if let Some(candidates) = last_unsure.filter(|c| !c.is_empty()) {
+                let gap = candidates.get(1).map_or(99.0, |c| c.cost);
+                outcome.unsure.push((gap, candidates[0].uci == nicochess::game::uci_of(game.moves[k])));
+            }
+        }
         let ok = key(&known) == key(truth) && brought_moves;
+        if let Some(certainty) = doubt_taken {
+            outcome.doubts.push((certainty, ok));
+        }
         if verbose && !ok {
             let seen: Vec<String> = detections.iter().flat_map(moves_of).map(nicochess::game::uci_of).collect();
             println!(
@@ -171,6 +197,10 @@ fn main() {
     let games = [opera(), random_game(1, 70), random_game(2, 70), random_game(3, 70)];
     let mut config = TrackerConfig::default();
     // STRESS_MARGIN=10 tries another margin without rebuilding the program.
+    // STRESS_SOFT=0.5 tries another soft margin (the lead at which a not quite clear move is taken, in doubt).
+    if let Some(soft) = std::env::var("STRESS_SOFT").ok().and_then(|v| v.parse().ok()) {
+        config.soft_margin = soft;
+    }
     if let Some(margin) = std::env::var("STRESS_MARGIN").ok().and_then(|v| v.parse().ok()) {
         config.margin = margin;
     }
@@ -187,6 +217,8 @@ fn main() {
     ];
     // STRESS_ONLY=hard,dark runs only those scenarios.
     let only = std::env::var("STRESS_ONLY").ok();
+    let mut all_unsure: Vec<(f32, bool)> = Vec::new();
+    let mut all_doubts: Vec<(f32, bool)> = Vec::new();
     for (name, conditions, unseen) in scenarios {
         if only.as_ref().is_some_and(|list| !list.split(',').any(|n| n == name)) {
             continue;
@@ -203,6 +235,8 @@ fn main() {
             sum.wrong += o.wrong;
             sum.manual += o.manual;
             sum.longest_manual_run = sum.longest_manual_run.max(o.longest_manual_run);
+            all_unsure.extend(o.unsure.iter().copied());
+            all_doubts.extend(o.doubts.iter().copied());
         }
         println!(
             "{name:<10} {:<16} {:>6} {:>9.0}% {:>6} {:>7} {:>11}\n",
@@ -213,5 +247,42 @@ fn main() {
             sum.manual,
             sum.longest_manual_run
         );
+    }
+    // Moves taken in doubt: how sure the tracker said it was, and how often it was right.
+    if !all_doubts.is_empty() {
+        let right = all_doubts.iter().filter(|(_, ok)| *ok).count();
+        println!(
+            "Taken in doubt ({} times, {:.0}% right): by the certainty the tracker gave",
+            all_doubts.len(),
+            100.0 * right as f64 / all_doubts.len() as f64
+        );
+        for (low, high) in [(0.0, 0.5), (0.5, 0.7), (0.7, 0.9), (0.9, 1.01)] {
+            let bucket: Vec<_> = all_doubts.iter().filter(|(c, _)| *c >= low && *c < high).collect();
+            if bucket.is_empty() {
+                continue;
+            }
+            let right = bucket.iter().filter(|(_, ok)| *ok).count();
+            println!(
+                "  certainty {low:.1}..{high:.1}: {:>3} times, right {:>3.0}%",
+                bucket.len(),
+                100.0 * right as f64 / bucket.len() as f64
+            );
+        }
+    }
+    // When the tracker was unsure, was its first candidate the move that was played? By how far it led.
+    if !all_unsure.is_empty() {
+        println!("When unsure ({} times): how often the first candidate was right, by its lead over the second (nats)", all_unsure.len());
+        for (low, high) in [(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0), (4.0, 6.0), (6.0, 1000.0)] {
+            let bucket: Vec<_> = all_unsure.iter().filter(|(gap, _)| *gap >= low && *gap < high).collect();
+            if bucket.is_empty() {
+                continue;
+            }
+            let right = bucket.iter().filter(|(_, ok)| *ok).count();
+            println!(
+                "  lead {low:>3}..{high:<5}: {:>3} times, first candidate right {:>3.0}%",
+                bucket.len(),
+                100.0 * right as f64 / bucket.len() as f64
+            );
+        }
     }
 }

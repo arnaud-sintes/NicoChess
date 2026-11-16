@@ -45,13 +45,31 @@ pub struct TrackerConfig {
     pub margin: f32,
     /// How many moves in a row may have been played between two pictures (1 to 3).
     pub max_plies: usize,
+    /// A move that leads the runner-up by at least this many nats, but by less than `margin`, is accepted all the
+    /// same, with a note of doubt (see [`Doubt`]): the person is told and can put it right with one click. `margin`
+    /// or more turns this off, and the tracker then asks as it always did.
+    #[serde(default = "default_soft_margin")]
+    pub soft_margin: f32,
 }
 
 impl Default for TrackerConfig {
     fn default() -> Self {
-        TrackerConfig { stable_frames: 3, motion_threshold: 4.0, max_excess: 60.0, margin: 6.0, max_plies: 3 }
+        TrackerConfig { stable_frames: 3, motion_threshold: 4.0, max_excess: 60.0, margin: 6.0, max_plies: 3, soft_margin: SOFT_MARGIN }
     }
 }
+
+/// The soft margin of recordings made before there was one.
+fn default_soft_margin() -> f32 {
+    SOFT_MARGIN
+}
+
+/// A move that leads by at least this much (nats) is taken even though it is not clear, and flagged as doubtful.
+const SOFT_MARGIN: f32 = 2.0;
+/// How the lead of one explanation over the others becomes a chance. The likelihoods are overconfident (the
+/// squares are not independent), so the nats are divided by this before they are turned into odds. Measured on
+/// the synthetic stress test (few cases): moves taken on a lead of 2 to 6 nats were right about two times in three,
+/// so a lead of 6 nats is shown as about 80%, not 95%.
+const CERTAINTY_SCALE: f32 = 4.0;
 
 /// What a square may misfit, in nats, before it counts as unexplained: the noise on top of the usual.
 const SLACK: f32 = 4.0;
@@ -105,6 +123,17 @@ pub struct Candidate {
     pub san: String,
     /// How much less likely than the likeliest explanation, in nats.
     pub cost: f32,
+    /// How likely it is among the explanations that move something, from 0 to 1.
+    pub chance: f32,
+}
+
+/// A move was taken although it was not clear: how sure the tracker is, and what else it may have been.
+#[derive(Clone, Debug)]
+pub struct Doubt {
+    /// The chance that the moves taken are the ones played, from 0 to 1.
+    pub certainty: f32,
+    /// The other likely explanations, likeliest first.
+    pub alternatives: Vec<Candidate>,
 }
 
 #[derive(Debug)]
@@ -224,6 +253,10 @@ pub struct Tracker {
     /// What the board looked like (light corrected) when the position was last confirmed. Absent after a
     /// person set the position by hand, until a picture of it is seen.
     reference: Option<Vec<Features>>,
+    /// Set when the last moves taken were doubtful; the engine takes it (see `take_doubt`).
+    doubt: Option<Doubt>,
+    /// The person took back a doubtful move and has to say what was played: nothing is decided until then.
+    held: bool,
 }
 
 /// What the board should look like for a position.
@@ -377,6 +410,18 @@ impl Pool {
         (best, runner_up)
     }
 
+    /// How likely each of these explanations is among all the ones that move something: the odds of their
+    /// likelihoods, softened by `CERTAINTY_SCALE`, shared out so that they add up to 1.
+    fn chances(&self, picks: &[usize]) -> Vec<f32> {
+        let best = self.hyps.iter().filter(|h| h.plies >= 1).map(|h| h.score).fold(f32::INFINITY, f32::min);
+        if !best.is_finite() {
+            return vec![0.0; picks.len()];
+        }
+        let weight = |score: f32| ((best - score) / CERTAINTY_SCALE).exp();
+        let total: f32 = self.hyps.iter().filter(|h| h.plies >= 1).map(|h| weight(h.score)).sum();
+        picks.iter().map(|&i| weight(self.hyps[i].score) / total).collect()
+    }
+
     /// The moves of an explanation, in order.
     fn moves(&self, mut i: usize) -> Vec<Move> {
         let mut moves = Vec::new();
@@ -408,7 +453,22 @@ impl Tracker {
             unsure: false,
             candidates: Vec::new(),
             reference: None,
+            doubt: None,
+            held: false,
         }
+    }
+
+    /// The doubt about the moves that were just taken, if there is one. Taken once.
+    pub fn take_doubt(&mut self) -> Option<Doubt> {
+        self.doubt.take()
+    }
+
+    /// The person took back a move the tracker was doubtful about: the tracker offers these moves and decides
+    /// nothing, whatever the pictures show, until the person says what was played (`set_position`).
+    pub fn hold(&mut self, candidates: Vec<Candidate>) {
+        self.held = true;
+        self.unsure = true;
+        self.candidates = candidates;
     }
 
     pub fn status(&self) -> Status {
@@ -457,6 +517,7 @@ impl Tracker {
         self.position = position;
         self.last_eval = None;
         self.unsure = false;
+        self.held = false;
         self.resync_pending = true;
         // The reference shows another position: it says nothing about what changed.
         self.reference = None;
@@ -470,6 +531,7 @@ impl Tracker {
         self.resync_pending = false;
         self.last_eval = None;
         self.unsure = false;
+        self.held = false;
         self.still = false;
         self.gate.reset();
     }
@@ -502,6 +564,9 @@ impl Tracker {
             return Detection::Nothing;
         };
         self.still = true;
+        if self.held {
+            return Detection::Unsure { candidates: self.candidates.clone() };
+        }
         // What the board shows is read from the pictures averaged since it stopped moving: steadier than one.
         let averaged = self.gate.average();
         let grid = Models::read(&models.costs(&averaged));
@@ -516,6 +581,7 @@ impl Tracker {
     fn evaluate(&mut self, features: &[Features], since: Instant) -> Detection {
         let Some(models) = self.models.as_ref() else { return Detection::Nothing };
         let evidence = Evidence::new(models, features, expected_grid(&self.position), self.reference.as_deref());
+        self.doubt = None;
 
         // Nothing, one move, two moves: always looked at together (a reply played before the picture was
         // taken must not be mistaken for one move). Three only when those are not clear.
@@ -539,16 +605,7 @@ impl Tracker {
         // Nothing is clear: offer the likeliest explanations.
         let (best, _) = pool.best_within(3);
         let best_score = pool.hyps[best].score;
-        let mut order: Vec<usize> = (0..pool.hyps.len()).filter(|&i| pool.hyps[i].plies >= 1).collect();
-        order.sort_by(|&a, &b| pool.hyps[a].score.total_cmp(&pool.hyps[b].score));
-        let candidates: Vec<Candidate> = order
-            .into_iter()
-            .take(4)
-            .map(|i| {
-                let (uci, san) = self.describe(&pool.moves(i));
-                Candidate { uci, san, cost: pool.hyps[i].score - best_score }
-            })
-            .collect();
+        let candidates = self.likeliest(&pool, 4, None, best_score);
         self.unsure = true;
         self.candidates = candidates.clone();
         Detection::Unsure { candidates }
@@ -577,7 +634,9 @@ impl Tracker {
         }
         if pool.hyps[simple].excess <= limit * self.cfg.max_excess {
             if simple_runner_up - pool.hyps[simple].score < self.cfg.margin {
-                return None; // two simple explanations fit alike: more moves would not help
+                // Two simple explanations fit nearly alike: more moves would not help. If one leads a little,
+                // it is taken and flagged; else the person is asked.
+                return self.accept_doubtful(pool, simple, simple_runner_up, self.cfg.soft_margin, features, since);
             }
             return self.accept(pool, simple, simple_runner_up, features, since);
         }
@@ -587,11 +646,53 @@ impl Tracker {
             return None; // wait until one more move has been looked at (see `evaluate`)
         }
         // Several moves at once must be clearer than one: there are many more ways to look alike.
-        let needed = self.cfg.margin * (1.0 + 0.5 * f32::from(pool.hyps[best].plies.saturating_sub(1)));
-        if runner_up - pool.hyps[best].score < needed {
-            return None;
+        let scale = 1.0 + 0.5 * f32::from(pool.hyps[best].plies.saturating_sub(1));
+        if runner_up - pool.hyps[best].score < self.cfg.margin * scale {
+            return self.accept_doubtful(pool, best, runner_up, self.cfg.soft_margin * scale, features, since);
         }
         self.accept(pool, best, runner_up, features, since)
+    }
+
+    /// The explanations that move something, likeliest first (at most `n`, without `skip`), each with its chance.
+    /// `best_score` is what `cost` is counted from. Call it before the tracker's position changes: the moves are
+    /// written out from the position they were found for.
+    fn likeliest(&self, pool: &Pool, n: usize, skip: Option<usize>, best_score: f32) -> Vec<Candidate> {
+        let mut order: Vec<usize> = (0..pool.hyps.len()).filter(|&i| pool.hyps[i].plies >= 1 && Some(i) != skip).collect();
+        order.sort_by(|&a, &b| pool.hyps[a].score.total_cmp(&pool.hyps[b].score));
+        order.truncate(n);
+        let chances = pool.chances(&order);
+        order
+            .into_iter()
+            .zip(chances)
+            .map(|(i, chance)| {
+                let (uci, san) = self.describe(&pool.moves(i));
+                Candidate { uci, san, cost: pool.hyps[i].score - best_score, chance }
+            })
+            .collect()
+    }
+
+    /// The likeliest explanation leads, but not by the margin: it is taken if it leads by the soft margin, and
+    /// the doubt goes with it (see `take_doubt`) so that the person can be told and can correct it. Not right
+    /// after a position was set by hand, where nothing is taken on thin evidence.
+    fn accept_doubtful(
+        &mut self,
+        pool: &Pool,
+        index: usize,
+        runner_up: f32,
+        soft_needed: f32,
+        features: &[Features],
+        since: Instant,
+    ) -> Option<Detection> {
+        let lead = runner_up - pool.hyps[index].score;
+        if self.resync_pending || pool.hyps[index].plies == 0 || !(lead >= soft_needed && soft_needed < f32::INFINITY) {
+            return None;
+        }
+        // Written out before `accept` moves the position on.
+        let chance = pool.chances(&[index])[0];
+        let alternatives = self.likeliest(pool, 3, Some(index), pool.hyps[index].score);
+        let detection = self.accept(pool, index, runner_up, features, since)?;
+        self.doubt = Some(Doubt { certainty: chance, alternatives });
+        Some(detection)
     }
 
     fn accept(&mut self, pool: &Pool, index: usize, runner_up: f32, features: &[Features], since: Instant) -> Option<Detection> {
@@ -677,7 +778,11 @@ mod tests {
 
     impl Rig {
         fn new(position: Chess) -> Rig {
-            let mut tracker = Tracker::new(TrackerConfig::default());
+            Rig::with_config(position, TrackerConfig::default())
+        }
+
+        fn with_config(position: Chess, config: TrackerConfig) -> Rig {
+            let mut tracker = Tracker::new(config);
             tracker.set_calibration(Some(&synthetic::corners()));
             tracker.start(position);
             Rig { tracker, now: Instant::now(), frames: 0 }
@@ -850,6 +955,76 @@ mod tests {
             }
             other => panic!("expected one pair, got {other:?}"),
         }
+    }
+
+    /// The margin is so wide that no move is ever clear, so every move has to be taken on the soft margin.
+    fn unclear_config(soft_margin: f32) -> TrackerConfig {
+        TrackerConfig { margin: 1000.0, soft_margin, ..TrackerConfig::default() }
+    }
+
+    #[test]
+    fn a_move_that_leads_by_the_soft_margin_only_is_taken_with_a_doubt() {
+        let steps = synthetic::game_steps(&["e4"]);
+        let mut rig = Rig::with_config(Chess::default(), unclear_config(0.5));
+        assert!(rig.show(&synthetic::start_grid(), 7).is_empty());
+        let detections = rig.show(&steps[0].after, 4);
+        match detections.as_slice() {
+            [Detection::Move { mv, .. }] => assert_eq!(uci_of(*mv), "e2e4"),
+            other => panic!("expected the move to be taken, got {other:?}"),
+        }
+        let doubt = rig.tracker.take_doubt().expect("it was not clear: the move comes with a doubt");
+        assert!(doubt.certainty > 0.5 && doubt.certainty <= 1.0, "{}", doubt.certainty);
+        assert!(!doubt.alternatives.is_empty() && doubt.alternatives.len() <= 3);
+        assert!(doubt.alternatives.iter().all(|c| c.uci != "e2e4" && c.chance >= 0.0 && c.chance < doubt.certainty));
+        assert!(doubt.certainty + doubt.alternatives.iter().map(|c| c.chance).sum::<f32>() <= 1.0001, "chances share one whole");
+        assert!(rig.tracker.take_doubt().is_none(), "it is taken once");
+        assert_eq!(rig.tracker.status(), Status::Watching);
+    }
+
+    #[test]
+    fn a_clear_move_comes_without_a_doubt_and_the_soft_margin_can_be_turned_off() {
+        let steps = synthetic::game_steps(&["e4"]);
+        // As usual: the picture is clear, the move is taken, no doubt.
+        let mut rig = Rig::new(Chess::default());
+        rig.show(&synthetic::start_grid(), 7);
+        assert!(matches!(rig.show(&steps[0].after, 4).as_slice(), [Detection::Move { .. }]));
+        assert!(rig.tracker.take_doubt().is_none());
+        // The soft margin as wide as the margin: nothing is taken on thin evidence, the person is asked.
+        let mut strict = Rig::with_config(Chess::default(), unclear_config(1000.0));
+        strict.show(&synthetic::start_grid(), 7);
+        let detections = strict.show(&steps[0].after, 4);
+        assert!(detections.iter().all(|d| matches!(d, Detection::Unsure { .. })), "{detections:?}");
+        match detections.last() {
+            Some(Detection::Unsure { candidates }) => {
+                assert_eq!(candidates[0].uci, "e2e4");
+                assert!(candidates[0].chance > 0.5, "{}", candidates[0].chance);
+            }
+            other => panic!("expected a list of candidates, got {other:?}"),
+        }
+        assert!(strict.tracker.take_doubt().is_none());
+    }
+
+    #[test]
+    fn a_held_tracker_decides_nothing_until_a_move_is_entered() {
+        let steps = synthetic::game_steps(&["e4", "e5"]);
+        let mut rig = Rig::new(Chess::default());
+        rig.show(&synthetic::start_grid(), 7);
+        // The person took back a doubtful move: the picture shows e4, the position says the start.
+        let offered = vec![Candidate { uci: "e2e4".into(), san: "e4".into(), cost: 0.0, chance: 0.6 }];
+        rig.tracker.hold(offered);
+        let detections = rig.show(&steps[0].after, 5);
+        assert!(
+            !detections.is_empty() && detections.iter().all(|d| matches!(d, Detection::Unsure { candidates } if candidates.len() == 1)),
+            "{detections:?}"
+        );
+        assert_eq!(rig.tracker.status(), Status::Unsure);
+        // The person says what was played: the hold ends and tracking goes on by itself.
+        let mut after_e4 = Chess::default();
+        after_e4.play_unchecked(crate::game::parse_move(&after_e4, "e2e4").unwrap());
+        rig.tracker.set_position(after_e4);
+        rig.show(&steps[0].after, 3);
+        assert_eq!(rig.tracker.status(), Status::Watching);
+        assert!(matches!(rig.show(&steps[1].after, 4).as_slice(), [Detection::Move { .. }]));
     }
 
     #[test]

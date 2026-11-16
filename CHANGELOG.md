@@ -5,6 +5,24 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.5.0
+
+Three things testers asked for, and the CI:
+
+- **The squares of the virtual board had the wrong colours** (a1 was light): fixed, a1 is dark.
+- **New pieces:** the pieces are drawn by the page itself instead of coming from a font, with a thin outline: White is
+  cream with a dark outline and Black near black with a light outline, so they cannot be mixed up on either colour of
+  square (and some devices no longer show chess glyphs as emoji).
+- **Doubt instead of questions:** when two moves look nearly alike, the likelier one is taken if it leads by the soft
+  margin (`--soft-margin`, default 2 nats; `--margin` or more turns it off) instead of stopping to ask. The page
+  says so under the board: "Not completely sure about d4 (78% sure)", with the other likely moves and their chances as
+  buttons that replace the move, and an Undo that takes it back and offers the choice (the tracker decides nothing
+  until a move is entered). When no move is likely enough the page still asks, now with the chance of each move. New
+  route `POST /api/game/doubt`; the recording notes the doubt of each move, and `--replay` marks doubtful moves and
+  says why the tracker was unsure.
+- **CI:** the workflow file was invalid YAML (so GitHub never ran it): fixed. A server test that played a whole game
+  could fail on a slow machine because the controller role timed out: the test rigs now have long timeouts.
+
 ## 0.4.0
 
 - **Camera chooser on the page (Windows):** with several cameras (a built-in one and a USB one, say) the page

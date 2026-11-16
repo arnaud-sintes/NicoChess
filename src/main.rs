@@ -59,6 +59,8 @@ OPTIONS:
     --max-excess <X>         misfit left unexplained that is still accepted (nats)  [default: 60]
     --margin <X>             how much likelier than the runner-up a move must be (nats)  [default: 6]
     --max-plies <N>          moves in a row that may be played between two pictures, 1 to 3  [default: 3]
+    --soft-margin <X>        a move that leads by this much (nats) but less than --margin is taken and flagged as
+                             doubtful on the page, with a one-click correction; --margin or more asks instead  [default: 2]
 
     -V, --version            show the version
 
@@ -114,6 +116,7 @@ fn run() -> Result<()> {
         max_excess: args.opt_value_from_str("--max-excess")?,
         margin: args.opt_value_from_str("--margin")?,
         max_plies: args.opt_value_from_str("--max-plies")?,
+        soft_margin: args.opt_value_from_str("--soft-margin")?,
     };
     let tracker = overrides.apply(TrackerConfig::default());
 

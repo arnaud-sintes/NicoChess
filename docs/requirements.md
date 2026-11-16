@@ -145,7 +145,7 @@ Not verified on the real thing: detection quality on a real board with any camer
 | 4. API and push events | Done (own HTTP server: ready-made small servers buffer the events) |
 | 5. Interface | Done: live, calibration, games, replay, corrections |
 | 6. Roles, names, results | Done |
-| 7. Tuning on the target | To do. Tuning flags exist: `--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--max-plies` |
+| 7. Tuning on the target | To do. Tuning flags exist: `--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--soft-margin`, `--max-plies` |
 | 8. Windows camera and Windows package | Done (2026-11-12 and 2026-11-13). Webcam tried on a PC; a real game not yet |
 | 9. Picture settings, auto-detect of the board, stabilization (FR-3a to FR-3c) | Done, tested on synthetic pictures and, for the auto-detect, on a few photos of real boards. Not yet on a real game |
 | 10. Android app: phone camera, remote server switch, camera choice, foreground service (AR-1 to AR-4) | Built and compiled. Not yet run on a phone |

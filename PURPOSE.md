@@ -42,8 +42,9 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
 - **Picture settings**: turn by 90 degrees, auto contrast, brightness and contrast (done in software, same on every camera). Not during a game.
 - **Stabilization**: during a game the calibration follows the board when the camera or the board shifts a little (switchable).
 - **Move detection**: stability gate (no hand, a few identical pictures), per-square empty/white/black reading learned from the known position, legal-move matching with castling, en passant and promotion.
+- **Doubt**: when two moves look nearly alike, the program takes the likelier one if it leads a little (`--soft-margin`) instead of asking, and says so on the page: "Not completely sure about d4 (78% sure)", with the other likely moves and their chances as one-click buttons, and an Undo that takes the move back and offers the choice. When no move is likely enough, it asks as before, now with a chance next to each move.
 - **Roles**: controller and viewers, by a token kept in the browser; the controller role is kept while a game runs, released by a button, and expires when the controller goes silent.
-- **Live page**: virtual board, move list with times, camera picture and top-down board as Motion JPEG streams, push by server-sent events.
+- **Live page**: virtual board (drawn with its own pieces: white cream with a dark outline, black near black with a light outline, a1 a dark square), move list with times, camera picture and top-down board as Motion JPEG streams, push by server-sent events.
 - **Recording for investigation** (`--record`, any target that has a command line; the Windows package has a launcher
   for it): for every game, a folder with still pictures of what the detection saw, what it decided and what the
   people did, and `--replay` to run it through the detection again, also with other tuning values. For finding out

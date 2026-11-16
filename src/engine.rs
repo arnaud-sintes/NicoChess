@@ -13,7 +13,7 @@ use crate::picture::{self, Picture};
 use crate::record::{RecordOptions, Recorder, SessionMeta};
 use crate::roles::{self, Role, Roles};
 use crate::store::{Store, Summary};
-use crate::tracker::{Candidate, Detection, Status, Tracker, TrackerConfig};
+use crate::tracker::{Candidate, Detection, Doubt, Status, Tracker, TrackerConfig};
 use anyhow::Result;
 use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, ImageEncoder, RgbImage};
@@ -249,6 +249,17 @@ impl Drop for ClientGuard {
     }
 }
 
+/// The last moves were taken although the tracker was not sure (see `Doubt`): the page says so, and the person can
+/// put it right while those are still the last moves of the game.
+#[derive(Clone)]
+struct DoubtNote {
+    /// How many moves the game had once they were taken, and how many of those they are.
+    after: usize,
+    count: usize,
+    certainty: f32,
+    alternatives: Vec<Candidate>,
+}
+
 struct Inner {
     roles: Roles,
     mode: Mode,
@@ -281,6 +292,7 @@ struct Inner {
     /// The recording of the game being played, when recording is on. Last in the lock order: it only queues
     /// work for its own thread, so it can be used with `inner` held.
     recorder: Option<Recorder>,
+    doubt: Option<DoubtNote>,
 }
 
 /// Speed figures of the camera pipeline, smoothed.
@@ -371,6 +383,7 @@ impl Engine {
                 last_follow_save: None,
                 pending_save: None,
                 recorder: None,
+                doubt: None,
             }),
             frame: RwLock::new(None),
             camera_wanted: Mutex::new(false),
@@ -543,16 +556,20 @@ impl Engine {
                 }
                 Detection::Sequence { moves, since } => {
                     inner.candidates.clear();
+                    let doubt = inner.tracker.take_doubt();
                     let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
                     self.apply_detected_moves(inner, &moves, since);
-                    noted = Some(detection_event(inner, before, moves.len()));
+                    noted = Some(detection_event(inner, before, moves.len(), doubt.as_ref()));
+                    remember_doubt(inner, doubt, before, moves.len());
                     changed = true;
                 }
                 Detection::Move { mv, since, promotion_guess } => {
                     inner.candidates.clear();
+                    let doubt = inner.tracker.take_doubt();
                     let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
                     self.apply_detected_move(inner, mv, since, promotion_guess);
-                    noted = Some(detection_event(inner, before, 1));
+                    noted = Some(detection_event(inner, before, 1, doubt.as_ref()));
+                    remember_doubt(inner, doubt, before, 1);
                     changed = true;
                 }
             }
@@ -723,6 +740,8 @@ impl Engine {
 
     /// Saves the game and ends it if the rules say so.
     fn after_game_change(&self, inner: &mut Inner) {
+        // Whatever changed the game, the doubt was about moves that are no longer the last ones.
+        inner.doubt = None;
         let Some(game) = inner.game.as_mut() else { return };
         let mut warning = None;
         match game.rules_outcome() {
@@ -890,7 +909,8 @@ impl Engine {
             },
             "tracker": {
                 "status": status_name(inner.tracker.status()),
-                "candidates": inner.candidates.iter().map(|c| json!({"uci": c.uci, "san": c.san, "cost": (c.cost * 10.0).round() / 10.0})).collect::<Vec<_>>(),
+                "candidates": candidates_json(&inner.candidates),
+                "doubt": doubt_json(inner),
                 "promotion_pending": promotion_pending,
             },
             "game": game,
@@ -1253,6 +1273,7 @@ impl Engine {
     /// of the game were already played (0 for a new game), so the timestamps carry on.
     fn begin_playing(&self, inner: &mut Inner, position: shakmaty::Chess, resume_at: f64) {
         inner.tracker.start(position.clone());
+        inner.doubt = None;
         self.begin_recording(inner, &position, resume_at);
         // The time of the last move comes from a file: do not trust it to be a sane number.
         let played = Duration::try_from_secs_f64(resume_at.max(0.0)).unwrap_or_default();
@@ -1402,6 +1423,7 @@ impl Engine {
             Self::record(inner, "undo", json!({"fen": game::fen_of(&position)}));
             inner.tracker.set_position(position);
         }
+        inner.doubt = None;
         inner.candidates.clear();
         self.save(inner);
         drop(guard);
@@ -1424,6 +1446,77 @@ impl Engine {
         let position = game.position().map_err(ApiError::internal)?;
         Self::record(inner, "promotion", json!({"piece": piece.to_string(), "fen": game::fen_of(&position)}));
         inner.tracker.set_position(position);
+        self.after_game_change(inner);
+        self.close_recording_if_idle(inner);
+        drop(guard);
+        let saved = self.flush_save();
+        self.hub.notify();
+        saved
+    }
+
+    /// The person's answer to a move the tracker took although it was not sure. `Some(uci)` replaces it by one of
+    /// the other likely explanations. `None` takes it back and leaves the person to say what was played: the
+    /// tracker offers the explanations again and decides nothing until a move is entered.
+    pub fn resolve_doubt(&self, token: &str, choice: Option<&str>) -> ApiResult {
+        let mut guard = self.controlled(token)?;
+        let inner = &mut *guard;
+        if inner.mode != Mode::Playing {
+            return Err(ApiError::Conflict("no game is running".into()));
+        }
+        let note = inner.doubt.clone().ok_or_else(|| ApiError::Conflict("the last move is not in doubt (any more)".into()))?;
+        let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
+        if game.moves.len() != note.after {
+            inner.doubt = None;
+            return Err(ApiError::Conflict("the game has moved on".into()));
+        }
+        let replacement = match choice {
+            Some(uci) => Some(
+                note.alternatives
+                    .iter()
+                    .find(|c| c.uci == uci)
+                    .ok_or_else(|| ApiError::BadRequest("that is not one of the other likely moves".into()))?
+                    .clone(),
+            ),
+            None => None,
+        };
+        // What was taken, when it was seen, and what it was.
+        let first = note.after - note.count;
+        let t = game.moves[first].t;
+        let taken: Vec<(String, String)> = game.moves[first..].iter().map(|m| (m.uci.clone(), m.san.clone())).collect();
+        for _ in 0..note.count {
+            game.undo();
+        }
+        if let Some(chosen) = &replacement {
+            for part in chosen.uci.split_whitespace() {
+                if let Err(e) = game.push_text(part, t) {
+                    // The alternatives are legal moves of this position, so this should not happen: put it back.
+                    while game.moves.len() > first {
+                        game.undo();
+                    }
+                    for (uci, _) in &taken {
+                        let _ = game.push_text(uci, t);
+                    }
+                    return Err(ApiError::internal(e));
+                }
+            }
+        }
+        let position = game.position().map_err(ApiError::internal)?;
+        Self::record(inner, "doubt", json!({"choice": choice, "fen": game::fen_of(&position)}));
+        inner.tracker.set_position(position);
+        inner.candidates.clear();
+        if replacement.is_none() {
+            // Ask again: the move that was taken and the other likely ones.
+            let guessed = Candidate {
+                uci: taken.iter().map(|(u, _)| u.as_str()).collect::<Vec<_>>().join(" "),
+                san: taken.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join(" "),
+                cost: 0.0,
+                chance: note.certainty,
+            };
+            let mut offered = vec![guessed];
+            offered.extend(note.alternatives.iter().cloned());
+            inner.tracker.hold(offered.clone());
+            inner.candidates = offered;
+        }
         self.after_game_change(inner);
         self.close_recording_if_idle(inner);
         drop(guard);
@@ -1477,21 +1570,49 @@ impl Engine {
     }
 }
 
-/// The candidates of an unsure tracker, for the recording.
+/// The candidates of an unsure tracker, for the page and the recording.
 fn candidates_json(candidates: &[Candidate]) -> Value {
-    Value::Array(candidates.iter().map(|c| json!({"uci": c.uci, "san": c.san, "cost": (c.cost * 10.0).round() / 10.0})).collect())
+    Value::Array(
+        candidates
+            .iter()
+            .map(|c| json!({"uci": c.uci, "san": c.san, "cost": (c.cost * 10.0).round() / 10.0, "chance": (c.chance * 100.0).round() / 100.0}))
+            .collect(),
+    )
+}
+
+/// A doubtful move, for the page: how sure the tracker is, what it took, and what else it may have been. Only while
+/// the doubtful moves are the last of the game.
+fn doubt_json(inner: &Inner) -> Value {
+    let (Some(note), Some(game)) = (&inner.doubt, &inner.game) else { return Value::Null };
+    if inner.mode != Mode::Playing || game.moves.len() != note.after {
+        return Value::Null;
+    }
+    let played: Vec<&str> = game.moves[note.after - note.count..].iter().map(|m| m.san.as_str()).collect();
+    json!({"certainty": (note.certainty * 100.0).round() / 100.0, "played": played.join(" "), "alternatives": candidates_json(&note.alternatives)})
+}
+
+/// Keeps the doubt about moves that were just taken (if the game accepted them), for the page to show.
+fn remember_doubt(inner: &mut Inner, doubt: Option<Doubt>, moves_before: usize, count: usize) {
+    inner.doubt = None;
+    let Some(doubt) = doubt else { return };
+    let Some(game) = inner.game.as_ref() else { return };
+    // The game may have refused the moves, or ended with them.
+    if inner.mode != Mode::Playing || game.moves.len() != moves_before + count {
+        return;
+    }
+    inner.doubt = Some(DoubtNote { after: game.moves.len(), count, certainty: doubt.certainty, alternatives: doubt.alternatives });
 }
 
 /// What the recording says of moves that were just found: the moves and the position after them, or that
 /// the game refused them.
-fn detection_event(inner: &Inner, moves_before: usize, count: usize) -> (&'static str, Value) {
+fn detection_event(inner: &Inner, moves_before: usize, count: usize, doubt: Option<&Doubt>) -> (&'static str, Value) {
     let fen = game::fen_of(inner.tracker.position());
     match inner.game.as_ref() {
         Some(game) if game.moves.len() == moves_before + count => {
             let found = &game.moves[moves_before..];
             (
                 "detect",
-                json!({"moves": found.iter().map(|m| &m.uci).collect::<Vec<_>>(), "san": found.iter().map(|m| &m.san).collect::<Vec<_>>(), "fen": fen}),
+                json!({"moves": found.iter().map(|m| &m.uci).collect::<Vec<_>>(), "san": found.iter().map(|m| &m.san).collect::<Vec<_>>(), "fen": fen, "doubt": doubt.map(|d| json!({"certainty": (d.certainty * 100.0).round() / 100.0, "alternatives": candidates_json(&d.alternatives)}))}),
             )
         }
         _ => ("rejected", json!({"text": inner.notice, "fen": fen})),

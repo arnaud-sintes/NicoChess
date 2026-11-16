@@ -35,6 +35,7 @@
 //!   POST   /api/game/undo              take back the last move
 //!   POST   /api/game/promotion         {"piece": "q"|"r"|"b"|"n"}
 //!   POST   /api/game/relearn           learn the look of the squares again
+//!   POST   /api/game/doubt             {"move": "d2d4"} put a doubtful move right with another likely one; {} takes it back and asks
 
 use crate::engine::{ApiError, ApiResult, Engine, StartRequest};
 use crate::http::{Handler, Reply, Request};
@@ -129,6 +130,14 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             Err(e) => failure(e),
         },
         ("DELETE", "/api/calibration") => done(engine.clear_calibration(&token)),
+        ("POST", "/api/game/doubt") => {
+            #[derive(Deserialize)]
+            struct Body {
+                #[serde(rename = "move", default)]
+                mv: Option<String>,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.resolve_doubt(&token, b.mv.as_deref().filter(|m| !m.is_empty()))))
+        }
         ("POST", "/api/camera/follow") => {
             #[derive(Deserialize)]
             struct Body {
@@ -367,6 +376,12 @@ mod tests {
         }
     }
 
+    /// The controller must not lose the role to the clock on a slow machine: some tests play a whole game, and
+    /// the role is released after a silence (60 seconds by default), which a loaded test machine can exceed.
+    fn patient() -> EngineConfig {
+        EngineConfig { idle_timeout: Duration::from_secs(3600), game_timeout: Duration::from_secs(3600), ..EngineConfig::default() }
+    }
+
     fn rig(name: &str, source: SourceSpec) -> Rig {
         rig_with(name, source, Duration::from_millis(5), false)
     }
@@ -381,7 +396,7 @@ mod tests {
             backlog: 100_000,
             ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
         });
-        let engine = Engine::new(EngineConfig { record, ..EngineConfig::default() }, store, dir.join("calibration.json"), None);
+        let engine = Engine::new(EngineConfig { record, ..patient() }, store, dir.join("calibration.json"), None);
         engine.spawn_capture(camera::factory(source, frame_interval)).unwrap();
         let handler = handler(Arc::clone(&engine), 8);
         Rig { engine, handler, dir }
@@ -712,7 +727,7 @@ mod tests {
         let mut game = crate::game::GameRecord::new("20260101T100000".into(), None, "Ann", "Bob", None).unwrap();
         game.push_text("e4", 3.0).unwrap();
         store.save(&game).unwrap();
-        let engine = Engine::new(EngineConfig::default(), store, dir.join("calibration.json"), calibration);
+        let engine = Engine::new(patient(), store, dir.join("calibration.json"), calibration);
         engine.spawn_capture(camera::factory(SourceSpec::Synthetic, Duration::from_millis(5))).unwrap();
         let handler = handler(Arc::clone(&engine), 8);
         Rig { engine, handler, dir }
@@ -1025,7 +1040,7 @@ mod tests {
         let selection =
             Arc::new(CameraSelection::with_lister("0".into(), Some(dir.join("camera.json")), Box::new(move || Ok(cameras.clone()))));
         let store = Store::open(&dir.join("games")).unwrap();
-        let config = EngineConfig { camera: Some(Arc::clone(&selection)), ..EngineConfig::default() };
+        let config = EngineConfig { camera: Some(Arc::clone(&selection)), ..patient() };
         let engine = Engine::new(config, store, dir.join("calibration.json"), None);
         // A source that notes which camera each opening asked for, as the real one reads the selection.
         let opened: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -1076,6 +1091,75 @@ mod tests {
         assert_eq!(rig.call("POST", "/api/camera/select", ALICE, r#"{"id": "0"}"#).0, 409);
         assert_eq!(selection.device(), "1");
         assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"*","reason":"abandoned"}"#).0, 200);
+    }
+
+    /// A rig whose tracker takes every move on the soft margin: each move comes with a doubt.
+    fn rig_doubtful(name: &str) -> Rig {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let tracker = crate::tracker::TrackerConfig { margin: 1000.0, soft_margin: 0.5, ..Default::default() };
+        let engine = Engine::new(EngineConfig { tracker, ..patient() }, store, dir.join("calibration.json"), None);
+        engine
+            .spawn_capture(camera::factory(SourceSpec::Demo { move_interval: Duration::from_millis(1500) }, Duration::from_millis(100)))
+            .unwrap();
+        let rig = Rig { handler: handler(Arc::clone(&engine), 8), engine, dir };
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        // The first move of the demo is taken with a doubt.
+        wait_for("a move in doubt", || !rig.state(BOB)["tracker"]["doubt"].is_null());
+        rig
+    }
+
+    #[test]
+    fn a_move_taken_in_doubt_is_reported_and_can_be_replaced_by_another_likely_one() {
+        let rig = rig_doubtful("doubt-replace");
+        let doubt = rig.state(BOB)["tracker"]["doubt"].clone();
+        assert_eq!(doubt["played"], "e4");
+        assert!(doubt["certainty"].as_f64().unwrap() > 0.5, "{doubt}");
+        let alternatives = doubt["alternatives"].as_array().unwrap();
+        assert!(!alternatives.is_empty());
+        let other = alternatives[0]["uci"].as_str().unwrap().to_string();
+        assert!(alternatives[0]["chance"].as_f64().unwrap() < doubt["certainty"].as_f64().unwrap());
+
+        // Only the controller, only one of the offered moves.
+        assert_eq!(rig.call("POST", "/api/game/doubt", BOB, &json!({"move": other}).to_string()).0, 403);
+        assert_eq!(rig.call("POST", "/api/game/doubt", ALICE, r#"{"move": "a2a3"}"#).0, 400);
+        assert_eq!(rig.state(ALICE)["game"]["moves"][0]["uci"], "e2e4", "nothing changed");
+
+        // Replaced: the game has the other move, and the doubt is gone.
+        let (status, body) = rig.call("POST", "/api/game/doubt", ALICE, &json!({"move": other}).to_string());
+        assert_eq!(status, 200, "{body}");
+        let state = rig.state(ALICE);
+        assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 1);
+        assert_eq!(state["game"]["moves"][0]["uci"], other.as_str());
+        assert!(state["tracker"]["doubt"].is_null());
+        // Nothing is in doubt any more: a second answer is refused.
+        assert_eq!(rig.call("POST", "/api/game/doubt", ALICE, &json!({"move": other}).to_string()).0, 409);
+    }
+
+    #[test]
+    fn taking_back_a_move_in_doubt_offers_the_choice_and_waits_for_a_move() {
+        let rig = rig_doubtful("doubt-undo");
+        let doubt = rig.state(ALICE)["tracker"]["doubt"].clone();
+        let alternatives = doubt["alternatives"].as_array().unwrap().len();
+        let (status, body) = rig.call("POST", "/api/game/doubt", ALICE, "{}");
+        assert_eq!(status, 200, "{body}");
+        let state = rig.state(ALICE);
+        assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 0, "the move was taken back");
+        assert!(state["tracker"]["doubt"].is_null());
+        // The move that was taken and the other likely ones are offered, as when the tracker is unsure.
+        let candidates = state["tracker"]["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 1 + alternatives);
+        assert_eq!(candidates[0]["san"], "e4");
+        wait_for("the tracker to wait for the person", || rig.state(ALICE)["tracker"]["status"] == "unsure");
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 0, "nothing is decided meanwhile");
+        // The person picks one of them as any move: the game goes on from there.
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "e2e4"}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["game"]["moves"][0]["san"], "e4");
     }
 
     #[test]

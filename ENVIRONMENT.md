@@ -82,7 +82,7 @@ cargo run --release -- --probe                # list the cameras, formats and co
 cargo run --release -- --device 0 --width 1280 --height 720 --open    # Windows webcam (Linux: --device /dev/video0)
 ```
 
-`--open` opens the page in the browser of this computer. Default address `0.0.0.0:8080`; on Windows, if that port is reserved or taken, the program takes the next free one among 28080-28089, then any, and prints the addresses. For tests and scripts give the address yourself: `--listen 127.0.0.1:28080`. `--data-dir` and `--calibration` default to the current folder (`./data`, `./calibration.json`); `picture.json` goes next to the calibration file. `--help` lists every option, including the tuning flags (`--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--max-plies`).
+`--open` opens the page in the browser of this computer. Default address `0.0.0.0:8080`; on Windows, if that port is reserved or taken, the program takes the next free one among 28080-28089, then any, and prints the addresses. For tests and scripts give the address yourself: `--listen 127.0.0.1:28080`. `--data-dir` and `--calibration` default to the current folder (`./data`, `./calibration.json`); `picture.json` goes next to the calibration file. `--help` lists every option, including the tuning flags (`--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--soft-margin`, `--max-plies`).
 
 ## Record and replay a game (investigating a bad session, tuning the detection)
 
@@ -121,7 +121,7 @@ sees: they stay on the PC, and look at them before sending them anywhere.
 - `cargo run --release --example stress` measures how well the tracker follows whole games on synthetic pictures
   with a poor camera: `easy`, `drift` (fading, warming light and a moving shadow), `hard` (plus glare and leaning
   pieces), `dark`, `noisy`, and `catch-up` (every fifth move is never photographed). A simulated person types the
-  move whenever the tracker is unsure or wrong. It prints, per game, how many plies were found by themselves, how
+  move whenever the tracker is unsure or wrong. At the end it prints how often the first candidate was the right one when the tracker was unsure, by its lead over the second. It prints, per game, how many plies were found by themselves, how
   many were wrong, how many had to be typed, and the longest run of typed moves. It takes some minutes.
   `STRESS_ONLY=hard,dark` runs some scenarios, `STRESS_VERBOSE=1` lists each failure, `STRESS_MARGIN=9` tries another
   `--margin`. Run it after any change to `vision.rs` or `tracker.rs`; the pictures are synthetic, so the numbers
