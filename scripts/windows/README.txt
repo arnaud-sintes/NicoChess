@@ -14,6 +14,9 @@ Start
 
 No camera at hand? "Demo (no camera).bat" plays a whole game on a drawn board.
 
+Testing? Start with "Start NicoChess (record).bat" instead: it does the same and also
+records every game for debugging (see Recordings below).
+
 Another camera: "List cameras.bat" shows what Windows offers; then start with its
 number, for example:  Start NicoChess.bat 1
 
@@ -27,7 +30,18 @@ on private networks, or other devices cannot connect.
 Where things are kept
 ---------------------
 %LOCALAPPDATA%\NicoChess : the games (games\), the calibration and the picture
-settings. To remove NicoChess, delete this folder and the folder it came in.
+settings, and the recordings (recordings\). To remove NicoChess, delete this folder and
+the folder it came in.
+
+Recordings
+----------
+"Start NicoChess (record).bat" keeps, for every game, a folder named after its start
+(for example 2026-11-16_11-30-05) in %LOCALAPPDATA%\NicoChess\recordings. It holds the
+pictures the program looked at, what it decided and what the players did (moves typed
+by hand, undo, calibration). The developer can replay it to see why a move was missed.
+The pictures show whatever the camera sees, so look at a few before sending a folder.
+Nothing is sent anywhere by the program. Expect a few hundred MB per hour of play at
+1280x720: delete the folders you no longer need. To send one, zip its folder.
 
 If it does not start
 --------------------

@@ -7,6 +7,8 @@ use anyhow::{Result, bail};
 use nicochess::app::{self, ServerOptions};
 use nicochess::camera::{self, CameraSettings, SourceSpec};
 use nicochess::http;
+use nicochess::record::RecordOptions;
+use nicochess::replay::{self, TrackerOverrides};
 use nicochess::tracker::TrackerConfig;
 use std::net::UdpSocket;
 use std::path::PathBuf;
@@ -40,11 +42,23 @@ OPTIONS:
     --game-timeout <MINS>    ... and during a game               [default: 30]
     --demo-interval <SECS>   time between moves of the demo game [default: 4]
 
+  Recording games, to look into them later:
+    --record                 keep a recording of every game: a folder named after the start (date and time) with
+                             the pictures the detection saw, what it decided, and what the people did
+    --record-dir <DIR>       where the recordings go             [default: recordings]
+    --record-every <SECS>    time between two pictures kept while the board is quiet; every picture is kept
+                             while something happens. 0 keeps all of them  [default: 2]
+    --replay <DIR>           no camera, no page: run a recording (or all those in a folder) through the
+                             detection again and compare it with what happened. The tuning options below
+                             replace the recorded ones, to try them on real pictures
+    --replay-verbose         with --replay: also list every change of the tracker's status
+
   Tuning the move detection:
     --stable-frames <N>      frames in a row that must agree     [default: 3]
     --motion-threshold <X>   colour change that means 'a hand is there'  [default: 4]
-    --max-cost <X>           largest mismatch accepted for a move  [default: 1.6]
-    --margin <X>             how much better than the runner-up    [default: 1]
+    --max-excess <X>         misfit left unexplained that is still accepted (nats)  [default: 60]
+    --margin <X>             how much likelier than the runner-up a move must be (nats)  [default: 6]
+    --max-plies <N>          moves in a row that may be played between two pictures, 1 to 3  [default: 3]
 
     -V, --version            show the version
 
@@ -90,17 +104,34 @@ fn run() -> Result<()> {
     let game_mins: u64 = args.opt_value_from_str("--game-timeout")?.unwrap_or(30);
     let demo_secs: f32 = args.opt_value_from_str("--demo-interval")?.unwrap_or(4.0);
 
-    let defaults = TrackerConfig::default();
-    let tracker = TrackerConfig {
-        stable_frames: args.opt_value_from_str("--stable-frames")?.unwrap_or(defaults.stable_frames),
-        motion_threshold: args.opt_value_from_str("--motion-threshold")?.unwrap_or(defaults.motion_threshold),
-        max_cost: args.opt_value_from_str("--max-cost")?.unwrap_or(defaults.max_cost),
-        margin: args.opt_value_from_str("--margin")?.unwrap_or(defaults.margin),
+    // Only the values that are given: a replay keeps the recorded ones for the others.
+    let overrides = TrackerOverrides {
+        stable_frames: args.opt_value_from_str("--stable-frames")?,
+        motion_threshold: args.opt_value_from_str("--motion-threshold")?,
+        max_excess: args.opt_value_from_str("--max-excess")?,
+        margin: args.opt_value_from_str("--margin")?,
+        max_plies: args.opt_value_from_str("--max-plies")?,
     };
+    let tracker = overrides.apply(TrackerConfig::default());
+
+    let record = args.contains("--record");
+    let record_dir: PathBuf = args.opt_value_from_str("--record-dir")?.unwrap_or_else(|| PathBuf::from("recordings"));
+    let record_every: f32 = args.opt_value_from_str("--record-every")?.unwrap_or(2.0);
+    let replay: Option<PathBuf> = args.opt_value_from_str("--replay")?;
+    let replay_verbose = args.contains("--replay-verbose");
 
     let rest = args.finish();
     if !rest.is_empty() {
         bail!("unknown arguments: {rest:?} (see --help)");
+    }
+    if let Some(path) = replay {
+        return replay::run(&path, &overrides, replay_verbose);
+    }
+    if replay_verbose {
+        bail!("--replay-verbose goes with --replay");
+    }
+    if !(record_every >= 0.0 && record_every.is_finite()) {
+        bail!("--record-every must be 0 or more");
     }
     if probe {
         print!("{}", camera::probe(&device)?);
@@ -164,6 +195,7 @@ fn run() -> Result<()> {
         idle_timeout: Duration::from_secs(idle_secs),
         game_timeout: Duration::from_secs(game_mins * 60),
         max_viewers,
+        record: record.then(|| RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))),
     };
     app::serve_on(options, listener, on_ready)
 }

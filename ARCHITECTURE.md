@@ -8,7 +8,7 @@
 | **Own small HTTP server** (`src/http.rs`), thread per connection, `Connection: close` | The page needs server-sent events and Motion JPEG streams, which must leave the machine at once; the usual small servers buffer their output. Few clients, so threads are fine |
 | **Server-sent events**, not WebSocket | One direction (server to page) is all that is needed; commands are plain `POST`s. Works through any proxy and needs no handshake code |
 | **One HTML file** (`web/index.html`) built into the program with `include_str!` | No build step, no external font, script or image: it works offline, and the program is a single file |
-| **Vision from the known position**: homography warp, per-square empty/white/black classifier learned from the start position, legal-move matching | A cheap camera cannot tell piece types, but it can tell empty from white from black. The chess rules (`shakmaty`) do the rest, and piece types come from the game |
+| **Vision from the known position**: homography warp, per-square empty/white/black models learned from the start position and kept learning, scoring of every way the game may have gone on (nothing, one, two or three moves) | A cheap camera cannot tell piece types, but it can tell empty from white from black. The chess rules (`shakmaty`) do the rest, and piece types come from the game |
 | **Pure Rust image code** (`image`, `imageproc`, no OpenCV) | Nothing to install, builds everywhere, including the container for the 32-bit target |
 | **Kotlin shell plus JNI** for Android | Only Kotlin can reach Camera2, the foreground service, permissions and the WebView. Everything else (server, vision, rules) is the same Rust core in a native library |
 | **Docker** for the Linux 32-bit and the Android builds | The `v4l` crate needs libclang and the Linux headers at build time; the Android build needs the SDK, NDK and Gradle. Neither belongs on the Windows PC |
@@ -39,14 +39,17 @@
 | `calibration.rs` | The four corners and the size of the picture they were made for, validation, warp to the top-down board (50 px squares, 25 px margin) |
 | `boarddetect.rs` | Finds the 49 inner corners (saddle points), fits the lattice, gives the four outer corners and which one is a1; `refine` follows a board that moved |
 | `picture.rs` | Rotation, brightness, contrast, auto contrast, the follow switch; saved in `picture.json` |
-| `vision.rs` | Sampling of each square and the learned empty/white/black classifier |
-| `tracker.rs` | Stability gate and the choice of the legal move (or, when none fits, the pair of moves) that best explains the picture |
+| `vision.rs` | Sampling of each square (eight numbers: colour of the middle and of the ring, texture) and the per-square, per-content models (`Models`) that learn, compensate a change of the light and say how badly a square fits "empty", "white" or "black" |
+| `tracker.rs` | Stability gate; then every way the game may have gone on (no move, any one, two or three legal moves) is scored by how likely the picture is, including what changed since the last confirmed picture. The likeliest is accepted only if it beats the next by a margin and leaves little unexplained; a clear move teaches the models. After a position set by hand the next picture is adopted and learned, and nothing but one reply is believed beyond it |
 | `game.rs` | The game record (moves, result), SAN/UCI, PGN, file format version, the draw rules (repetition, 50 and 75 moves) |
 | `store.rs` | One JSON file per game, ids, listing |
 | `build.rs` (root) | Adds the git commit to the program (`COMMIT`, with `VERSION` from Cargo.toml: `lib.rs`) |
 | `fsutil.rs` | `write_atomic`: temporary file, flush to disk, rename |
+| `record.rs` | Recording of a game (`--record`): a folder per game with `session.json`, `frames/*.jpg` and `events.jsonl`, written by its own thread so that the capture path never waits for the disk; date and time of the start without a library (Windows local time through one `GetLocalTime` call) |
+| `replay.rs` | Replay of a recording (`--replay`): feeds the pictures to the tracker at their recorded times, applies what the people did, and reports how the result compares with what happened; the tuning options replace the recorded ones |
 | `roles.rs` | Controller and viewer, tokens, expiry |
-| `synthetic.rs` | A chessboard drawn in perspective, the Opera game; used by the demo source and by the tests |
+| `synthetic.rs` | A chessboard drawn in perspective, the Opera game; used by the demo source and by the tests. `Conditions` adds drifting light, a moving shadow, glare, leaning pieces and noise |
+| `examples/stress.rs` | Benchmark (not part of the program): plays whole games through the tracker under those conditions with a simulated person who types a move when the tracker is unsure |
 
 ### Page (`web/index.html`)
 One file: markup, style and script. Tabs Live, Games, Calibrate; the page state comes from the event stream; commands go through `api()`.
@@ -85,6 +88,7 @@ PGN is produced on request from the stored moves (`GameRecord::pgn`); positions 
 |---|---|
 | `capture` (one) | Opens a `FrameSource` when the camera is wanted, loops over frames, runs `on_frame`; sleeps on a condvar when no camera is wanted. A panic while processing a picture is caught (the picture is skipped and the loop goes on); a panic inside the camera source itself ends the thread, which is logged |
 | `camera` (Windows only) | Owns the Media Foundation camera (it is not `Send`) and sends frames over a channel |
+| `record` (one per recorded game) | Encodes the pictures it is given and writes them, and the event lines, in the recording's folder; ends when the game's recording is dropped. Fed by `try_send` on a bounded queue: when the disk cannot keep up, pictures are dropped and counted, never waited for |
 | `http` (one per connection) | Reads one request, runs the handler, answers; stream replies (events, MJPEG) keep the thread until the page leaves |
 | `http-accept` (Android, remote listener) | Polls a non-blocking listener ten times a second so it can be stopped |
 | `nicochess-server` (Android) | Runs the loopback listener |
@@ -93,7 +97,7 @@ PGN is produced on request from the stored moves (`GameRecord::pgn`); positions 
 | `CoreService` worker (Android) | Starts the core and opens or closes the remote listener, which can take a moment |
 
 State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, picture settings, roles, notices. Separate small locks: `frame` (latest picture, `RwLock`), `camera_wanted` with a condvar, `frame_count` with a condvar (streams wait on it), `stats` (speed figures), `save_lock` (one game writer at a time), the SSE hub's subscriber list.
-**Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`. No cycle exists; keep it that way.** (`wait_for_frame` takes `frame_count` and then only reads `frame`; it never takes `inner`.) Poisoned locks are recovered, not propagated. Slow work on the capture thread (detection, JPEG encoding, writing a game) is done outside `inner`; the rare commands of the owner write their small settings file under it.
+**Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`. No cycle exists; keep it that way.** (The recorder lives inside `inner`: it only queues work for its own thread and takes no lock, so it can be used with `inner` held.) (`wait_for_frame` takes `frame_count` and then only reads `frame`; it never takes `inner`.) Poisoned locks are recovered, not propagated. Slow work on the capture thread (detection, JPEG encoding, writing a game) is done outside `inner`; the rare commands of the owner write their small settings file under it.
 
 ## Persistence
 
@@ -103,7 +107,9 @@ State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, 
 | `calibration.json` | `--calibration` (default `./calibration.json`) | Corners a1, h1, h8, a8 in pixels of the rotated picture, and the size of the picture they were made for. The engine warns when the picture has another size |
 | `picture.json` | next to `calibration.json` | Rotation, brightness, contrast, the follow switch |
 
-All three are written by `fsutil::write_atomic`: after a power cut a file is the old one or the new one. An unfinished game found at start is loaded into the Idle state; the page offers **Resume** (`POST /api/game/resume`) or **Close it**.
+| `<recording-dir>/<date>_<time>/` | `--record-dir` (default `./recordings`; Windows record launcher: `%LOCALAPPDATA%\NicoChess\recordings`) | Only with `--record`: one folder per game played. `session.json` (program version, start time, source, calibration, picture settings, tracker settings, start position), `frames/NNNNNN.jpg` (the pictures the detection saw), `events.jsonl` (one JSON line each: `frame`, `detect`, `unsure`, `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`). Format number in `record::FORMAT` |
+
+All of them are written by `fsutil::write_atomic`: after a power cut a file is the old one or the new one. The one exception is `events.jsonl` of a recording, which is appended line by line (a line cut short by a power loss is skipped by the replay). An unfinished game found at start is loaded into the Idle state; the page offers **Resume** (`POST /api/game/resume`) or **Close it**.
 
 ## API and roles
 

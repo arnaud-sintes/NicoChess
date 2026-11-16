@@ -9,6 +9,7 @@ use crate::calibration::{self, Calibration};
 use crate::camera::SourceFactory;
 use crate::game::{self, GameRecord};
 use crate::picture::{self, Picture};
+use crate::record::{RecordOptions, Recorder, SessionMeta};
 use crate::roles::{self, Role, Roles};
 use crate::store::{Store, Summary};
 use crate::tracker::{Candidate, Detection, Status, Tracker, TrackerConfig};
@@ -81,6 +82,8 @@ pub struct EngineConfig {
     /// The tracker looks at a picture at most this often, however fast the camera
     /// delivers (the preview can be faster than the detection needs to be).
     pub track_interval: Duration,
+    /// Keep a recording of every game for later investigation (see `record`).
+    pub record: Option<RecordOptions>,
 }
 
 impl Default for EngineConfig {
@@ -90,6 +93,7 @@ impl Default for EngineConfig {
             game_timeout: Duration::from_secs(30 * 60),
             tracker: TrackerConfig::default(),
             track_interval: Duration::ZERO,
+            record: None,
         }
     }
 }
@@ -270,6 +274,9 @@ struct Inner {
     /// The game to write to the disk: set under the lock, written by `flush_save` once the lock is
     /// released (writing and flushing a file can take long on a small machine).
     pending_save: Option<GameRecord>,
+    /// The recording of the game being played, when recording is on. Last in the lock order: it only queues
+    /// work for its own thread, so it can be used with `inner` held.
+    recorder: Option<Recorder>,
 }
 
 /// Speed figures of the camera pipeline, smoothed.
@@ -292,6 +299,9 @@ pub struct Engine {
     calibration_path: PathBuf,
     picture_path: PathBuf,
     track_interval: Duration,
+    /// Where games are recorded, and the settings of the tracker (kept in the recording).
+    record: Option<RecordOptions>,
+    tracker_config: TrackerConfig,
     /// Counts the pictures received; the picture streams wait on it.
     frame_count: Mutex<u64>,
     frame_cv: Condvar,
@@ -315,6 +325,7 @@ pub struct StartRequest {
 
 impl Engine {
     pub fn new(config: EngineConfig, store: Store, calibration_path: PathBuf, calibration: Option<Calibration>) -> Arc<Engine> {
+        let tracker_config = config.tracker.clone();
         let mut tracker = Tracker::new(config.tracker);
         tracker.set_calibration(calibration.as_ref());
         let picture_path = calibration_path.with_file_name("picture.json");
@@ -352,6 +363,7 @@ impl Engine {
                 follow_anchor: None,
                 last_follow_save: None,
                 pending_save: None,
+                recorder: None,
             }),
             frame: RwLock::new(None),
             camera_wanted: Mutex::new(false),
@@ -363,6 +375,8 @@ impl Engine {
             calibration_path,
             picture_path,
             track_interval: config.track_interval,
+            record: config.record,
+            tracker_config,
             frame_count: Mutex::new(0),
             frame_cv: Condvar::new(),
             frame_streams: AtomicUsize::new(0),
@@ -492,7 +506,11 @@ impl Engine {
         let feed_due = inner.last_feed.is_none_or(|t| now.duration_since(t) >= self.track_interval);
         if inner.mode == Mode::Playing && feed_due && size_ok {
             inner.last_feed = Some(now);
-            match inner.tracker.feed(&latest.image, now) {
+            let detection = inner.tracker.feed(&latest.image, now);
+            // What the recording will say about this picture (see the module record).
+            let mut noted: Option<(&'static str, Value)> = None;
+            let found = matches!(detection, Detection::Move { .. } | Detection::Sequence { .. });
+            match detection {
                 Detection::Nothing => {
                     if inner.tracker.status() != Status::Unsure && !inner.candidates.is_empty() {
                         inner.candidates.clear();
@@ -502,18 +520,23 @@ impl Engine {
                 Detection::Unsure { candidates } => {
                     // Tell the pages only when the list changed: this comes at every picture while unsure.
                     if !inner.candidates.iter().map(|c| &c.uci).eq(candidates.iter().map(|c| &c.uci)) {
+                        noted = Some(("unsure", json!({"candidates": candidates_json(&candidates)})));
                         inner.candidates = candidates;
                         changed = true;
                     }
                 }
-                Detection::Pair { first, second, since } => {
+                Detection::Sequence { moves, since } => {
                     inner.candidates.clear();
-                    self.apply_detected_pair(inner, first, second, since);
+                    let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
+                    self.apply_detected_moves(inner, &moves, since);
+                    noted = Some(detection_event(inner, before, moves.len()));
                     changed = true;
                 }
                 Detection::Move { mv, since, promotion_guess } => {
                     inner.candidates.clear();
+                    let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
                     self.apply_detected_move(inner, mv, since, promotion_guess);
+                    noted = Some(detection_event(inner, before, 1));
                     changed = true;
                 }
             }
@@ -522,6 +545,15 @@ impl Engine {
                 inner.last_status = status;
                 changed = true;
             }
+            // The picture comes before what it led to, so that the file reads in order. Every picture is kept
+            // while something is going on; only now and then while the board is quiet.
+            if let Some(recorder) = inner.recorder.as_mut() {
+                recorder.frame(now, &latest.image, status_name(status), found || status != Status::Watching);
+                if let Some((kind, data)) = noted {
+                    recorder.event(now, kind, data);
+                }
+            }
+            self.close_recording_if_idle(inner);
         }
         drop(guard);
         // A failure to save becomes the notice of the pages; nothing else to do here.
@@ -617,6 +649,7 @@ impl Engine {
             _ => return,
         }
         inner.calibration = Some(moved);
+        Self::record(&inner, "calibration", json!({"how": "follow", "calibration": moved}));
         let save_due = inner.last_follow_save.is_none_or(|t| now.duration_since(t) >= FOLLOW_SAVE_EVERY);
         if save_due {
             inner.last_follow_save = Some(now);
@@ -648,20 +681,20 @@ impl Engine {
         self.after_game_change(inner);
     }
 
-    /// Two moves were recognised at once: both are recorded, at the time the board became still.
-    fn apply_detected_pair(&self, inner: &mut Inner, first: shakmaty::Move, second: shakmaty::Move, since: Instant) {
+    /// Two or three moves were recognised at once: all are recorded, at the time the board became still.
+    fn apply_detected_moves(&self, inner: &mut Inner, moves: &[shakmaty::Move], since: Instant) {
         let Some(game) = inner.game.as_mut() else { return };
         let t = since.saturating_duration_since(inner.game_started.unwrap_or(since)).as_secs_f64();
         let before = game.moves.len();
-        for mv in [first, second] {
+        for mv in moves.iter().copied() {
             match game.push_move(mv, t, mv.promotion().is_some()) {
-                Ok(record) => eprintln!("game: {} {} (two moves at once)", record.san, record.uci),
+                Ok(record) => eprintln!("game: {} {} ({} moves at once)", record.san, record.uci, moves.len()),
                 Err(e) => {
                     // The tracker and the game disagree: trust the game, and keep neither move.
                     while game.moves.len() > before {
                         game.undo();
                     }
-                    inner.notice = Some(format!("two detected moves were rejected ({e:#}); position kept"));
+                    inner.notice = Some(format!("the moves detected at once were rejected ({e:#}); position kept"));
                     if let Ok(pos) = game.position() {
                         inner.tracker.set_position(pos);
                     }
@@ -934,6 +967,7 @@ impl Engine {
         calibration.save(&self.calibration_path).map_err(ApiError::internal)?;
         inner.calibration = Some(calibration);
         inner.follow_anchor = None;
+        Self::record(&inner, "calibration", json!({"how": "set", "calibration": calibration}));
         // During a game the squares are learned again from the position reached.
         inner.tracker.set_calibration(Some(&calibration));
         inner.notice = None;
@@ -1100,10 +1134,63 @@ impl Engine {
         Ok(())
     }
 
+    /// Starts the recording of the game that begins now, if recording is on. A failure is reported and the game
+    /// goes on without it.
+    fn begin_recording(&self, inner: &mut Inner, position: &shakmaty::Chess, resume_at: f64) {
+        let Some(options) = &self.record else { return };
+        let meta = SessionMeta {
+            format: crate::record::FORMAT,
+            program: crate::version_text(),
+            started_utc: String::new(),
+            started_local: None,
+            source: inner.source.clone(),
+            game_id: inner.game.as_ref().map(|g| g.id.clone()).unwrap_or_default(),
+            start_fen: game::fen_of(position),
+            resumed_at: resume_at,
+            record_every: options.every.as_secs_f64(),
+            tracker: self.tracker_config.clone(),
+            calibration: inner.calibration,
+            picture: inner.picture,
+        };
+        inner.recorder = match Recorder::begin(options, meta, Instant::now()) {
+            Ok(recorder) => {
+                eprintln!("record: this game is recorded in {}", recorder.folder().display());
+                Some(recorder)
+            }
+            Err(e) => {
+                eprintln!("record: {e:#}; this game is not recorded");
+                None
+            }
+        };
+    }
+
+    /// Notes something in the recording of the game, if there is one.
+    fn record(inner: &Inner, kind: &str, data: Value) {
+        if let Some(recorder) = &inner.recorder {
+            recorder.event(Instant::now(), kind, data);
+        }
+    }
+
+    /// The game is over or was ended: its recording ends. Call it once the last thing that happened in the game
+    /// has been noted.
+    fn close_recording_if_idle(&self, inner: &mut Inner) {
+        if inner.mode == Mode::Playing {
+            return;
+        }
+        let Some(recorder) = inner.recorder.take() else { return };
+        let (result, reason) = inner.game.as_ref().map_or((None, None), |g| (g.result.clone(), g.termination.clone()));
+        recorder.event(Instant::now(), "end", json!({"result": result, "reason": reason, "fen": game::fen_of(inner.tracker.position())}));
+        if recorder.dropped() > 0 {
+            eprintln!("record: {} pictures could not be kept, the disk was too slow", recorder.dropped());
+        }
+        eprintln!("record: saved in {}", recorder.folder().display());
+    }
+
     /// The board shows `position`: follow the game from there. `resume_at` is how many seconds
     /// of the game were already played (0 for a new game), so the timestamps carry on.
     fn begin_playing(&self, inner: &mut Inner, position: shakmaty::Chess, resume_at: f64) {
-        inner.tracker.start(position);
+        inner.tracker.start(position.clone());
+        self.begin_recording(inner, &position, resume_at);
         // The time of the last move comes from a file: do not trust it to be a sane number.
         let played = Duration::try_from_secs_f64(resume_at.max(0.0)).unwrap_or_default();
         inner.game_started = Some(Instant::now().checked_sub(played).unwrap_or_else(Instant::now));
@@ -1176,6 +1263,7 @@ impl Engine {
         }
         self.go_idle(&mut inner);
         inner.candidates.clear();
+        self.close_recording_if_idle(&mut inner);
         drop(inner);
         if let Some(id) = forget
             && let Err(e) = self.store.remove(&id)
@@ -1196,10 +1284,10 @@ impl Engine {
         }
         let t = inner.game_started.map_or(0.0, |s| s.elapsed().as_secs_f64());
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
-        // One move, or two ("e4 e5") when a reply was played before the first move was seen: all or nothing.
+        // One move, or several ("e4 e5") when replies were played before the first move was seen: all or nothing.
         let parts: Vec<&str> = text.split_whitespace().collect();
-        if parts.is_empty() || parts.len() > 2 {
-            return Err(ApiError::BadRequest("give one move, or two separated by a space".into()));
+        if parts.is_empty() || parts.len() > 3 {
+            return Err(ApiError::BadRequest("give one move, or up to three separated by spaces".into()));
         }
         let before = game.moves.len();
         for part in parts {
@@ -1211,9 +1299,11 @@ impl Engine {
             }
         }
         let position = game.position().map_err(ApiError::internal)?;
+        Self::record(inner, "manual", json!({"text": text.trim(), "fen": game::fen_of(&position)}));
         inner.tracker.set_position(position);
         inner.candidates.clear();
         self.after_game_change(inner);
+        self.close_recording_if_idle(inner);
         drop(guard);
         let saved = self.flush_save();
         self.hub.notify();
@@ -1246,6 +1336,7 @@ impl Engine {
             // The board must show the position again before learning resumes.
             self.begin_playing(inner, position, resume_at);
         } else {
+            Self::record(inner, "undo", json!({"fen": game::fen_of(&position)}));
             inner.tracker.set_position(position);
         }
         inner.candidates.clear();
@@ -1268,8 +1359,10 @@ impl Engine {
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         game.set_last_promotion(piece)?;
         let position = game.position().map_err(ApiError::internal)?;
+        Self::record(inner, "promotion", json!({"piece": piece.to_string(), "fen": game::fen_of(&position)}));
         inner.tracker.set_position(position);
         self.after_game_change(inner);
+        self.close_recording_if_idle(inner);
         drop(guard);
         let saved = self.flush_save();
         self.hub.notify();
@@ -1282,6 +1375,7 @@ impl Engine {
         if inner.mode != Mode::Playing {
             return Err(ApiError::Conflict("no game is running".into()));
         }
+        Self::record(&inner, "relearn", json!({}));
         inner.tracker.relearn();
         inner.last_status = Status::Learning;
         drop(inner);
@@ -1320,6 +1414,27 @@ impl Engine {
     }
 }
 
+/// The candidates of an unsure tracker, for the recording.
+fn candidates_json(candidates: &[Candidate]) -> Value {
+    Value::Array(candidates.iter().map(|c| json!({"uci": c.uci, "san": c.san, "cost": (c.cost * 10.0).round() / 10.0})).collect())
+}
+
+/// What the recording says of moves that were just found: the moves and the position after them, or that
+/// the game refused them.
+fn detection_event(inner: &Inner, moves_before: usize, count: usize) -> (&'static str, Value) {
+    let fen = game::fen_of(inner.tracker.position());
+    match inner.game.as_ref() {
+        Some(game) if game.moves.len() == moves_before + count => {
+            let found = &game.moves[moves_before..];
+            (
+                "detect",
+                json!({"moves": found.iter().map(|m| &m.uci).collect::<Vec<_>>(), "san": found.iter().map(|m| &m.san).collect::<Vec<_>>(), "fen": fen}),
+            )
+        }
+        _ => ("rejected", json!({"text": inner.notice, "fen": fen})),
+    }
+}
+
 fn status_name(status: Status) -> &'static str {
     match status {
         Status::NoCalibration => "no_calibration",
@@ -1350,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn two_detected_moves_are_both_recorded_and_an_illegal_pair_is_not() {
+    fn detected_moves_are_all_recorded_and_an_illegal_sequence_is_not() {
         let (engine, dir) = engine_playing("detected-pair");
         use shakmaty::Position;
         let start = shakmaty::Chess::default();
@@ -1360,7 +1475,7 @@ mod tests {
         let e5 = crate::game::parse_move(&after, "e7e5").unwrap();
         {
             let mut inner = engine.inner.grab();
-            engine.apply_detected_pair(&mut inner, e4, e5, Instant::now());
+            engine.apply_detected_moves(&mut inner, &[e4, e5], Instant::now());
             let game = inner.game.as_ref().unwrap();
             assert_eq!(game.moves.len(), 2);
             assert_eq!((game.moves[0].uci.as_str(), game.moves[1].uci.as_str()), ("e2e4", "e7e5"));
@@ -1372,9 +1487,9 @@ mod tests {
         // A pair that does not follow from the position (the tracker and the game disagree): neither is kept.
         {
             let mut inner = engine.inner.grab();
-            engine.apply_detected_pair(&mut inner, e4, e5, Instant::now());
+            engine.apply_detected_moves(&mut inner, &[e4, e5], Instant::now());
             assert_eq!(inner.game.as_ref().unwrap().moves.len(), 2);
-            assert!(inner.notice.as_deref().is_some_and(|n| n.contains("two detected moves were rejected")));
+            assert!(inner.notice.as_deref().is_some_and(|n| n.contains("the moves detected at once were rejected")));
         }
         std::fs::remove_dir_all(&dir).ok();
     }

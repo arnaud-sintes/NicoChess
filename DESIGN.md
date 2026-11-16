@@ -20,7 +20,7 @@ These rules describe how the code is written today. Follow them when you change 
 
 ## Files
 
-- Every file the program writes goes through `fsutil::write_atomic` (temporary file, `sync_all`, rename). Never `fs::write` on a file that matters.
+- Every file the program writes goes through `fsutil::write_atomic` (temporary file, `sync_all`, rename). Never `fs::write` on a file that matters. (A recording's `events.jsonl` is appended, line by line, by the recording thread; the replay skips a line cut short.) Recording must never disturb a game: the capture path only queues work (`try_send`) for the recording thread, and a failure is reported once and ignored.
 - A corrupt `calibration.json` or `picture.json` must not stop the program from starting: report it and use the defaults.
 - Game files carry a `version`; a reader of a newer version must refuse, not guess.
 

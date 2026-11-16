@@ -44,6 +44,10 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
 - **Move detection**: stability gate (no hand, a few identical pictures), per-square empty/white/black reading learned from the known position, legal-move matching with castling, en passant and promotion.
 - **Roles**: controller and viewers, by a token kept in the browser; the controller role is kept while a game runs, released by a button, and expires when the controller goes silent.
 - **Live page**: virtual board, move list with times, camera picture and top-down board as Motion JPEG streams, push by server-sent events.
+- **Recording for investigation** (`--record`, any target that has a command line; the Windows package has a launcher
+  for it): for every game, a folder with still pictures of what the detection saw, what it decided and what the
+  people did, and `--replay` to run it through the detection again, also with other tuning values. For finding out
+  why a move was missed in a test session and for tuning on real pictures; it is not a video of the game.
 - **Games**: one JSON file per game, a list by date, replay, PGN export, resume of an unfinished game after a restart.
 - **Remote server and camera choice** (Android): see above.
 
@@ -52,13 +56,14 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
 - No recognition of piece types by vision (types come from the game state).
 - No engine analysis for now (Stockfish is a design for later, see `docs/requirements.md`).
 - No HTTPS, no accounts, no login: the network (the Wi-Fi passphrase, or the phone itself) is the only protection.
-- No chess clock, no video recording, no tournament scoring.
+- No chess clock, no video recording of games to watch (the debugging recording keeps still pictures), no tournament scoring.
 - Not for the Internet: do not expose the port outside a trusted network.
 
 ## Known limits
 
 - Draws by repetition and by the 50-move rule follow the FIDE rules: fivefold repetition and the 75-move rule end the game by themselves; threefold repetition and the 50-move rule only show a "Claim the draw" button, because a player has to claim them.
-- Two moves made between two still pictures (an instant reply) are recognised as a pair when the board matches that pair clearly better than any single move and any other pair; otherwise the page stays unsure, offers the likeliest singles and pairs, and the moves can be entered by hand ("e4 e5"). Since the camera only sees empty, white or black squares, two different pairs that leave the same squares occupied by the same colours cannot be told apart: such a case stays unsure.
+- Up to three moves made between two still pictures (an instant reply, or a moment nobody was looking) are recognised when the board matches that sequence clearly better than any shorter one and any other sequence; otherwise the page stays unsure, offers the likeliest explanations, and the moves can be entered by hand ("e4 e5", up to three). Since the camera only sees empty, white or black squares, two different sequences that leave the same squares occupied by the same colours cannot be told apart: such a case stays unsure.
+- The look of each square is learned and keeps adapting to a light that fades, warms or moves. After a move typed by hand the next still picture is adopted as the look of that position, so tracking resumes by itself. Very dark pictures with strong glare, or a heavy-noise camera, can still make the program unsure or, rarely, wrong; the page shows what was recorded, and a wrong move is undone by hand. All of this is measured on synthetic pictures only.
 - Promotion is guessed as a queen; the page offers the other pieces.
 - Detection quality on a real board, with real lighting and real pieces, is **not yet tested** with any camera. The auto-detect of the board was only tried on a few photos found on the web, and the stabilization only on synthetic pictures.
 - The Android app has been built but not yet run on a phone since the service and the settings were added; a USB camera works only on phones whose Android lists it to apps.

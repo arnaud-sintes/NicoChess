@@ -5,6 +5,33 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.3.0
+
+Move detection that keeps working as a game goes on (testers reported that it lost track and needed every
+move typed by hand):
+
+- **Per-square models that keep learning** replace the fixed classifier learned once at the start: each square
+  has its own idea of what empty, white and black look like, follows a light that fades, warms or moves, and
+  learns from every move it sees clearly. Squares are described by eight numbers (colour of the middle and the
+  ring, texture) averaged over small blocks, so camera noise matters less.
+- **Likelihood instead of a fixed limit:** every way the game may have gone on is scored by how well it explains
+  the picture, including what changed since the last confirmed picture; the best is accepted when it is clearly
+  ahead and leaves little unexplained.
+- **Catch-up:** up to three moves played between two pictures are recognised (it was two); a move typed by hand
+  may also be two or three moves ("e4 e5 Nf3").
+- **Tracking resumes after a move typed by hand:** the next still picture is adopted and learned, and nothing
+  beyond one reply is believed right after it, so one odd square can no longer lead to invented moves.
+- **`--record` and `--replay`, to look into test sessions:** with `--record` (and `--record-dir`, `--record-every`)
+  every game gets a folder named after its start (date and time) with still pictures of what the detection saw,
+  the decisions it took and what the people did (moves typed, undo, calibration). `--replay <folder>` runs it
+  through the detection again, without camera or page, and compares what it finds with what happened; the tuning
+  flags replace the recorded ones, so a change can be tried on real pictures. The Windows package has a
+  `Start NicoChess (record).bat` launcher for testers.
+- Tuning flags: `--max-cost` is replaced by `--max-excess`, and `--max-plies` is new.
+- `examples/stress.rs`: a benchmark that plays whole games on synthetic pictures under drifting light, glare,
+  leaning pieces, darkness, noise and unphotographed moves (see ENVIRONMENT.md). Synthetic only: nothing has run
+  on a real board yet.
+
 ## 0.2.0
 
 First numbered version. Everything since the first working program:

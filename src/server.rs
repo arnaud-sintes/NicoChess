@@ -358,11 +358,21 @@ mod tests {
     }
 
     fn rig(name: &str, source: SourceSpec) -> Rig {
+        rig_with(name, source, Duration::from_millis(5), false)
+    }
+
+    /// `record`: every game is recorded in the folder `recordings` of the rig, every picture the tracker sees.
+    fn rig_with(name: &str, source: SourceSpec, frame_interval: Duration, record: bool) -> Rig {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::open(&dir.join("games")).unwrap();
-        let engine = Engine::new(EngineConfig::default(), store, dir.join("calibration.json"), None);
-        engine.spawn_capture(camera::factory(source, Duration::from_millis(5))).unwrap();
+        // Every picture, and none dropped whatever the load of the machine running the tests.
+        let record = record.then(|| crate::record::RecordOptions {
+            backlog: 100_000,
+            ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
+        });
+        let engine = Engine::new(EngineConfig { record, ..EngineConfig::default() }, store, dir.join("calibration.json"), None);
+        engine.spawn_capture(camera::factory(source, frame_interval)).unwrap();
         let handler = handler(Arc::clone(&engine), 8);
         Rig { engine, handler, dir }
     }
@@ -839,7 +849,7 @@ mod tests {
         // The second move is illegal: the first is not kept either.
         assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "Nf3 Nf3"}"#).0, 400);
         assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 2);
-        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "Nf3 Nc6 Bb5"}"#).0, 400, "three at once is too many");
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "Nf3 Nc6 Bb5 a6"}"#).0, 400, "four at once is too many");
         assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move": "   "}"#).0, 400);
         assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 2);
     }
@@ -905,6 +915,93 @@ mod tests {
         assert_eq!(state["mode"], "playing");
         assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 32);
         assert_eq!(state["game"]["over"], false);
+    }
+
+    #[test]
+    fn a_recorded_game_is_kept_in_a_folder_and_a_replay_of_it_finds_the_same_moves() {
+        use crate::replay::{TrackerOverrides, replay_folder};
+        // Slow enough for the disk of any machine: every picture the tracker sees is kept.
+        let rig = rig_with("recording", SourceSpec::Demo { move_interval: Duration::from_millis(600) }, Duration::from_millis(100), true);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
+
+        // One folder, named after the start; the recording is closed by its own thread a moment after the game.
+        let folders: Vec<_> = std::fs::read_dir(rig.dir.join("recordings")).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(folders.len(), 1, "{folders:?}");
+        let folder = folders[0].clone();
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.len() == 19 && name.as_bytes()[10] == b'_', "{name}");
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let kind = |e: &Value| e["type"].as_str().unwrap().to_string();
+        let moves: usize = events.iter().filter(|e| kind(e) == "detect").map(|e| e["moves"].as_array().unwrap().len()).sum();
+        assert_eq!(moves, 33, "every move of the game is in the recording");
+        let ends: Vec<&Value> = events.iter().filter(|e| kind(e) == "end").collect();
+        assert_eq!(ends.len(), 1);
+        assert_eq!((ends[0]["result"].as_str(), ends[0]["reason"].as_str()), (Some("1-0"), Some("checkmate")));
+        assert_eq!(kind(events.last().unwrap()), "closed");
+        assert_eq!(events.last().unwrap()["dropped"], 0, "no picture was lost");
+        let session: crate::record::SessionMeta = serde_json::from_slice(&std::fs::read(folder.join("session.json")).unwrap()).unwrap();
+        assert_eq!(session.game_id, "undated", "the page gave no start time");
+        assert_eq!(session.calibration.map(|c| (c.corners, c.size)), Some((synthetic::corners().corners, Some([640, 480]))));
+        assert!(session.source.contains("demo"), "{}", session.source);
+
+        // The replay goes through the same pictures and gets to the same game.
+        let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        assert_eq!(report.summary.wrong, 0, "{}", report.text);
+        assert_eq!(report.summary.behind, 0, "{}", report.text);
+        assert_eq!((report.summary.live_typed, report.summary.live_undone), (0, 0));
+        assert!(report.summary.found > 0 && report.summary.pictures >= 33, "{}", report.text);
+    }
+
+    #[test]
+    fn what_the_players_do_is_in_the_recording_with_the_position_after_it() {
+        let rig = rig_with("recording-manual", SourceSpec::Synthetic, Duration::from_millis(60), true);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        rig.call("POST", "/api/calibration", ALICE, &corners_json());
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move":"e2e4"}"#).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move":"e5 Nf3"}"#).0, 200, "two moves at once");
+        assert_eq!(rig.call("POST", "/api/game/undo", ALICE, "").0, 200);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"0-1","reason":"resignation"}"#).0, 200);
+
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let people: Vec<&Value> = events.iter().filter(|e| e["type"] != "frame" && e["type"] != "closed").collect();
+        let kinds: Vec<&str> = people.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["manual", "manual", "undo", "end"], "{people:?}");
+        assert_eq!(people[0]["text"], "e2e4");
+        assert_eq!(people[1]["text"], "e5 Nf3");
+        // The position after each: the replay and the people reading it look at these.
+        assert!(people[0]["fen"].as_str().unwrap().starts_with("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b "), "{}", people[0]["fen"]);
+        assert!(
+            people[1]["fen"].as_str().unwrap().starts_with("rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b "),
+            "{}",
+            people[1]["fen"]
+        );
+        assert!(
+            people[2]["fen"].as_str().unwrap().starts_with("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w "),
+            "e5 stays after the undo of Nf3: {}",
+            people[2]["fen"]
+        );
+        assert_eq!((people[3]["result"].as_str(), people[3]["reason"].as_str()), (Some("0-1"), Some("resignation")));
+        // Times are in order.
+        let times: Vec<f64> = events.iter().map(|e| e["t"].as_f64().unwrap()).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::calibration::Calibration;
 use crate::camera::{self, SourceSpec};
 use crate::engine::{Engine, EngineConfig};
 use crate::http::Handler;
+use crate::record::RecordOptions;
 use crate::tracker::TrackerConfig;
 use crate::{http, server, store::Store};
 use anyhow::Result;
@@ -32,6 +33,8 @@ pub struct ServerOptions {
     pub game_timeout: Duration,
     /// Open pages allowed at once.
     pub max_viewers: usize,
+    /// Keep a recording of every game (the command-line option --record); the Android app has none.
+    pub record: Option<RecordOptions>,
 }
 
 /// The engine is running and the web handler is ready; nothing listens yet.
@@ -64,6 +67,7 @@ pub fn build(options: ServerOptions) -> Result<Built> {
         game_timeout: options.game_timeout,
         tracker: options.tracker,
         track_interval: options.track_interval,
+        record: options.record,
     };
     let engine = Engine::new(config, store, options.calibration_path, calibration);
     engine.spawn_capture(camera::factory(options.source, options.frame_interval))?;
@@ -114,6 +118,7 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
             game_timeout: Duration::from_secs(60),
             max_viewers: 4,
+            record: None,
         };
         let built = build(options).expect("the program starts without a calibration");
         let reply = (built.handler)(Request::for_test("GET", "/api/state?token=", &[], ""));

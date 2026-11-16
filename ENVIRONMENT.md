@@ -82,11 +82,50 @@ cargo run --release -- --probe                # list the cameras, formats and co
 cargo run --release -- --device 0 --width 1280 --height 720 --open    # Windows webcam (Linux: --device /dev/video0)
 ```
 
-`--open` opens the page in the browser of this computer. Default address `0.0.0.0:8080`; on Windows, if that port is reserved or taken, the program takes the next free one among 28080-28089, then any, and prints the addresses. For tests and scripts give the address yourself: `--listen 127.0.0.1:28080`. `--data-dir` and `--calibration` default to the current folder (`./data`, `./calibration.json`); `picture.json` goes next to the calibration file. `--help` lists every option, including the tuning flags (`--stable-frames`, `--motion-threshold`, `--max-cost`, `--margin`).
+`--open` opens the page in the browser of this computer. Default address `0.0.0.0:8080`; on Windows, if that port is reserved or taken, the program takes the next free one among 28080-28089, then any, and prints the addresses. For tests and scripts give the address yourself: `--listen 127.0.0.1:28080`. `--data-dir` and `--calibration` default to the current folder (`./data`, `./calibration.json`); `picture.json` goes next to the calibration file. `--help` lists every option, including the tuning flags (`--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--max-plies`).
+
+## Record and replay a game (investigating a bad session, tuning the detection)
+
+`--record` keeps a recording of every game. At the start of each game (new, resumed, or reopened by undo) a folder
+named after the start, `2026-11-16_11-30-05` (the clock of the PC on Windows, UTC on other systems; `session.json`
+has both), is made in `--record-dir` (default `./recordings`; the Windows package's `Start NicoChess (record).bat`
+uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
+
+- `session.json`: the program and commit, the source, the calibration, the picture settings, the tracker settings
+  and the position the tracker started from.
+- `frames/000001.jpg`, ...: the pictures the detection was given, as it saw them (turned and adjusted). One every
+  `--record-every` seconds (default 2) while the board is quiet, and every picture while something happens (learning,
+  a hand moving, unsure, a move found). `--record-every 0` keeps every picture. Roughly 100 KB each at 1280x720.
+- `events.jsonl`: what happened, in order, with `t` in seconds: `frame` (file and the tracker's status), `detect` (the
+  moves found and the position after them), `unsure` (the candidates offered), `rejected`, `manual` (a move typed by
+  hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`.
+
+`--replay <folder>` needs no camera and starts no page. It runs the pictures through the current tracker at their
+recorded times, applies what the people did, and prints what the replay found beside what happened, with the picture
+file of each line, then a summary: how many moves the program found and how many were typed during the game, and
+how many detections of the replay fit the game, how many do not, and at how many places the replay was behind (the
+number of moves it would have made someone type). The recorded game is the truth. A folder that holds recordings is
+replayed recording by recording. The tuning options replace the recorded ones, to try a change on real pictures
+(`--replay recordings\2026-11-16_11-30-05 --max-excess 80 --margin 9`); `--replay-verbose` also lists every change of
+status and every list of candidates. Open the picture files named in the report to see what the camera saw.
+
+Limits: a replay sees only the pictures that were kept, so with the default spacing it follows the live run closely
+only around moves (where every picture is kept); use `--record-every 0` for a faithful replay of a short session. A
+move that the people undid after the program found it counts as played. When the disk is too slow, pictures are
+dropped (the end of the replay report says so) and the game is never delayed. Recordings show whatever the camera
+sees: they stay on the PC, and look at them before sending them anywhere.
 
 ## Test
 
 - `cargo test` at the root. It covers: the chess rules and PGN, the vision and tracker on synthetic pictures (a whole game of 33 plies), board auto-detection (also rotated, noisy, scaled), picture settings, atomic file writes, the HTTP server (including the stoppable listener), and the engine through the API (roles, calibration, pictures, streams, a game from the demo camera to a PGN, resume, stabilization). It takes about a minute because the engine tests run real capture threads.
+- `cargo run --release --example stress` measures how well the tracker follows whole games on synthetic pictures
+  with a poor camera: `easy`, `drift` (fading, warming light and a moving shadow), `hard` (plus glare and leaning
+  pieces), `dark`, `noisy`, and `catch-up` (every fifth move is never photographed). A simulated person types the
+  move whenever the tracker is unsure or wrong. It prints, per game, how many plies were found by themselves, how
+  many were wrong, how many had to be typed, and the longest run of typed moves. It takes some minutes.
+  `STRESS_ONLY=hard,dark` runs some scenarios, `STRESS_VERBOSE=1` lists each failure, `STRESS_MARGIN=9` tries another
+  `--margin`. Run it after any change to `vision.rs` or `tracker.rs`; the pictures are synthetic, so the numbers
+  say that nothing got worse, not how a real board and camera behave.
 - Temporary folders are `nicochess-<name>-<pid>` under the system temp folder and are removed afterwards.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` must pass; CI runs them with the tests (`--locked`), on Linux and Windows.
 - Android (Kotlin and JNI) has no unit tests: the Docker build is the compile check, and a run on a phone is the real test (not done yet).

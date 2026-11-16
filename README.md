@@ -39,9 +39,10 @@ Everything is built and tested on a PC with a synthetic camera. The integrated w
 | Stabilization: during a game the calibration follows the board if the camera shifts a little (can be switched off) | Tried only on synthetic pictures: not yet on a real board |
 | Camera and top-down pictures pushed as Motion JPEG streams (no polling) | Speed of the preview on a real phone not measured: see the figures under the picture |
 | Per-square empty / white / black detection, learned from the known start position | |
-| Stability gate and legal-move matching, with castling, en passant, promotion; two moves played between two pictures; draws by repetition and the 50/75-move rules (claim button for the claimable ones) | |
+| Stability gate and legal-move matching, with castling, en passant, promotion; up to three moves played between two pictures; squares are learned per square and keep adapting to the light, and tracking resumes by itself after a move typed by hand; draws by repetition and the 50/75-move rules (claim button for the claimable ones) | Tuned on synthetic pictures only (`examples/stress.rs`); not yet measured on a real board |
 | Live board and move list with timestamps (offsets from the start of the game) | |
 | Manual corrections: undo, enter a move, pick among candidates, change a promotion | |
+| Recording of games for debugging (`--record`: still pictures, decisions and corrections in a folder per game) and `--replay` of it through the detection, with other tuning values if wanted. Windows package: `Start NicoChess (record).bat` | Command line and Windows tested on the demo source; not yet on a real camera |
 | End of game by the rules, or by resignation, draw, abort | |
 | Games stored as JSON, list by date, replay (real time, as fast as possible, step by step), PGN export | |
 | 32-bit Linux build, run in a Debian 12 i386 container | Run on the INEOS 600 |
@@ -145,7 +146,7 @@ The long version, with the threads and the files, is in [ARCHITECTURE.md](ARCHIT
 | `src/calibration.rs` | Corner validation, save/load, warp to the top-down board |
 | `src/boarddetect.rs` | Finds the board by itself (inner corners of the squares, lattice fit) and follows it when the camera moves |
 | `src/picture.rs` | Turn, brightness, contrast, and the follow switch, saved in `picture.json` |
-| `src/vision.rs` | Per-square sampling and the learned classifier |
+| `src/vision.rs` | Per-square sampling (block-averaged, eight numbers per square) and the per-square models that keep learning |
 | `src/tracker.rs` | Stability gate and the match of the board to a legal move |
 | `src/game.rs` | Game record, SAN/UCI, PGN export |
 | `src/store.rs` | One JSON file per game |
