@@ -17,8 +17,12 @@ No camera at hand? "Demo (no camera).bat" plays a whole game on a drawn board.
 Testing? Start with "Start NicoChess (record).bat" instead: it does the same and also
 records every game for debugging (see Recordings below).
 
-Another camera: "List cameras.bat" shows what Windows offers; then start with its
-number, for example:  Start NicoChess.bat 1
+Another camera (a laptop with a built-in camera and a USB one, for example): on the page,
+Calibrate > Camera, pick it in the list (not during a game). The choice is remembered
+by the camera's name, so it is used again next time even if Windows numbers the
+cameras differently. Changing the camera forgets the calibration of the board.
+You can also start with a camera number:  Start NicoChess.bat 1  ("List cameras.bat"
+shows the numbers); a number given this way beats the remembered choice.
 
 From a phone or tablet
 ----------------------

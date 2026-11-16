@@ -7,6 +7,7 @@
 use crate::boarddetect;
 use crate::calibration::{self, Calibration};
 use crate::camera::SourceFactory;
+use crate::choice::CameraSelection;
 use crate::game::{self, GameRecord};
 use crate::picture::{self, Picture};
 use crate::record::{RecordOptions, Recorder, SessionMeta};
@@ -84,6 +85,8 @@ pub struct EngineConfig {
     pub track_interval: Duration,
     /// Keep a recording of every game for later investigation (see `record`).
     pub record: Option<RecordOptions>,
+    /// The camera in use, when the page may choose among the cameras of the computer (see `choice`).
+    pub camera: Option<Arc<CameraSelection>>,
 }
 
 impl Default for EngineConfig {
@@ -94,6 +97,7 @@ impl Default for EngineConfig {
             tracker: TrackerConfig::default(),
             track_interval: Duration::ZERO,
             record: None,
+            camera: None,
         }
     }
 }
@@ -295,6 +299,9 @@ pub struct Engine {
     hub: Hub,
     clients: AtomicUsize,
     restart_source: AtomicBool,
+    /// Set when another camera was chosen: the capture loop closes the camera and opens the new one at once.
+    reopen_source: AtomicBool,
+    camera: Option<Arc<CameraSelection>>,
     store: Store,
     calibration_path: PathBuf,
     picture_path: PathBuf,
@@ -371,6 +378,8 @@ impl Engine {
             hub: Hub { subscribers: Mutex::new(Vec::new()) },
             clients: AtomicUsize::new(0),
             restart_source: AtomicBool::new(false),
+            reopen_source: AtomicBool::new(false),
+            camera: config.camera,
             store,
             calibration_path,
             picture_path,
@@ -402,10 +411,17 @@ impl Engine {
                     wanted = self.camera_cv.wait(wanted).unwrap_or_else(PoisonError::into_inner);
                 }
             }
+            // A choice of camera made while it was off needs no reopening: it is opened now.
+            self.reopen_source.store(false, Ordering::SeqCst);
+            let mut reopening = false;
             match factory() {
                 Ok(mut source) => {
                     self.set_source(source.describe());
                     while self.camera_is_wanted() {
+                        if self.reopen_source.swap(false, Ordering::SeqCst) {
+                            reopening = true;
+                            break;
+                        }
                         if self.restart_source.swap(false, Ordering::SeqCst) {
                             source.restart();
                         }
@@ -427,7 +443,7 @@ impl Engine {
             }
             *self.frame.write_ok() = None;
             self.set_source(String::new());
-            if self.camera_is_wanted() {
+            if self.camera_is_wanted() && !reopening {
                 thread::sleep(CAMERA_RETRY);
             }
         }
@@ -856,6 +872,7 @@ impl Engine {
             "camera": {
                 "on": frame.is_some() || inner.mode != Mode::Idle,
                 "source": inner.source,
+                "choice": self.camera.is_some(),
                 "error": inner.camera_error,
                 "width": frame.as_ref().map_or(0, |f| f.image.width()),
                 "height": frame.as_ref().map_or(0, |f| f.image.height()),
@@ -1100,13 +1117,59 @@ impl Engine {
         if inner.mode == Mode::Playing {
             return Err(ApiError::Conflict("a game is running".into()));
         }
+        self.forget_calibration(&mut inner)?;
+        drop(inner);
+        self.hub.notify();
+        Ok(())
+    }
+
+    fn forget_calibration(&self, inner: &mut Inner) -> ApiResult {
         match std::fs::remove_file(&self.calibration_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(ApiError::Internal(format!("cannot delete the calibration file: {e}"))),
         }
         inner.calibration = None;
+        inner.follow_anchor = None;
         inner.tracker.set_calibration(None);
+        Ok(())
+    }
+
+    // ---- Choice of camera --------------------------------------------------------
+
+    /// The cameras of the computer, and the one in use, for the page. `selectable` is false when this program
+    /// has no choice to offer (another system, another source).
+    pub fn cameras(&self) -> Value {
+        let Some(selection) = &self.camera else { return json!({"selectable": false, "cameras": [], "selected": null}) };
+        match selection.list() {
+            Ok(cameras) => json!({"selectable": true, "cameras": cameras, "selected": selection.device()}),
+            Err(e) => json!({"selectable": true, "cameras": [], "selected": selection.device(), "error": format!("{e:#}")}),
+        }
+    }
+
+    /// Uses another camera. It is opened at once if the camera is on, and chosen again at the next start.
+    /// The calibration was made on the picture of the other camera, so it is forgotten.
+    pub fn select_camera(&self, token: &str, id: &str) -> ApiResult {
+        let Some(selection) = &self.camera else {
+            return Err(ApiError::Conflict("there is no choice of camera here".into()));
+        };
+        let refuse_when_playing = |inner: &Inner| {
+            if inner.mode == Mode::Playing { Err(ApiError::Conflict("a game is running: end it first".into())) } else { Ok(()) }
+        };
+        refuse_when_playing(&*self.controlled(token)?)?;
+        // Looking for the cameras takes a moment: not under the lock.
+        let camera = selection.find(id).map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
+        let mut inner = self.controlled(token)?;
+        refuse_when_playing(&inner)?;
+        if selection.device() == camera.id {
+            return Ok(());
+        }
+        selection.store(&camera).map_err(ApiError::internal)?;
+        if inner.calibration.is_some() {
+            self.forget_calibration(&mut inner)?;
+        }
+        inner.camera_error = None;
+        self.reopen_source.store(true, Ordering::SeqCst);
         drop(inner);
         self.hub.notify();
         Ok(())

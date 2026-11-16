@@ -174,7 +174,14 @@ pub struct CameraSettings {
 pub use v4l_camera::{V4lCamera, probe};
 
 #[cfg(windows)]
-pub use windows_camera::{WindowsCamera, probe};
+pub use windows_camera::{WindowsCamera, list_cameras as system_cameras, probe};
+
+/// The cameras of this computer that the page can choose among. Only Windows has the choice for now (Linux
+/// is given a device on the command line, and the Android app has its own).
+#[cfg(not(windows))]
+pub fn system_cameras() -> Result<Vec<crate::choice::CameraInfo>> {
+    Ok(Vec::new())
+}
 
 /// Prints what a camera offers. Only available on Linux and Windows.
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -233,6 +240,12 @@ mod windows_camera {
                 }
                 unique
             })
+    }
+
+    /// The cameras Windows offers, with the number that `--device` takes.
+    pub fn list_cameras() -> Result<Vec<crate::choice::CameraInfo>> {
+        let cameras = nokhwa::query(BACKEND).map_err(|e| anyhow::anyhow!("cannot list the cameras: {e}"))?;
+        Ok(cameras.iter().map(|info| crate::choice::CameraInfo { id: info.index().to_string(), name: info.human_name() }).collect())
     }
 
     pub fn probe(device: &str) -> Result<String> {
@@ -734,9 +747,25 @@ pub enum SourceSpec {
 pub type SourceFactory = Box<dyn Fn() -> Result<Box<dyn FrameSource>> + Send + Sync>;
 
 pub fn factory(spec: SourceSpec, interval: Duration) -> SourceFactory {
+    factory_with(spec, interval, None)
+}
+
+/// Like [`factory`]; when a camera is opened, the one that `selection` names at that moment is used, so that
+/// the person can change it from the page.
+pub fn factory_with(
+    spec: SourceSpec,
+    interval: Duration,
+    selection: Option<std::sync::Arc<crate::choice::CameraSelection>>,
+) -> SourceFactory {
     Box::new(move || -> Result<Box<dyn FrameSource>> {
         match &spec {
-            SourceSpec::Camera(settings) => open_camera(settings),
+            SourceSpec::Camera(settings) => {
+                let mut settings = settings.clone();
+                if let Some(selection) = &selection {
+                    settings.device = selection.device();
+                }
+                open_camera(&settings)
+            }
             SourceSpec::Synthetic => Ok(Box::new(Synthetic::new(interval))),
             SourceSpec::Demo { move_interval } => Ok(Box::new(DemoGame::new(interval, *move_interval))),
             SourceSpec::Image(path) => Ok(Box::new(StillImage::open(path, interval)?)),

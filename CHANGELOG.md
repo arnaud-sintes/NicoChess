@@ -5,6 +5,15 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.4.0
+
+- **Camera chooser on the page (Windows):** with several cameras (a built-in one and a USB one, say) the page
+  lists them under Calibrate > Camera and switches to the one picked, at once if the camera is on. Not during a
+  game. The choice is kept by the camera's name in `camera.json`, so it is found again at the next start even if
+  Windows numbers the cameras differently; `--device N` on the command line still wins. The calibration belongs
+  to the picture of one camera, so changing the camera forgets it. New routes: `GET /api/camera/list`,
+  `POST /api/camera/select`.
+
 ## 0.3.0
 
 Move detection that keeps working as a game goes on (testers reported that it lost track and needed every

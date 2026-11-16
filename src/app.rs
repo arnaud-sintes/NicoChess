@@ -5,6 +5,7 @@
 
 use crate::calibration::Calibration;
 use crate::camera::{self, SourceSpec};
+use crate::choice::CameraSelection;
 use crate::engine::{Engine, EngineConfig};
 use crate::http::Handler;
 use crate::record::RecordOptions;
@@ -35,6 +36,9 @@ pub struct ServerOptions {
     pub max_viewers: usize,
     /// Keep a recording of every game (the command-line option --record); the Android app has none.
     pub record: Option<RecordOptions>,
+    /// Use the camera the person chose last time from the page (`camera.json` next to the calibration), unless
+    /// the camera was named on the command line (`--device`).
+    pub remember_camera: bool,
 }
 
 /// The engine is running and the web handler is ready; nothing listens yet.
@@ -62,15 +66,27 @@ pub fn build(options: ServerOptions) -> Result<Built> {
     let store = Store::open(&options.data_dir)?;
     eprintln!("store: games are kept in {}", options.data_dir.display());
 
+    // With a camera of this computer the page may choose among them (Windows); the choice is kept.
+    let camera = match &options.source {
+        SourceSpec::Camera(settings) => {
+            let selection = CameraSelection::new(settings.device.clone(), Some(options.calibration_path.with_file_name("camera.json")));
+            if options.remember_camera {
+                selection.restore();
+            }
+            Some(Arc::new(selection))
+        }
+        _ => None,
+    };
     let config = EngineConfig {
         idle_timeout: options.idle_timeout,
         game_timeout: options.game_timeout,
         tracker: options.tracker,
         track_interval: options.track_interval,
         record: options.record,
+        camera: camera.clone(),
     };
     let engine = Engine::new(config, store, options.calibration_path, calibration);
-    engine.spawn_capture(camera::factory(options.source, options.frame_interval))?;
+    engine.spawn_capture(camera::factory_with(options.source, options.frame_interval, camera))?;
 
     // A page holds up to three long connections (events, camera picture, top-down board) and
     // makes ordinary requests besides: leave room for all of that.
@@ -119,6 +135,7 @@ mod tests {
             game_timeout: Duration::from_secs(60),
             max_viewers: 4,
             record: None,
+            remember_camera: false,
         };
         let built = build(options).expect("the program starts without a calibration");
         let reply = (built.handler)(Request::for_test("GET", "/api/state?token=", &[], ""));

@@ -86,7 +86,10 @@ fn run() -> Result<()> {
     let listen_option: Option<String> = args.opt_value_from_str("--listen")?;
     let source: String = args.opt_value_from_str("--source")?.unwrap_or_else(|| "camera".into());
     let default_device = if cfg!(windows) { "0" } else { "/dev/video0" };
-    let device: String = args.opt_value_from_str("--device")?.unwrap_or_else(|| default_device.into());
+    let device_option: Option<String> = args.opt_value_from_str("--device")?;
+    // Without --device the camera chosen last time on the page is used (if it is still there).
+    let remember_camera = device_option.is_none();
+    let device: String = device_option.unwrap_or_else(|| default_device.into());
     let width: u32 = args.opt_value_from_str("--width")?.unwrap_or(640);
     let height: u32 = args.opt_value_from_str("--height")?.unwrap_or(480);
     let fps: f32 = args.opt_value_from_str("--fps")?.unwrap_or(3.0);
@@ -196,6 +199,7 @@ fn run() -> Result<()> {
         game_timeout: Duration::from_secs(game_mins * 60),
         max_viewers,
         record: record.then(|| RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))),
+        remember_camera,
     };
     app::serve_on(options, listener, on_ready)
 }

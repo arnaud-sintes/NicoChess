@@ -208,6 +208,7 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
             game_timeout: Duration::from_secs(30 * 60),
             max_viewers: 8,
             record: None,
+            remember_camera: false,
         };
         // Take the port first: if it is not free, nothing else has been built yet.
         let listener = match http::bind_first(&[options.listen.clone()]) {

@@ -212,6 +212,8 @@
       <h2>Camera</h2>
       <div id="cal-viewer" class="muted" hidden>Only the controller can calibrate.</div>
       <div id="cal-controls">
+        <label class="check" id="cam-choose-row" hidden>Camera <select id="cam-select"></select> <button id="cam-refresh" title="Look for the cameras again">Refresh</button></label>
+        <div class="muted small" id="cam-choose-info"></div>
         <div class="bar">
           <button id="cal-open" class="primary">Open the camera</button>
           <button id="cal-detect" class="primary" hidden title="Look for the chessboard in the picture and calibrate with it">Auto-detect the board</button>
@@ -517,6 +519,7 @@ function showTab(name) {
   document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
   for (const t of ['live', 'games', 'calibrate']) $('tab-' + t).hidden = t !== name;
   if (name === 'games') refreshGames();
+  if (name === 'calibrate') camRefresh();
   cameraLoops();
   renderCalibrate(S && S.role === 'controller');
 }
@@ -548,7 +551,7 @@ function renderCalibrate(ctl) {
   $('warp-card').hidden = !(cameraOn && S.calibration);
   $('picture-card').hidden = !(cameraOn && ctl && S.mode !== 'playing');
   showPicture();
-  if (tab === 'calibrate') andRender();
+  if (tab === 'calibrate') { andRender(); camRender(); }
   if (!cameraOn) { clicks = []; calNote = null; }
   if (cameraOn && ctl && !clicks.length && calNote) {
     $('cal-msg').className = 'status' + (calNote.bad ? ' unsure' : '');
@@ -664,6 +667,54 @@ setInterval(async () => {
     $('cam-stats').textContent = r.fps.toFixed(1) + ' pictures/s from the camera · ' + r.process_ms.toFixed(0) + ' ms to process · ' + r.encode_ms.toFixed(0) + ' ms to compress';
   } catch (e) { /* the next time */ }
 }, 1500);
+
+// ---------- choosing the camera of this computer (Windows) ----------
+// The server says whether it offers the choice (S.camera.choice) and lists the cameras it finds. The Android app
+// has its own choice, below.
+let camList = null, camSignature = '';
+async function camRefresh() {
+  if (!S || !S.camera || !S.camera.choice || S.role !== 'controller') { camList = null; camRender(); return; }
+  try { camList = await (await fetch('/api/camera/list')).json(); } catch (e) { return; }
+  camRender();
+}
+function camRender() {
+  const sel = $('cam-select');
+  const ok = !!(S && S.camera && S.camera.choice && S.role === 'controller' && camList && camList.selectable);
+  const list = ok ? camList.cameras : [];
+  $('cam-choose-row').hidden = list.length < 2;
+  const playing = !!S && S.mode === 'playing';
+  if (list.length >= 2) {
+    const signature = list.map(c => c.id + c.name).join('|') + '/' + camList.selected;
+    if (signature !== camSignature && document.activeElement !== sel) {
+      camSignature = signature;
+      sel.innerHTML = list.map(c => '<option value="' + esc(c.id) + '">' + esc(c.id + ': ' + c.name) + '</option>').join('');
+      sel.value = camList.selected;
+    }
+  }
+  sel.disabled = playing;
+  $('cam-refresh').disabled = playing;
+  $('cam-choose-info').textContent = !ok ? ''
+    : camList.error ? 'Cannot list the cameras: ' + camList.error
+    : playing ? 'The camera cannot be changed during a game.'
+    : list.length >= 2 ? 'Changing the camera forgets the calibration of the board: calibrate again.'
+    : list.length === 1 ? 'One camera found: ' + list[0].name + '.'
+    : 'No camera found: is it plugged in, and allowed in Settings > Privacy > Camera?';
+}
+$('cam-select').onchange = async () => {
+  const sel = $('cam-select');
+  if (S && S.calibration && !confirm('Changing the camera forgets the calibration of the board. Go on?')) {
+    sel.value = camList ? camList.selected : sel.value;
+    return;
+  }
+  await api('POST', '/api/camera/select', { id: sel.value });
+  // Whatever the server answered, show what it uses now.
+  sel.blur();
+  camSignature = '';
+  camRefresh();
+};
+$('cam-refresh').onclick = camRefresh;
+// A USB camera can be plugged in or pulled out while the page is open.
+setInterval(() => { if (tab === 'calibrate' && !document.hidden && document.activeElement !== $('cam-select')) camRefresh(); }, 5000);
 
 // ---------- the Android app: remote server, camera choice ----------
 // Only the WebView of the app has window.NicoAndroid; in a browser the card stays hidden.

@@ -45,6 +45,7 @@
 | `store.rs` | One JSON file per game, ids, listing |
 | `build.rs` (root) | Adds the git commit to the program (`COMMIT`, with `VERSION` from Cargo.toml: `lib.rs`) |
 | `fsutil.rs` | `write_atomic`: temporary file, flush to disk, rename |
+| `choice.rs` | The camera in use and the cameras there are (`CameraSelection`): shared by the engine (the page changes it) and the source factory (reads it at each opening); kept by name in `camera.json`. Windows only for now: elsewhere the list is empty and the page offers nothing |
 | `record.rs` | Recording of a game (`--record`): a folder per game with `session.json`, `frames/*.jpg` and `events.jsonl`, written by its own thread so that the capture path never waits for the disk; date and time of the start without a library (Windows local time through one `GetLocalTime` call) |
 | `replay.rs` | Replay of a recording (`--replay`): feeds the pictures to the tracker at their recorded times, applies what the people did, and reports how the result compares with what happened; the tuning options replace the recorded ones |
 | `roles.rs` | Controller and viewer, tokens, expiry |
@@ -106,6 +107,7 @@ State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, 
 | `games/<id>.json` | `--data-dir` (Android: `filesDir/games`; Windows package: `%LOCALAPPDATA%\NicoChess\games`; Linux service: `/var/lib/nicochess/games`) | One game: version, start date, names, start FEN, moves (SAN, UCI, time offset), result, termination. Id = digits of the browser's start time (`YYYYMMDDTHHMMSS`, `-2` on a clash, `undated` otherwise) |
 | `calibration.json` | `--calibration` (default `./calibration.json`) | Corners a1, h1, h8, a8 in pixels of the rotated picture, and the size of the picture they were made for. The engine warns when the picture has another size |
 | `picture.json` | next to `calibration.json` | Rotation, brightness, contrast, the follow switch |
+| `camera.json` | next to `calibration.json` | The camera chosen on the page (Windows): its number and its name. At start the name is looked for again, since Windows may number the cameras differently; `--device` beats it |
 
 | `<recording-dir>/<date>_<time>/` | `--record-dir` (default `./recordings`; Windows record launcher: `%LOCALAPPDATA%\NicoChess\recordings`) | Only with `--record`: one folder per game played. `session.json` (program version, start time, source, calibration, picture settings, tracker settings, start position), `frames/NNNNNN.jpg` (the pictures the detection saw), `events.jsonl` (one JSON line each: `frame`, `detect`, `unsure`, `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`). Format number in `record::FORMAT` |
 

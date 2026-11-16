@@ -49,7 +49,8 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
   people did, and `--replay` to run it through the detection again, also with other tuning values. For finding out
   why a move was missed in a test session and for tuning on real pictures; it is not a video of the game.
 - **Games**: one JSON file per game, a list by date, replay, PGN export, resume of an unfinished game after a restart.
-- **Remote server and camera choice** (Android): see above.
+- **Camera choice**: on Windows the page lists the cameras of the computer (Calibrate > Camera) and switches to the one
+  picked, not during a game; the choice is kept by the camera's name. On Android: see above, with the remote server.
 
 ## Non-goals
 
