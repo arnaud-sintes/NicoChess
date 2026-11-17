@@ -1,175 +1,160 @@
 # NicoChess
 
-Monitor a real chessboard with a USB webcam and track the game automatically.
+NicoChess watches a real chessboard with a camera (or two), works out the moves with the rules of chess, records the
+game and shows it live, and afterwards in replay, on a web page for a phone, a tablet or a PC. Everything runs offline,
+in one small program.
 
-## Goal
+Play on a normal board with normal pieces. Point a camera at it, calibrate once, press Start. The moves appear on the
+page with their times, the game is saved, and it can be exported as PGN.
 
-An old webcam on a tripod looks at the board at about 45° vertical tilt and about 20° lateral offset.
-Software on a small PC captures frames, works out the moves, applies the chess rules and records the game.
-Implementation language: Rust.
+## How it works
 
-The target machine runs headless. A USB Wi-Fi dongle will expose its own access point, so a phone or tablet
-can join it, open a web page, start a game and see the board and the moves live.
+The camera cannot tell a knight from a bishop, and does not have to. For each of the 64 squares the program only asks
+whether it looks empty, white or black, using a model of that square that is learned from the known starting position
+and keeps adapting to the light. The program itself knows the rules and the position, so it knows the piece types.
+After each pause in the movement it scores every way the game may have gone on (no move, any legal move, up to three
+moves played between two pictures) by how well the picture fits, and takes the likeliest one when it is clearly ahead.
+
+- **Not sure?** A move that leads only narrowly is taken anyway and flagged under the board ("Not completely sure about
+  d4, 78%"), with the other likely moves and their chances as buttons that replace it, and an Undo. When nothing is
+  likely enough the page asks. Moves can always be typed, and tracking resumes by itself afterwards.
+- **One camera or two.** A second camera on the opposite side sees what the first cannot: the squares hidden by a hand,
+  an arm or a tall piece. With one camera nothing changes ([Two cameras](#two-cameras)).
+- **Follows a board that moves.** During a game the calibration follows the board if the camera or the board shifts a
+  little.
+- **Records what it saw.** `--record` keeps the pictures, the decisions and the corrections of each game, and `--replay`
+  runs them through the detection again, with other tuning values if wanted ([Record and replay](#record-and-replay)).
+
+## Where it runs
+
+| | |
+|---|---|
+| **Windows PC** | The main target. `NicoChess-windows.zip`: unzip and double-click, nothing to install (under 1 MB). Webcams through Media Foundation; the page lets you choose among the cameras of the computer |
+| **Android phone or tablet** | An app that is both camera and screen: the server runs inside it and the page is shown in it. It keeps recording with the screen off, and can let other devices connect |
+| **Linux** | The same program as a service on a headless box (32-bit i386 build for small machines), reached from a phone or a tablet; V4L2 cameras ([PLAN.md](PLAN.md)) |
+
+## Quick start
+
+**Without a camera**, to see everything work: download `NicoChess-windows.zip` from the
+[latest release](https://github.com/arnaud-sintes/NicoChess/releases/latest), unzip it and double-click
+**Demo (no camera).bat** (or `cargo run --release -- --source demo` from the source). Open the address it prints, then:
+
+1. **Calibrate** > **Open the camera** > **Auto-detect the board** (or click the four corners a1, h1, h8, a8, counter-clockwise on the picture).
+2. **Live** > **Start game**. A whole game (Morphy's "Opera game", 33 plies) is played by a drawn board and ends in checkmate.
+3. **Games** to replay it, or download the PGN.
+
+**With a camera:** double-click **Start NicoChess.bat** (`Start NicoChess.bat 1` uses camera number 1; on the command
+line `--device N --width 1280 --height 720`, `--probe` lists what the cameras offer). Set up the pieces, calibrate, and
+press **Start game** with the pieces in their starting positions, because that is what the squares are learned from.
+Use **Picture** on the Calibrate tab to turn the picture or adjust the contrast. A phone or tablet on the same network
+opens the address that the program prints: the first page controls, the others only watch.
+
+Other sources for trying things: `--source synthetic` (the starting position), `--source photo.jpg`, and
+`--second-camera` with the demo for two cameras without hardware. `--open` opens the page in the browser of this
+computer, `--listen 127.0.0.1:28080` chooses the address, `--help` lists every option.
+
+## Two cameras
+
+One camera sees the board at an angle: a tall piece hides the square behind it, a hand or an arm hides the squares it is
+over, a glare spoils a few squares. A second camera on the opposite side sees what the first cannot. What the two
+pictures say is put together square by square, each camera counting as far as it can explain what it sees there.
+
+- **Windows:** on the **Calibrate** tab choose a camera for **Camera 2** ("No second camera" switches it off and keeps its
+  calibration for later). Or `--device2 1`. The choice is kept.
+- **Linux:** `--device2 /dev/video2`. **Android:** one camera only.
+- Each camera is set up by itself: with two cameras the Calibrate tab has a button for each, and the picture, the
+  calibration (clicks or Auto-detect, which finds a1 from the pieces when it can), the top-down view and the picture settings are those of
+  the one chosen. The Live tab says "Two cameras are watching".
+- If one camera stops (unplugged, taken by another program) the page says so and the game goes on with the other; when it
+  comes back it is used again.
+
+Put the cameras on opposite sides of the board: two on the same side add little. Two 1280x720 streams may not fit the USB
+bandwidth of one hub; if not, use a smaller `--width`/`--height` or another port.
+
+## Record and replay
+
+```
+nicochess --record                      # a folder per game in ./recordings (Windows: Start NicoChess (record).bat)
+nicochess --replay recordings\2026-11-16_11-30-05 --replay-verbose
+nicochess --replay recordings --margin 9 --max-excess 80     # all the recordings, with other tuning values
+```
+
+A recording has the pictures the detection was given (both cameras', when there are two), what it decided, and what the
+people did (typed moves, undos). A replay feeds them through the detection again and tells where it agrees with what
+happened, which moves it would have made someone type, and which it got wrong. This is how a bad session is looked into
+and how the tuning options are tried on real pictures ([ENVIRONMENT.md](ENVIRONMENT.md)).
+
+## Status
+
+Built and tested on a PC with a synthetic camera (over 140 tests, a benchmark of whole games under drifting light, glare,
+leaning pieces and noise, and CI on Windows and Linux). **Not yet seen by real cameras on a real game.** What has and has
+not been tried:
+
+| Tried | Not yet tried |
+|---|---|
+| The page, the calibration and the whole pipeline on the demo, in the Windows release program | A real game on a real board, with real lighting and real pieces: the detection thresholds are tuned on synthetic pictures only |
+| An integrated Windows webcam: camera list, 1280x720 capture, the picture on the page (2026-11-12) | Two real cameras at once (also the USB bandwidth), and how much the second camera gains: measured on synthetic pictures only, and the one-camera figure with hands over the moves (66% of the moves by itself) has no two-camera counterpart yet |
+| Auto-detect of the board on a few photos of real boards from the web | The Android app on a phone since its service and switches were added; the external USB camera |
+| The 32-bit Linux build, in a Debian 12 i386 container | The Linux target with its real camera |
+| The camera chooser on a laptop with two cameras (listing only) | Changing cameras with the page while a USB camera is plugged in or pulled out |
+
+Details of what is built, with the limits, are in [PURPOSE.md](PURPOSE.md), and every change in [CHANGELOG.md](CHANGELOG.md).
+
+## Download and build
+
+Releases (open to everyone): https://github.com/arnaud-sintes/NicoChess/releases/latest, with `NicoChess-windows.zip`,
+`nicochess-debug-apk.zip` (the Android app, a debug build) and `nicochess-linux-i386.tar.gz`. The version is at the bottom
+of the page and shown by `nicochess --version`.
+
+From the source (Rust 2024, one workspace; Docker Desktop for the Linux and Android builds):
+
+| To | Run |
+|---|---|
+| Run, test, lint | `cargo run --release`, `cargo test`, `cargo clippy --all-targets -- -D warnings` |
+| Windows package | `.\scripts\package-windows.ps1` gives `dist\NicoChess-windows.zip` |
+| Linux 32-bit program | `.\scripts\build-target.ps1` gives `dist\nicochess` (built in a Debian 12 i386 container, because the camera crate needs the Linux headers) |
+| Android app | `.\scripts\build-android.ps1 [-Abis arm64-v8a]` gives `dist\nicochess-debug.apk` |
+| Release | `.\scripts\release.ps1` builds all three and publishes the GitHub release of the version in `Cargo.toml` |
+
+## A small headless box
+
+The program also runs on a small Linux box with no screen (the first target was an Atom N270 mini PC): a USB Wi-Fi
+dongle exposes an access point, and a phone or tablet joins it to open the page. `.\scripts\make-usb-bundle.ps1` builds
+a USB key with the program, an installer, the Debian packages for an offline install and the access point script, and
+`scripts\deploy.ps1 -Target user@host` updates it over SSH. How to install and configure it: [PLAN.md](PLAN.md), and
+its constraints and camera checks: [docs/target-hardware.md](docs/target-hardware.md). That box has never run the program
+with a real camera.
+
+Under study: a laptop as the target (own screen, faster) and engine analysis with Stockfish
+([docs/requirements.md](docs/requirements.md), "Under study").
 
 ## Documents
 
 - [CLAUDE.md](CLAUDE.md): entry point for an assistant or a new maintainer: commands, rules, gotchas.
-- [Purpose](PURPOSE.md): what it is for, scenarios, features, non-goals, known limits.
-- [Architecture](ARCHITECTURE.md): languages, modules, threads, files, targets.
-- [Design](DESIGN.md): patterns and coding rules.
-- [Environment](ENVIRONMENT.md): folders, build, test, package, deploy, troubleshooting.
-- [Requirements](docs/requirements.md): what the software must do, roles, formats, status.
-- [Design study](docs/design.md): feasibility, approach, pipeline, Rust stack, milestones.
-- [Plan](PLAN.md): what to install and configure on the target, and how.
-- [Target hardware](docs/target-hardware.md): INEOS 600 (Atom N270) constraints, Linux choice, webcam, checks to run.
-
-## Status
-
-Everything is built and tested on a PC with a synthetic camera. The integrated webcam of a Windows PC was tried on 2026-11-12
-(camera list, 1280x720 capture, the picture on the page). **Not yet tried: a real game on a real board, the C170, the Yealink, the INEOS 600.**
-
-| Done | Not yet |
-|---|---|
-| Web page for phone, tablet and PC (no external resources), updates pushed by server-sent events | Real webcam: formats, exposure lock, detection quality on a C170 |
-| Controller / viewer roles: the first user controls, the others watch and replay | Tuning of the detection thresholds on real lighting |
-| Calibration by clicking the 4 corners, or by the **Auto-detect the board** button (tried on a few photos of real boards found on the web), kept on disk | Wi-Fi access point on the target ([PLAN.md](PLAN.md) section 8) |
-| Picture settings: turn by 90°, auto contrast, brightness and contrast (software, same on every camera) | Camera-side controls on Android (exposure compensation, focus, white balance) |
-| Android app: server and phone camera in one app, runs on with the screen off (foreground service), remote-server switch, choice of camera, external USB camera when Android offers it | The Android app has not been run on a phone since the service and the switches were added; the USB camera is untested |
-| Windows package: unzip and double-click, nothing to install ([below](#windows-package)) | Tried on this PC only |
-| Stabilization: during a game the calibration follows the board if the camera shifts a little (can be switched off) | Tried only on synthetic pictures: not yet on a real board |
-| Camera and top-down pictures pushed as Motion JPEG streams (no polling) | Speed of the preview on a real phone not measured: see the figures under the picture |
-| Per-square empty / white / black detection, learned from the known start position | |
-| Stability gate and legal-move matching, with castling, en passant, promotion; up to three moves played between two pictures; a move that is not quite clear is taken with a note of doubt, the chance of the other likely moves and a one-click correction; squares are learned per square and keep adapting to the light, and tracking resumes by itself after a move typed by hand; draws by repetition and the 50/75-move rules (claim button for the claimable ones) | Tuned on synthetic pictures only (`examples/stress.rs`); not yet measured on a real board |
-| Two cameras on opposite sides of the board, optional ([below](#two-cameras)): the squares that a hand or a tall piece hides from one are read from the other; a single camera works as before | Never tried with real cameras; measured on synthetic pictures only |
-| Live board and move list with timestamps (offsets from the start of the game) | |
-| Manual corrections: undo, enter a move, pick among candidates, change a promotion | |
-| Recording of games for debugging (`--record`: still pictures, decisions and corrections in a folder per game) and `--replay` of it through the detection, with other tuning values if wanted. Windows package: `Start NicoChess (record).bat` | Command line and Windows tested on the demo source; not yet on a real camera |
-| End of game by the rules, or by resignation, draw, abort | |
-| Games stored as JSON, list by date, replay (real time, as fast as possible, step by step), PGN export | |
-| 32-bit Linux build, run in a Debian 12 i386 container | Run on the INEOS 600 |
-
-## Download
-
-Releases are on GitHub, open to everyone (https://github.com/arnaud-sintes/NicoChess/releases/latest): the newest one has `NicoChess-windows.zip` (unzip, double-click `Start NicoChess.bat`), `nicochess-debug-apk.zip` (the Android app, a debug build) and `nicochess-linux-i386.tar.gz`. The version is shown at the bottom of the page and by `nicochess --version`. See [CHANGELOG.md](CHANGELOG.md).
-
-## Try it on a PC (no camera)
-
-```
-cargo run --release -- --source demo
-```
-
-Open http://localhost:8080. The demo source plays a whole game (Morphy's "Opera game", 33 plies: 17 moves) on a synthetic board.
-
-1. Go to **Calibrate**, press **Open the camera**, and click the 4 corners of the board in the order a1, h1, h8, a8
-   (counter-clockwise on screen). The corners are about (120,440), (520,425), (470,90), (190,100) in the 640x480 image.
-2. Go back to **Live**, press **Start game**. The moves appear as the demo plays them, and the game ends by checkmate.
-3. Open **Games** to replay it, or download the PGN.
-
-Instead of clicking, press **Auto-detect the board**: it finds the 49 inner corners of the squares and works out the 4 outer corners. If a1 is at the wrong dark corner (a1 and h8 are both dark), press **Swap sides**.
-
-Open the same address from a second browser or a phone on the same network: it is a viewer and cannot start anything.
-Other sources: `--source synthetic` (the starting position only) or `--source some-image.jpg`.
-To try two cameras without any, add `--second-camera` to the demo or the synthetic source: the second camera shows the same board from the other side (see [Two cameras](#two-cameras)).
-`--open` opens the page in this computer’s browser once the server is up (handy when the target is a laptop).
-
-`cargo test` runs the test suite, including a full game recorded from the demo camera to a PGN.
-`cargo run -- --help` lists all the options.
-
-## Go to the target with a USB key
-
-```
-.\scripts\make-usb-bundle.ps1
-```
-
-builds `usb\`: the program, an installer, the Debian packages for an offline install, a Wi-Fi access point script and a README.
-Copy its content to a FAT32 key and follow `README.txt` on the target. Details in [PLAN.md](PLAN.md) section 10.
-`scripts\deploy.ps1 -Target user@host` updates the program over SSH when a network is available.
-
-## Android app
-
-`.\scripts\build-android.ps1` (Docker Desktop must be running) builds `dist\nicochess-debug.apk` for 64-bit and 32-bit ARM phones and tablets; `-Abis arm64-v8a` builds only the 64-bit one, which is faster (an x86 emulator build is not set up).
-The app is the same program as on the PC: the server runs inside the app and the page is shown in a WebView, so everything works offline.
-The phone camera is the default. On the **Calibrate** tab, a **This phone** card (only in the app) has:
-
-- **Let other devices connect (remote server)**: off by default. When on, the page is also served on port 8081 to the network, and the card shows the addresses.
-  Anyone on the network can then watch; the first page to connect while nobody controls can take control (for example a tablet while the phone only films).
-- **Use an external camera (USB)**: uses the first camera Android lists as external. Android only offers a USB camera to apps on phones that support it; when none is seen the card says so.
-- **Camera**: which camera of the phone, when it has several (back, ultra-wide, telephoto, front). Not changeable during a game.
-
-A notification shows while the app runs (Android requires it for a service that uses the camera); its **Stop** button ends everything.
-The app asks for the camera permission, and for notifications on Android 13 and later, when it opens.
-
-## Windows package
-
-`.\scripts\package-windows.ps1` builds `dist\NicoChess-windows.zip` (under 1 MB): `nicochess.exe`, three launchers and a README.
-Nothing to install: the C runtime is linked into the program. Unzip, then:
-
-- **Start NicoChess.bat** opens the page; `Start NicoChess.bat 1` uses camera number 1.
-- **Demo (no camera).bat** plays a whole game on a drawn board.
-- **List cameras.bat** shows the cameras, their formats and controls.
-
-Games, calibration and picture settings are kept in `%LOCALAPPDATA%\NicoChess`. Without `--listen` the program takes port 8080 and, if Windows reserves it
-(Docker Desktop and Hyper-V do), the next free one, and prints the addresses to use from a phone.
-
-## Two cameras
-
-One camera sees the board at an angle: a tall piece hides the square behind it, a hand or an arm hides the squares it is over, and a glare spoils a few squares. A second camera on the opposite side sees what the first cannot. It is optional: with one camera nothing changes.
-
-- **Windows:** on the **Calibrate** tab, choose a camera for **Camera 2** (the first row chooses camera 1; each list leaves out the camera the other one uses; "No second camera" switches it off, keeping its calibration for later). The choice is kept in `camera2.json`. Or on the command line: `--device2 1`.
-- **Linux:** `--device2 /dev/video2` (the page cannot list the cameras there).
-- **Demo and synthetic board:** `--second-camera`.
-- **Android:** one camera only.
-
-Then each camera is set up by itself: with two cameras the Calibrate tab has a button for each, and the picture, the calibration (clicks or **Auto-detect the board**), the top-down view and the picture settings (turn, brightness, contrast) are those of the one chosen. Put the second camera on the other side of the board: the calibration corners are still a1, h1, h8, a8 in the order they appear counter-clockwise on that camera's picture, and auto-detect works out which corner is a1 from the pieces. Start the game with both calibrated; the Live tab says "Two cameras are watching". If one camera stops (unplugged, taken by another program) the page reports it and the game goes on with the other; when it comes back it is used again.
-
-Both cameras use the USB bandwidth of the computer: two 1280x720 streams on one hub may not fit, in which case use a smaller `--width`/`--height` or another port. Put the two cameras on opposite sides of the board: two on the same side would give little. All of this was tried on synthetic pictures only; a recording (`--record`) of a game with two cameras keeps both pictures, and `--replay` runs both through the detection.
-
-## Cameras
-
-- Logitech C170 (VGA): the fallback, marginal at 640x480.
-- Yealink UVC30 Room (4K, 120°): the better candidate, not tried yet. The program accepts MJPEG, YUYV and NV12, turns autofocus off, and
-  `./nicochess --probe` (Linux and Windows) lists what a camera offers. Details and open points in [docs/target-hardware.md](docs/target-hardware.md).
-
-## Under study
-
-A laptop as the target (own screen, 64-bit, faster) and engine analysis with Stockfish: see "Under study" in [docs/requirements.md](docs/requirements.md).
-
-## Build for the target (Debian 12, 32-bit)
-
-```
-.\scripts\build-target.ps1
-```
-
-This builds in a Debian 12 i386 container (Docker Desktop must be running) and writes `dist\nicochess`.
-It needs the container because the camera crate generates its bindings at build time and needs the Linux headers.
-[PLAN.md](PLAN.md) covers installing, configuring and deploying the target.
+- [PURPOSE.md](PURPOSE.md): what it is for, scenarios, features, non-goals, known limits.
+- [ARCHITECTURE.md](ARCHITECTURE.md): modules, threads, files, targets, the data flow from camera to PGN.
+- [DESIGN.md](DESIGN.md): patterns and coding rules, how to add a route, a setting or a camera source.
+- [ENVIRONMENT.md](ENVIRONMENT.md): folders, build, test, package, deploy, record and replay, troubleshooting.
+- [CHANGELOG.md](CHANGELOG.md): what changed in each version.
+- [docs/requirements.md](docs/requirements.md), [docs/design.md](docs/design.md): the requirements and the early design study.
+- [PLAN.md](PLAN.md), [docs/target-hardware.md](docs/target-hardware.md): the Linux target.
 
 ## Code layout
 
-The long version, with the threads and the files, is in [ARCHITECTURE.md](ARCHITECTURE.md) and [ENVIRONMENT.md](ENVIRONMENT.md).
+The long version, with the threads and the files, is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 | File | Role |
 |---|---|
-| `src/lib.rs` | The library: everything that does not depend on the platform |
-| `src/main.rs` | The command-line program (Windows, Linux): options and start-up |
-| `src/app.rs` | Builds the engine, the camera thread and the web handler; runs the server (used by main.rs and by the Android library) |
-| `src/http.rs` | Small HTTP server on the standard library (needed for event streams that must not be buffered) |
-| `src/server.rs` | Routes and the JSON API, listed at the top of the file |
-| `src/engine.rs` | State machine: camera on/off, game, tracker, store, roles, push to pages |
-| `src/camera.rs` | Frame sources: V4L2 camera on Linux, Media Foundation camera on Windows, demo game, synthetic board, image file |
-| `src/pushed.rs` | Camera driven from outside (the Android app pushes its pictures in) |
-| `src/calibration.rs` | Corner validation, save/load, warp to the top-down board |
-| `src/boarddetect.rs` | Finds the board by itself (inner corners of the squares, lattice fit) and follows it when the camera moves |
-| `src/picture.rs` | Turn, brightness, contrast, and the follow switch, saved in `picture.json` |
-| `src/vision.rs` | Per-square sampling (block-averaged, eight numbers per square) and the per-square models that keep learning |
-| `src/tracker.rs` | Stability gate and the match of the board to a legal move |
-| `src/game.rs` | Game record, SAN/UCI, PGN export |
-| `src/store.rs` | One JSON file per game |
-| `src/fsutil.rs` | Atomic file writes (temporary file, flush to disk, rename) shared by the store, the calibration and the picture settings |
-| `src/roles.rs` | Controller and viewers |
-| `src/synthetic.rs` | Generated chessboard in perspective, for tests and PC development |
+| `src/main.rs`, `src/app.rs` | The command-line program: options and start-up; builds the engine, the camera threads and the web handler (also used by the Android library) |
+| `src/http.rs`, `src/server.rs` | A small HTTP server on the standard library (event streams must not be buffered); routes and JSON API, listed at the top of `server.rs` |
+| `src/engine.rs` | The state machine: cameras on and off, games, the tracker, the store, roles, push to the pages |
+| `src/camera.rs`, `src/choice.rs`, `src/pushed.rs` | Frame sources (V4L2, Media Foundation, demo, synthetic board, image file); the choice among the cameras; a camera driven from outside (the Android app) |
+| `src/calibration.rs`, `src/boarddetect.rs`, `src/picture.rs` | Corners and the warp to the top-down board; finding the board by itself and following it; turn, brightness, contrast |
+| `src/vision.rs`, `src/tracker.rs` | The per-square models that keep learning; the stability gate, the evidence of one or two cameras and the match to a legal move |
+| `src/game.rs`, `src/store.rs`, `src/fsutil.rs`, `src/roles.rs` | The game record, SAN/UCI and PGN; one JSON file per game; atomic file writes; controller and viewers |
+| `src/record.rs`, `src/replay.rs` | Recording of games and their replay |
+| `src/synthetic.rs` | A generated chessboard in perspective, for the demo, the tests and the benchmark (`examples/stress.rs`) |
 | `web/index.html` | The page (one file, built into the program) |
 | `android/` | The Android app: Kotlin shell (`android/app`) and the JNI library (`android/native`) |
-| `docker/` | Build images for the 32-bit Linux program and for the Android app |
-| `scripts/` | Build, package and deploy scripts (PowerShell), the USB key files (`scripts/usb`) and the Windows launchers (`scripts/windows`) |
+| `docker/`, `scripts/` | Build images; build, package, release and deploy scripts (PowerShell), the USB key files and the Windows launchers |
 | `docs/` | Requirements, design study, target hardware |
