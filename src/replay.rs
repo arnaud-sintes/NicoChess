@@ -121,6 +121,34 @@ fn read_events(folder: &Path) -> Result<Vec<Event>> {
     Ok(events)
 }
 
+/// Pictures that were given to the tracker together (one per camera, with the same `feed` number) become one event
+/// with a list `files` of `{cam, file}`, so that the replay gives them together. A recording from before there were
+/// two cameras has no numbers: each picture is a time by itself, of camera 0.
+fn group_pictures(events: Vec<Event>) -> Vec<Event> {
+    let mut out: Vec<Event> = Vec::new();
+    let mut last_feed: Option<u64> = None;
+    for mut event in events {
+        if event.kind != "frame" {
+            last_feed = None;
+            out.push(event);
+            continue;
+        }
+        let file = serde_json::json!({"cam": event.data["cam"].as_u64().unwrap_or(0), "file": event.text("file")});
+        let feed = event.data["feed"].as_u64();
+        if let (Some(previous), Some(number), Some(last)) = (out.last_mut(), feed, last_feed)
+            && number == last
+            && let Some(list) = previous.data["files"].as_array_mut()
+        {
+            list.push(file);
+            continue;
+        }
+        event.data["files"] = serde_json::json!([file]);
+        last_feed = feed;
+        out.push(event);
+    }
+    out
+}
+
 /// The position without the move counters: what makes two positions the same one.
 fn key_of(fen: &str) -> String {
     fen.split(' ').take(4).collect::<Vec<_>>().join(" ")
@@ -146,7 +174,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     if meta.format > FORMAT {
         bail!("this recording has format {}, newer than this program understands ({FORMAT}): use a newer NicoChess", meta.format);
     }
-    let events = read_events(folder)?;
+    let events = group_pictures(read_events(folder)?);
 
     // Every position the game was in, according to the recording.
     let mut real: HashSet<String> = HashSet::new();
@@ -159,7 +187,8 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
 
     let config = overrides.apply(meta.tracker.clone());
     let mut tracker = Tracker::new(config.clone());
-    tracker.set_calibration(meta.calibration.as_ref());
+    tracker.set_view_calibration(0, meta.calibration.as_ref());
+    tracker.set_view_calibration(1, meta.calibration2.as_ref());
     tracker.start(parse_fen(&meta.start_fen).context("the start position of the recording")?);
 
     let mut text = String::new();
@@ -192,13 +221,32 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     for event in &events {
         let now = base + Duration::from_secs_f64(event.t.max(0.0));
         match event.kind.as_str() {
+            "views" => {
+                // Which cameras gave pictures from now on (see the engine).
+                if let Some(active) = event.data["active"].as_array() {
+                    for (camera, on) in active.iter().enumerate() {
+                        tracker.set_view_active(camera, on.as_bool().unwrap_or(true));
+                    }
+                }
+            }
             "frame" => {
-                let file = event.text("file").to_string();
-                let image = image::open(folder.join(&file)).with_context(|| format!("cannot read the picture {file}"))?.to_rgb8();
-                summary.pictures += 1;
-                last_file = file;
+                // The pictures that were given to the tracker together: one per camera.
+                let files: Vec<(usize, String)> = event.data["files"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|f| Some((f["cam"].as_u64()? as usize, f["file"].as_str()?.to_string()))).collect())
+                    .unwrap_or_default();
+                let mut images: Vec<Option<image::RgbImage>> = vec![None; 2];
+                for (camera, file) in &files {
+                    let image = image::open(folder.join(file)).with_context(|| format!("cannot read the picture {file}"))?.to_rgb8();
+                    if let Some(place) = images.get_mut(*camera) {
+                        *place = Some(image);
+                    }
+                }
+                summary.pictures += files.len();
+                last_file = files.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>().join(" ");
                 let before = tracker.position().clone();
-                let moves = match tracker.feed(&image, now) {
+                let given: Vec<Option<&image::RgbImage>> = images.iter().map(Option::as_ref).collect();
+                let moves = match tracker.feed_views(&given, now) {
                     Detection::Move { mv, .. } => vec![mv],
                     Detection::Sequence { moves, .. } => moves,
                     Detection::Unsure { candidates } if verbose => {
@@ -281,13 +329,15 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
             }
             "calibration" => {
                 if let Ok(calibration) = serde_json::from_value::<crate::calibration::Calibration>(event.data["calibration"].clone()) {
+                    let camera = event.data["cam"].as_u64().unwrap_or(0) as usize;
                     // As the engine does: a board that moved a little keeps what was learned.
                     if event.text("how") == "follow" && tracker.status() != Status::Learning {
-                        tracker.move_calibration(&calibration);
+                        tracker.move_view_calibration(camera, &calibration);
                     } else {
-                        tracker.set_calibration(Some(&calibration));
+                        tracker.set_view_calibration(camera, Some(&calibration));
                     }
-                    let _ = writeln!(text, "{:>8.1}s  calibration {} during the game", event.t, event.text("how"));
+                    let which = if camera == 0 { String::new() } else { format!(" of camera {}", camera + 1) };
+                    let _ = writeln!(text, "{:>8.1}s  calibration {}{which} during the game", event.t, event.text("how"));
                 }
             }
             "unsure" if verbose => {
@@ -452,6 +502,8 @@ mod tests {
                 tracker: TrackerConfig::default(),
                 calibration: Some(synthetic::corners()),
                 picture: Picture::default(),
+                calibration2: None,
+                picture2: None,
             };
             let begun = Instant::now();
             // A test camera is faster than any disk: nothing may be dropped.

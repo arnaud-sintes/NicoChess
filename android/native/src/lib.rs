@@ -209,6 +209,9 @@ fn start(data_dir: String, listen: String, source: String) -> Result<(), String>
             max_viewers: 8,
             record: None,
             remember_camera: false,
+            // The phone has the one camera the app opens for it.
+            second_device: None,
+            second_synthetic: false,
         };
         // Take the port first: if it is not free, nothing else has been built yet.
         let listener = match http::bind_first(&[options.listen.clone()]) {

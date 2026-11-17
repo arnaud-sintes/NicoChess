@@ -30,30 +30,30 @@
 |---|---|
 | `lib.rs` | Declares the modules; the library is platform independent |
 | `main.rs` | Command-line options, help text, source choice, port choice (Windows fallback), startup banner, `--open`, `--probe` |
-| `app.rs` | `build()` makes the engine, the capture thread and the web handler; `serve()` / `serve_on()` run the server |
+| `app.rs` | `build()` makes the engine, the capture thread (and the one of the second camera, when there is one) and the web handler; `serve()` / `serve_on()` run the server |
 | `http.rs` | HTTP/1.1 server: `serve`, `serve_on`, `bind_first`, a stoppable `Listener` (`spawn`), request limits, timeouts, `Host` check, TCP keepalive |
 | `server.rs` | Routes, JSON API, MJPEG and event streams; the route list is the comment at the top |
-| `engine.rs` | The state machine: modes (Idle, Calibrating, Playing), camera on demand, capture loop, tracker feeding, games, calibration and picture commands, stabilization, snapshots for the pages, SSE hub |
-| `camera.rs` | `FrameSource` trait, `SourceSpec` and `factory`; V4L2 (Linux) and Media Foundation (Windows) cameras; demo, synthetic and image sources; `--probe` |
+| `engine.rs` | The state machine: modes (Idle, Calibrating, Playing), cameras on demand (a main one and an optional second one: `Cam` state under the lock, `Slot` of picture and flags outside it), capture loop per camera, tracker feeding with the new pictures of both, games, calibration and picture commands (each about one camera), stabilization, snapshots for the pages, SSE hub |
+| `camera.rs` | `FrameSource` trait, `SourceSpec`, `factory` and `second_factory`; V4L2 (Linux) and Media Foundation (Windows) cameras; demo, synthetic and image sources; `demo_pair` (the demo seen by two cameras that share one clock); `--probe` |
 | `pushed.rs` | `FrameInbox` and `PushedSource`: a camera driven from outside (Android); YUV 4:2:0 to RGB |
 | `calibration.rs` | The four corners and the size of the picture they were made for, validation, warp to the top-down board (50 px squares, 25 px margin) |
 | `boarddetect.rs` | Finds the 49 inner corners (saddle points), fits the lattice, gives the four outer corners and which one is a1; `refine` follows a board that moved |
 | `picture.rs` | Rotation, brightness, contrast, auto contrast, the follow switch; saved in `picture.json` |
 | `vision.rs` | Sampling of each square (eight numbers: colour of the middle and of the ring, texture) and the per-square, per-content models (`Models`) that learn, compensate a change of the light and say how badly a square fits "empty", "white" or "black" |
-| `tracker.rs` | Stability gate; then every way the game may have gone on (no move, any one, two or three legal moves) is scored by how likely the picture is, including what changed since the last confirmed picture. The likeliest is accepted only if it beats the next by a margin and leaves little unexplained; a clear move teaches the models. A move that leads by less than the margin but by at least the soft margin is accepted as well and comes with a `Doubt` (its chance and the other likely moves, each chance being the share of its likelihood, softened, among all explanations that move something); the engine keeps it while those are the last moves of the game and offers it to the page (`POST /api/game/doubt`: replace by an alternative, or take back and `hold` the tracker until a move is entered). After a position set by hand the next picture is adopted and learned, and nothing but one reply is believed beyond it |
+| `tracker.rs` | One `View` per camera (its sampler, models, stability gate and reference picture); the board is still when every camera that can judge has seen it still. What the cameras say is put together square by square (`Evidence::new`): each camera counts as far as one of the three contents explains what it sees on that square (`Part::trust`), so a square that a hand hides from one camera is read from the other; the average is on the scale of one camera, so the thresholds below mean the same with one or two. A camera that gives no pictures is left out (`set_view_active`), and a camera that comes late learns its squares at the next confirmed position (`learn_late_views`). Then every way the game may have gone on (no move, any one, two or three legal moves) is scored by how likely the picture is, including what changed since the last confirmed picture. The likeliest is accepted only if it beats the next by a margin and leaves little unexplained; a clear move teaches the models. A move that leads by less than the margin but by at least the soft margin is accepted as well and comes with a `Doubt` (its chance and the other likely moves, each chance being the share of its likelihood, softened, among all explanations that move something); the engine keeps it while those are the last moves of the game and offers it to the page (`POST /api/game/doubt`: replace by an alternative, or take back and `hold` the tracker until a move is entered). After a position set by hand the next picture is adopted and learned, and nothing but one reply is believed beyond it |
 | `game.rs` | The game record (moves, result), SAN/UCI, PGN, file format version, the draw rules (repetition, 50 and 75 moves) |
 | `store.rs` | One JSON file per game, ids, listing |
 | `build.rs` (root) | Adds the git commit to the program (`COMMIT`, with `VERSION` from Cargo.toml: `lib.rs`) |
 | `fsutil.rs` | `write_atomic`: temporary file, flush to disk, rename |
-| `choice.rs` | The camera in use and the cameras there are (`CameraSelection`): shared by the engine (the page changes it) and the source factory (reads it at each opening); kept by name in `camera.json`. Windows only for now: elsewhere the list is empty and the page offers nothing |
-| `record.rs` | Recording of a game (`--record`): a folder per game with `session.json`, `frames/*.jpg` and `events.jsonl`, written by its own thread so that the capture path never waits for the disk; date and time of the start without a library (Windows local time through one `GetLocalTime` call) |
-| `replay.rs` | Replay of a recording (`--replay`): feeds the pictures to the tracker at their recorded times, applies what the people did, and reports how the result compares with what happened; the tuning options replace the recorded ones |
+| `choice.rs` | The camera in use and the cameras there are (`CameraSelection`): shared by the engine (the page changes it) and the source factory (reads it at each opening); kept by name in `camera.json`. The second camera has a selection of its own (`camera2.json`), which can be empty ("no second camera"). The list comes from Windows only for now: elsewhere it is empty and the page offers nothing (the second camera is then named with `--device2`) |
+| `record.rs` | Recording of a game (`--record`): a folder per game with `session.json`, `frames/*.jpg` (with two cameras, two pictures per time, sharing a `feed` number) and `events.jsonl`, written by its own thread so that the capture path never waits for the disk; date and time of the start without a library (Windows local time through one `GetLocalTime` call) |
+| `replay.rs` | Replay of a recording (`--replay`): feeds the pictures to the tracker at their recorded times (those of one `feed`, one per camera, together; which cameras took part comes from the `views` events), applies what the people did, and reports how the result compares with what happened; the tuning options replace the recorded ones |
 | `roles.rs` | Controller and viewer, tokens, expiry |
-| `synthetic.rs` | A chessboard drawn in perspective, the Opera game; used by the demo source and by the tests. `Conditions` adds drifting light, a moving shadow, glare, leaning pieces and noise |
-| `examples/stress.rs` | Benchmark (not part of the program): plays whole games through the tracker under those conditions with a simulated person who types a move when the tracker is unsure |
+| `synthetic.rs` | A chessboard drawn in perspective, the Opera game; used by the demo source and by the tests. `Conditions` adds drifting light, a moving shadow, glare, leaning pieces and noise. A second camera on the other side is the same picture turned half way round (`second_corners`, `seen_from_the_other_side`), and `occlude` puts a hand over a square |
+| `examples/stress.rs` | Benchmark (not part of the program): plays whole games through the tracker under those conditions with a simulated person who types a move when the tracker is unsure; `STRESS_CAMERAS=2` and `STRESS_HAND=0.4` add the second camera and hands over the squares of the moves |
 
 ### Page (`web/index.html`)
-One file: markup, style and script. Tabs Live, Games, Calibrate; the page state comes from the event stream; commands go through `api()`.
+One file: markup, style and script. Tabs Live, Games, Calibrate; the page state comes from the event stream; commands go through `api()`. With a second camera the Calibrate tab has a button for each camera (`camN`): the picture, the calibration, the top-down view and the picture settings are those of the one chosen, and every request about a camera carries `?cam=2` for the second.
 
 ### Android (`android/`)
 
@@ -71,10 +71,10 @@ One file: markup, style and script. Tabs Live, Games, Calibrate; the page state 
 ## Data flow: camera to PGN
 
 ```
-camera --(FrameSource::next_frame)--> capture thread (engine::on_frame)
-   rotate + brightness/contrast (picture.rs)  ->  Latest { image, raw, seq }   -> preview: /frame.mjpg, /warp.mjpg
-   every track_interval, while Playing:
-      warp (calibration.rs) -> sample squares (vision.rs) -> stability gate + legal-move match (tracker.rs)
+camera --(FrameSource::next_frame)--> capture thread (engine::on_frame; one thread for each camera)
+   rotate + brightness/contrast (picture.rs)  ->  Latest { image, raw, seq }   -> preview: /frame.mjpg, /warp.mjpg (?cam=2 for the second camera)
+   every track_interval, while Playing, with the new picture of each camera that has a calibration (a camera is never given a picture twice):
+      warp (calibration.rs) -> sample squares (vision.rs) -> stability gate of each camera -> evidence of all put together + legal-move match (tracker.rs)
       -> Detection::Move (or Detection::Pair: two moves)  -> GameRecord::push_move (game.rs) -> pending_save -> flush_save after the lock is released (store.rs, atomic)
    about every 1.5 s (longer on a slow machine: at least 20 times the search time), while Playing and quiet: boarddetect::refine
    -> move the calibration if the board shifted (never more than one square from where the game began; the file is written at most every 10 s)
@@ -87,7 +87,7 @@ PGN is produced on request from the stored moves (`GameRecord::pgn`); positions 
 
 | Thread | What it does |
 |---|---|
-| `capture` (one) | Opens a `FrameSource` when the camera is wanted, loops over frames, runs `on_frame`; sleeps on a condvar when no camera is wanted. A panic while processing a picture is caught (the picture is skipped and the loop goes on); a panic inside the camera source itself ends the thread, which is logged |
+| `capture`, `capture2` (the second camera, when there is one) | Opens a `FrameSource` when the camera is wanted (the second one also when it is in use: chosen, or always there), loops over frames, runs `on_frame`; sleeps on a condvar when no camera is wanted. A panic while processing a picture is caught (the picture is skipped and the loop goes on); a panic inside the camera source itself ends the thread, which is logged |
 | `camera` (Windows only) | Owns the Media Foundation camera (it is not `Send`) and sends frames over a channel |
 | `record` (one per recorded game) | Encodes the pictures it is given and writes them, and the event lines, in the recording's folder; ends when the game's recording is dropped. Fed by `try_send` on a bounded queue: when the disk cannot keep up, pictures are dropped and counted, never waited for |
 | `http` (one per connection) | Reads one request, runs the handler, answers; stream replies (events, MJPEG) keep the thread until the page leaves |
@@ -97,8 +97,8 @@ PGN is produced on request from the stored moves (`GameRecord::pgn`); positions 
 | `logcat` (Android) | Reads the program's stderr from a pipe and writes it to logcat |
 | `CoreService` worker (Android) | Starts the core and opens or closes the remote listener, which can take a moment |
 
-State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, picture settings, roles, notices. Separate small locks: `frame` (latest picture, `RwLock`), `camera_wanted` with a condvar, `frame_count` with a condvar (streams wait on it), `stats` (speed figures), `save_lock` (one game writer at a time), the SSE hub's subscriber list.
-**Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`. No cycle exists; keep it that way.** (The recorder lives inside `inner`: it only queues work for its own thread and takes no lock, so it can be used with `inner` held.) (`wait_for_frame` takes `frame_count` and then only reads `frame`; it never takes `inner`.) Poisoned locks are recovered, not propagated. Slow work on the capture thread (detection, JPEG encoding, writing a game) is done outside `inner`; the rare commands of the owner write their small settings file under it.
+State: one `Mutex<Inner>` in the engine holds mode, game, tracker, the state of each camera (`Cam`: calibration, picture settings, when it last gave a picture, following), roles, notices. Separate small locks: for each camera its `frame` (latest picture, `RwLock`) and `stats` (speed figures), `camera_wanted` with a condvar (both threads wait on it; a camera that is chosen or switched off wakes them with the lock held, `wake_cameras`), `frame_count` with a condvar (streams wait on it), `save_lock` (one game writer at a time), the SSE hub's subscriber list.
+**Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame` (of either camera), `frame_count`, and before the selection of a camera (`CameraSelection` is a leaf). No cycle exists; keep it that way.** (The recorder lives inside `inner`: it only queues work for its own thread and takes no lock, so it can be used with `inner` held.) (`wait_for_frame` takes `frame_count` and then only reads `frame`; it never takes `inner`.) Poisoned locks are recovered, not propagated. Slow work on the capture thread (detection, JPEG encoding, writing a game) is done outside `inner`; the rare commands of the owner write their small settings file under it.
 
 ## Persistence
 
@@ -108,8 +108,9 @@ State: one `Mutex<Inner>` in the engine holds mode, game, tracker, calibration, 
 | `calibration.json` | `--calibration` (default `./calibration.json`) | Corners a1, h1, h8, a8 in pixels of the rotated picture, and the size of the picture they were made for. The engine warns when the picture has another size |
 | `picture.json` | next to `calibration.json` | Rotation, brightness, contrast, the follow switch |
 | `camera.json` | next to `calibration.json` | The camera chosen on the page (Windows): its number and its name. At start the name is looked for again, since Windows may number the cameras differently; `--device` beats it |
+| `calibration2.json`, `picture2.json`, `camera2.json` | next to `calibration.json` | The same three for the second camera. `camera2.json` may say "no camera" (empty number and name): the second camera is off. `--device2` beats it |
 
-| `<recording-dir>/<date>_<time>/` | `--record-dir` (default `./recordings`; Windows record launcher: `%LOCALAPPDATA%\NicoChess\recordings`) | Only with `--record`: one folder per game played. `session.json` (program version, start time, source, calibration, picture settings, tracker settings, start position), `frames/NNNNNN.jpg` (the pictures the detection saw), `events.jsonl` (one JSON line each: `frame`, `detect`, `unsure`, `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`). Format number in `record::FORMAT` |
+| `<recording-dir>/<date>_<time>/` | `--record-dir` (default `./recordings`; Windows record launcher: `%LOCALAPPDATA%\NicoChess\recordings`) | Only with `--record`: one folder per game played. `session.json` (program version, start time, source, calibration, picture settings, and those of the second camera when there was one, tracker settings, start position), `frames/NNNNNN.jpg` (the pictures the detection saw), `events.jsonl` (one JSON line each: `frame` (with `cam` and `feed`), `views` (which cameras gave pictures, noted when that changes), `detect`, `unsure`, `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`). Format number in `record::FORMAT` |
 
 All of them are written by `fsutil::write_atomic`: after a power cut a file is the old one or the new one. The one exception is `events.jsonl` of a recording, which is appended line by line (a line cut short by a power loss is skipped by the replay). An unfinished game found at start is loaded into the Idle state; the page offers **Resume** (`POST /api/game/resume`) or **Close it**.
 
@@ -121,7 +122,7 @@ The `Host` header must name an address, `localhost`, a name without a dot, or a 
 
 ## Platform abstraction
 
-`camera::FrameSource` (`describe`, `next_frame`, `restart`) is the one interface the engine knows. `next_frame` must return within a few seconds (a camera that goes silent gives an error, and the engine's retry reopens it). `SourceSpec` says which source to build (`Camera`, `Demo`, `Synthetic`, `Image`, `Pushed`); `camera::factory` turns it into a `SourceFactory`, which the capture thread calls whenever the camera is wanted and drops when it is not.
+`camera::FrameSource` (`describe`, `next_frame`, `restart`) is the one interface the engine knows. `next_frame` must return within a few seconds (a camera that goes silent gives an error, and the engine's retry reopens it). `SourceSpec` says which source to build (`Camera`, `Demo`, `Synthetic`, `Image`, `Pushed`); `camera::factory` turns it into a `SourceFactory`, which the capture thread calls whenever the camera is wanted and drops when it is not. The second camera has its own factory (`camera::second_factory`: the camera that `camera2` names; for the synthetic board the same board seen from the other side; the demo's comes from `demo_pair`, so that both cameras show the same moment of the game). The Android app has one camera only.
 `pushed.rs` is the Android case: the app calls `pushFrame` from Camera2, the converted picture goes into a `FrameInbox` (latest picture only), and `PushedSource` reads it. The inbox also carries the `wanted` flag: the engine sets it when it needs pictures, the service polls it every 300 ms and opens or closes the camera.
 
 ## Android structure

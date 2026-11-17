@@ -40,6 +40,7 @@ Everything is built and tested on a PC with a synthetic camera. The integrated w
 | Camera and top-down pictures pushed as Motion JPEG streams (no polling) | Speed of the preview on a real phone not measured: see the figures under the picture |
 | Per-square empty / white / black detection, learned from the known start position | |
 | Stability gate and legal-move matching, with castling, en passant, promotion; up to three moves played between two pictures; a move that is not quite clear is taken with a note of doubt, the chance of the other likely moves and a one-click correction; squares are learned per square and keep adapting to the light, and tracking resumes by itself after a move typed by hand; draws by repetition and the 50/75-move rules (claim button for the claimable ones) | Tuned on synthetic pictures only (`examples/stress.rs`); not yet measured on a real board |
+| Two cameras on opposite sides of the board, optional ([below](#two-cameras)): the squares that a hand or a tall piece hides from one are read from the other; a single camera works as before | Never tried with real cameras; measured on synthetic pictures only |
 | Live board and move list with timestamps (offsets from the start of the game) | |
 | Manual corrections: undo, enter a move, pick among candidates, change a promotion | |
 | Recording of games for debugging (`--record`: still pictures, decisions and corrections in a folder per game) and `--replay` of it through the detection, with other tuning values if wanted. Windows package: `Start NicoChess (record).bat` | Command line and Windows tested on the demo source; not yet on a real camera |
@@ -68,6 +69,7 @@ Instead of clicking, press **Auto-detect the board**: it finds the 49 inner corn
 
 Open the same address from a second browser or a phone on the same network: it is a viewer and cannot start anything.
 Other sources: `--source synthetic` (the starting position only) or `--source some-image.jpg`.
+To try two cameras without any, add `--second-camera` to the demo or the synthetic source: the second camera shows the same board from the other side (see [Two cameras](#two-cameras)).
 `--open` opens the page in this computer’s browser once the server is up (handy when the target is a laptop).
 
 `cargo test` runs the test suite, including a full game recorded from the demo camera to a PGN.
@@ -108,6 +110,19 @@ Nothing to install: the C runtime is linked into the program. Unzip, then:
 
 Games, calibration and picture settings are kept in `%LOCALAPPDATA%\NicoChess`. Without `--listen` the program takes port 8080 and, if Windows reserves it
 (Docker Desktop and Hyper-V do), the next free one, and prints the addresses to use from a phone.
+
+## Two cameras
+
+One camera sees the board at an angle: a tall piece hides the square behind it, a hand or an arm hides the squares it is over, and a glare spoils a few squares. A second camera on the opposite side sees what the first cannot. It is optional: with one camera nothing changes.
+
+- **Windows:** on the **Calibrate** tab, choose a camera for **Camera 2** (the first row chooses camera 1; each list leaves out the camera the other one uses; "No second camera" switches it off, keeping its calibration for later). The choice is kept in `camera2.json`. Or on the command line: `--device2 1`.
+- **Linux:** `--device2 /dev/video2` (the page cannot list the cameras there).
+- **Demo and synthetic board:** `--second-camera`.
+- **Android:** one camera only.
+
+Then each camera is set up by itself: with two cameras the Calibrate tab has a button for each, and the picture, the calibration (clicks or **Auto-detect the board**), the top-down view and the picture settings (turn, brightness, contrast) are those of the one chosen. Put the second camera on the other side of the board: the calibration corners are still a1, h1, h8, a8 in the order they appear counter-clockwise on that camera's picture, and auto-detect works out which corner is a1 from the pieces. Start the game with both calibrated; the Live tab says "Two cameras are watching". If one camera stops (unplugged, taken by another program) the page reports it and the game goes on with the other; when it comes back it is used again.
+
+Both cameras use the USB bandwidth of the computer: two 1280x720 streams on one hub may not fit, in which case use a smaller `--width`/`--height` or another port. Put the two cameras on opposite sides of the board: two on the same side would give little. All of this was tried on synthetic pictures only; a recording (`--record`) of a game with two cameras keeps both pictures, and `--replay` runs both through the detection.
 
 ## Cameras
 

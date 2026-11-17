@@ -4,6 +4,8 @@
 use crate::synthetic;
 use anyhow::{Context, Result, bail};
 use image::RgbImage;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -77,17 +79,23 @@ impl FrameSource for StillImage {
 pub struct Synthetic {
     image: RgbImage,
     pacer: Pacer,
+    second: bool,
 }
 
 impl Synthetic {
     pub fn new(interval: Duration) -> Self {
-        Synthetic { image: synthetic::frame(), pacer: Pacer::new(interval) }
+        Synthetic { image: synthetic::frame(), pacer: Pacer::new(interval), second: false }
+    }
+
+    /// The same board seen from the other side, as a second camera would.
+    pub fn second(interval: Duration) -> Self {
+        Synthetic { image: synthetic::seen_from_the_other_side(&synthetic::frame()), pacer: Pacer::new(interval), second: true }
     }
 }
 
 impl FrameSource for Synthetic {
     fn describe(&self) -> String {
-        "synthetic board".to_string()
+        if self.second { "synthetic board, seen from the other side" } else { "synthetic board" }.to_string()
     }
 
     fn next_frame(&mut self) -> Result<RgbImage> {
@@ -682,6 +690,10 @@ pub struct DemoGame {
     tick: usize,
     cache: Option<(synthetic::PieceGrid, RgbImage)>,
     pacer: Pacer,
+    /// Seen from the other side of the board: the picture of a second camera.
+    second: bool,
+    /// Where the game is, shared with the other camera when there are two (see [`demo_pair`]).
+    link: Option<Arc<AtomicUsize>>,
 }
 
 impl DemoGame {
@@ -700,35 +712,62 @@ impl DemoGame {
             script.push(lifted);
             script.extend(std::iter::repeat_n(step.after, per_move - 1));
         }
-        DemoGame { script, tick: 0, cache: None, pacer: Pacer::new(frame_interval) }
+        DemoGame { script, tick: 0, cache: None, pacer: Pacer::new(frame_interval), second: false, link: None }
+    }
+
+    /// One of two cameras that see the same game (see [`demo_pair`]): the first plays the game on and says where it
+    /// is in `shared`, the second, on the other side of the board, shows the same moment of it.
+    fn linked(frame_interval: Duration, move_interval: Duration, shared: Arc<AtomicUsize>, second: bool) -> DemoGame {
+        DemoGame { second, link: Some(shared), ..DemoGame::new(frame_interval, move_interval) }
     }
 }
 
 impl FrameSource for DemoGame {
     fn describe(&self) -> String {
-        "demo game (Opera game, synthetic board)".to_string()
+        if self.second { "demo game (Opera game, seen from the other side)" } else { "demo game (Opera game, synthetic board)" }.to_string()
     }
 
     fn restart(&mut self) {
-        self.tick = 0;
+        // The camera that follows the other one has nothing to start again: it shows where the first is.
+        if !self.second {
+            self.tick = 0;
+            if let Some(shared) = &self.link {
+                shared.store(0, Ordering::SeqCst);
+            }
+        }
     }
 
     fn next_frame(&mut self) -> Result<RgbImage> {
         self.pacer.wait();
-        let grid = self.script[self.tick.min(self.script.len() - 1)];
-        self.tick += 1;
+        let last = self.script.len() - 1;
+        let index = match (&self.link, self.second) {
+            (Some(shared), true) => shared.load(Ordering::SeqCst).min(last),
+            (link, _) => {
+                let index = self.tick.min(last);
+                self.tick += 1;
+                if let Some(shared) = link {
+                    shared.store(index, Ordering::SeqCst);
+                }
+                index
+            }
+        };
+        let grid = self.script[index];
         if let Some((cached, image)) = &self.cache
             && *cached == grid
         {
             return Ok(image.clone());
         }
-        let image = synthetic::frame_from_grid(&grid);
+        let mut image = synthetic::frame_from_grid(&grid);
+        if self.second {
+            image = synthetic::seen_from_the_other_side(&image);
+        }
         self.cache = Some((grid, image.clone()));
         Ok(image)
     }
 }
 
 /// Where frames come from.
+#[derive(Clone)]
 pub enum SourceSpec {
     Camera(CameraSettings),
     /// The starting position on a synthetic board.
@@ -770,6 +809,45 @@ pub fn factory_with(
             SourceSpec::Demo { move_interval } => Ok(Box::new(DemoGame::new(interval, *move_interval))),
             SourceSpec::Image(path) => Ok(Box::new(StillImage::open(path, interval)?)),
             SourceSpec::Pushed(inbox) => Ok(Box::new(crate::pushed::PushedSource::open(inbox.clone()))),
+        }
+    })
+}
+
+/// The demo game seen by two cameras on opposite sides of the board: the factories of the first and the second. The
+/// second shows the moment of the game that the first shows. (Two clocks of their own would drift apart whenever one
+/// camera's thread was held up, and the cameras would then show different moments, which no real pair does.)
+pub fn demo_pair(frame_interval: Duration, move_interval: Duration) -> (SourceFactory, SourceFactory) {
+    let shared = Arc::new(AtomicUsize::new(0));
+    let make = |second: bool| -> SourceFactory {
+        let shared = Arc::clone(&shared);
+        Box::new(move || -> Result<Box<dyn FrameSource>> {
+            Ok(Box::new(DemoGame::linked(frame_interval, move_interval, Arc::clone(&shared), second)))
+        })
+    };
+    (make(false), make(true))
+}
+
+/// The source of the second camera. A real camera is the one `selection` names (none chosen: an error, which the
+/// engine does not ask about, because it opens a second camera only when one is chosen); the synthetic board
+/// shows the same board from the other side. The demo's second camera comes with its first (see [`demo_pair`]).
+pub fn second_factory(
+    spec: SourceSpec,
+    interval: Duration,
+    selection: Option<std::sync::Arc<crate::choice::CameraSelection>>,
+) -> SourceFactory {
+    Box::new(move || -> Result<Box<dyn FrameSource>> {
+        match &spec {
+            SourceSpec::Camera(settings) => {
+                let device = selection.as_ref().map(|s| s.device()).unwrap_or_default();
+                if device.is_empty() {
+                    bail!("no second camera is chosen");
+                }
+                let mut settings = settings.clone();
+                settings.device = device;
+                open_camera(&settings)
+            }
+            SourceSpec::Synthetic => Ok(Box::new(Synthetic::second(interval))),
+            SourceSpec::Demo { .. } | SourceSpec::Image(_) | SourceSpec::Pushed(_) => bail!("this source has no second camera"),
         }
     })
 }

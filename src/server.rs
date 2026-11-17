@@ -6,7 +6,10 @@
 //!   GET    /warp.jpg[?grid=0]          top-down board (needs a calibration)
 //!   GET    /warp.mjpg                  the top-down board as a Motion JPEG stream
 //!   GET    /api/camera/stats           pictures per second and time per picture
-//!   GET    /api/camera/list            the cameras of the computer and the one in use (Windows)
+//!   GET    /api/camera/list            the cameras of the computer and the ones in use (Windows)
+//!
+//! Everything that is about one camera (the five pictures and figures above, the calibration, the picture settings
+//! and the choice of the camera below) takes `?cam=2` for the second camera, and the main one without it (or `?cam=1`).
 //!   GET    /api/state?token=T          full state for one user (JSON)
 //!   GET    /api/events?token=T         the same state, pushed on every change (SSE)
 //!   GET    /api/games                  list of games, most recent first
@@ -22,7 +25,8 @@
 //!   POST   /api/calibration            {"corners": [[x,y] x4]}  order a1, h1, h8, a8
 //!   POST   /api/calibration/detect     find the board in the picture and calibrate with it
 //!   POST   /api/camera/follow          {"on": true}  follow the board if it moves during a game
-//!   POST   /api/camera/select          {"id": "1"}  use that camera (not during a game; forgets the calibration)
+//!   POST   /api/camera/select          {"id": "1"}  use that camera (not during a game; forgets the calibration);
+//!                                      with ?cam=2 also {"id": ""}: no second camera
 //!   DELETE /api/calibration            forget the calibration
 //!   POST   /api/camera/rotate          {"turns": 1}  quarter turns clockwise (-1: counter-clockwise)
 //!   POST   /api/camera/picture         {"brightness": 0, "contrast": 1}
@@ -85,17 +89,29 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
     match (method, path) {
         ("GET", "/" | "/index.html") => Reply::bytes(200, "text/html; charset=utf-8", INDEX_HTML.as_bytes().to_vec()),
 
-        ("GET", "/frame.jpg") => match engine.latest_frame() {
-            Some(frame) => Reply::bytes(200, "image/jpeg", frame.jpeg().as_ref().clone()),
-            None => Reply::text(503, "the camera is off"),
+        ("GET", "/frame.jpg") => match cam_of(&request) {
+            Ok(cam) => match engine.latest_frame(cam) {
+                Some(frame) => Reply::bytes(200, "image/jpeg", frame.jpeg().as_ref().clone()),
+                None => Reply::text(503, "the camera is off"),
+            },
+            Err(e) => Reply::text(e.status(), &e.message()),
         },
-        ("GET", "/frame.mjpg") => frame_stream(engine, false),
-        ("GET", "/warp.mjpg") => frame_stream(engine, true),
-        ("GET", "/api/camera/stats") => Reply::json(200, &engine.camera_stats()),
+        ("GET", "/frame.mjpg") => match cam_of(&request) {
+            Ok(cam) => frame_stream(engine, false, cam),
+            Err(e) => Reply::text(e.status(), &e.message()),
+        },
+        ("GET", "/warp.mjpg") => match cam_of(&request) {
+            Ok(cam) => frame_stream(engine, true, cam),
+            Err(e) => Reply::text(e.status(), &e.message()),
+        },
+        ("GET", "/api/camera/stats") => match cam_of(&request) {
+            Ok(cam) => Reply::json(200, &engine.camera_stats(cam)),
+            Err(e) => Reply::text(e.status(), &e.message()),
+        },
         ("GET", "/api/camera/list") => Reply::json(200, &engine.cameras()),
         ("GET", "/warp.jpg") => {
             let grid = !request.query.split('&').any(|q| q == "grid=0");
-            match engine.warped_jpeg(grid) {
+            match cam_of(&request).and_then(|cam| engine.warped_jpeg(cam, grid)) {
                 Ok(bytes) => Reply::bytes(200, "image/jpeg", bytes),
                 Err(e) => Reply::text(e.status(), &e.message()),
             }
@@ -123,13 +139,13 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             struct Body {
                 corners: [[f32; 2]; 4],
             }
-            done(body_json::<Body>(&request).and_then(|b| engine.set_calibration(&token, b.corners)))
+            done(cam_of(&request).and_then(|cam| body_json::<Body>(&request).and_then(|b| engine.set_calibration(&token, cam, b.corners))))
         }
-        ("POST", "/api/calibration/detect") => match engine.detect_calibration(&token) {
+        ("POST", "/api/calibration/detect") => match cam_of(&request).and_then(|cam| engine.detect_calibration(&token, cam)) {
             Ok(message) => Reply::json(200, &json!({ "ok": true, "message": message })),
             Err(e) => failure(e),
         },
-        ("DELETE", "/api/calibration") => done(engine.clear_calibration(&token)),
+        ("DELETE", "/api/calibration") => done(cam_of(&request).and_then(|cam| engine.clear_calibration(&token, cam))),
         ("POST", "/api/game/doubt") => {
             #[derive(Deserialize)]
             struct Body {
@@ -151,14 +167,14 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             struct Body {
                 id: String,
             }
-            done(body_json::<Body>(&request).and_then(|b| engine.select_camera(&token, &b.id)))
+            done(cam_of(&request).and_then(|cam| body_json::<Body>(&request).and_then(|b| engine.select_camera(&token, cam, &b.id))))
         }
         ("POST", "/api/camera/rotate") => {
             #[derive(Deserialize)]
             struct Body {
                 turns: i32,
             }
-            done(body_json::<Body>(&request).and_then(|b| engine.rotate_picture(&token, b.turns)))
+            done(cam_of(&request).and_then(|cam| body_json::<Body>(&request).and_then(|b| engine.rotate_picture(&token, cam, b.turns))))
         }
         ("POST", "/api/camera/picture") => {
             #[derive(Deserialize)]
@@ -166,10 +182,14 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
                 brightness: f32,
                 contrast: f32,
             }
-            done(body_json::<Body>(&request).and_then(|b| engine.set_picture_adjust(&token, b.brightness, b.contrast)))
+            done(
+                cam_of(&request).and_then(|cam| {
+                    body_json::<Body>(&request).and_then(|b| engine.set_picture_adjust(&token, cam, b.brightness, b.contrast))
+                }),
+            )
         }
-        ("POST", "/api/camera/auto-contrast") => done(engine.auto_contrast(&token)),
-        ("POST", "/api/camera/picture/reset") => done(engine.reset_picture_adjust(&token)),
+        ("POST", "/api/camera/auto-contrast") => done(cam_of(&request).and_then(|cam| engine.auto_contrast(&token, cam))),
+        ("POST", "/api/camera/picture/reset") => done(cam_of(&request).and_then(|cam| engine.reset_picture_adjust(&token, cam))),
 
         ("POST", "/api/game/start") => {
             #[derive(Deserialize, Default)]
@@ -223,6 +243,16 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
     }
 }
 
+/// The camera a request is about: `?cam=2` is the second camera, no `cam` (or `cam=1`) the main one. The engine
+/// refuses the second camera when there is none.
+fn cam_of(request: &Request) -> ApiResult<usize> {
+    match request.query_param("cam") {
+        None | Some("" | "1") => Ok(0),
+        Some("2") => Ok(1),
+        Some(_) => Err(ApiError::BadRequest("cam must be 1 or 2".into())),
+    }
+}
+
 /// `ID` or `ID/pgn`.
 fn game_route(engine: &Engine, rest: &str) -> Reply {
     let (id, want_pgn) = match rest.strip_suffix("/pgn") {
@@ -251,7 +281,10 @@ fn game_route(engine: &Engine, rest: &str) -> Reply {
 /// The camera frames as a Motion JPEG stream: one connection, a new picture as soon as
 /// there is one. The page shows it in a plain <img>. Only the newest picture is sent,
 /// so a slow link skips pictures instead of falling behind.
-fn frame_stream(engine: &Arc<Engine>, top_down: bool) -> Reply {
+fn frame_stream(engine: &Arc<Engine>, top_down: bool, cam: usize) -> Reply {
+    if cam == 1 && !engine.has_second_camera() {
+        return Reply::text(400, "there is no second camera");
+    }
     let Some(guard) = engine.open_frame_stream() else {
         return Reply::text(503, "too many picture streams are open");
     };
@@ -264,14 +297,14 @@ fn frame_stream(engine: &Arc<Engine>, top_down: bool) -> Reply {
             let mut silent_since = std::time::Instant::now();
             let mut uncalibrated_since: Option<std::time::Instant> = None;
             loop {
-                match engine.wait_for_frame(last.as_ref(), Duration::from_secs(1)) {
+                match engine.wait_for_frame(cam, last.as_ref(), Duration::from_secs(1)) {
                     Some(frame) => {
                         silent_since = std::time::Instant::now();
                         let jpeg: Arc<Vec<u8>> = if top_down {
                             // The board view needs no more than a few pictures per second.
                             std::thread::sleep(TOP_DOWN_PAUSE);
-                            let newest = engine.latest_frame().unwrap_or_else(|| Arc::clone(&frame));
-                            let made = engine.warped_jpeg_of(&newest, true);
+                            let newest = engine.latest_frame(cam).unwrap_or_else(|| Arc::clone(&frame));
+                            let made = engine.warped_jpeg_of(cam, &newest, true);
                             last = Some(newest);
                             match made {
                                 Ok(bytes) => {
@@ -464,12 +497,12 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("calibrate"));
 
         // The camera is off until the calibration page asks for it.
-        assert!(rig.engine.latest_frame().is_none());
+        assert!(rig.engine.latest_frame(0).is_none());
         assert_eq!(rig.call("GET", "/frame.jpg", "", "").0, 503);
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 409);
 
         assert_eq!(rig.call("POST", "/api/calibration/open", ALICE, "").0, 200);
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.state(ALICE)["mode"], "calibrating");
         assert_eq!(rig.call("GET", "/frame.jpg", "", "").0, 200);
 
@@ -482,7 +515,7 @@ mod tests {
         assert!(rig.dir.join("calibration.json").exists());
 
         assert_eq!(rig.call("POST", "/api/calibration/close", ALICE, "").0, 200);
-        wait_for("camera off", || rig.engine.latest_frame().is_none());
+        wait_for("camera off", || rig.engine.latest_frame(0).is_none());
         assert_eq!(rig.state(ALICE)["mode"], "idle");
     }
 
@@ -491,7 +524,7 @@ mod tests {
         let rig = rig("turn", SourceSpec::Synthetic);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         let before = rig.state(ALICE);
         let (w, h) = (before["camera"]["width"].as_u64().unwrap(), before["camera"]["height"].as_u64().unwrap());
@@ -531,7 +564,7 @@ mod tests {
         // The camera is off: there is nothing to measure.
         assert_eq!(rig.call("POST", "/api/camera/auto-contrast", ALICE, "").0, 409);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
 
         assert_eq!(rig.call("POST", "/api/camera/picture", BOB, r#"{"brightness": 10, "contrast": 1}"#).0, 403);
         assert_eq!(rig.call("POST", "/api/camera/picture", ALICE, r#"{"brightness": 10, "contrast": 0}"#).0, 400);
@@ -541,7 +574,7 @@ mod tests {
         assert_eq!(state["picture"]["contrast"], 1.5);
         // What the page shows is adjusted, the raw picture is not.
         wait_for("the adjusted picture", || {
-            let frame = rig.engine.latest_frame().unwrap();
+            let frame = rig.engine.latest_frame(0).unwrap();
             !Arc::ptr_eq(&frame.image, &frame.raw) && frame.image.as_raw() != frame.raw.as_raw()
         });
 
@@ -583,7 +616,7 @@ mod tests {
         let rig = rig("stream", SourceSpec::Synthetic);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
 
         let reply = (rig.handler)(Request::for_test("GET", "/frame.mjpg", &[], ""));
         let Reply::Stream { content_type, run } = reply else { panic!("expected a stream") };
@@ -604,7 +637,7 @@ mod tests {
         // The camera is off: nothing to look at.
         assert_eq!(rig.call("POST", "/api/calibration/detect", ALICE, "").0, 409);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
 
         assert_eq!(rig.call("POST", "/api/calibration/detect", BOB, "").0, 403);
         let (status, body) = rig.call("POST", "/api/calibration/detect", ALICE, "");
@@ -633,7 +666,7 @@ mod tests {
         rig.state(ALICE);
         assert_eq!(rig.state(ALICE)["stabilize"]["on"], true, "on unless switched off");
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &body).0, 200);
         assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
         wait_for("the calibration to move", || rig.state(ALICE)["stabilize"]["adjusted"].as_u64().unwrap() >= 1);
@@ -665,7 +698,7 @@ mod tests {
         assert_eq!(rig.state(ALICE)["stabilize"]["on"], false);
         assert!(!crate::picture::Picture::load(&rig.dir.join("picture.json")).unwrap().follow, "kept for next time");
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         rig.call("POST", "/api/calibration", ALICE, &body);
         rig.call("POST", "/api/game/start", ALICE, "{}");
         // Plenty of time for it to have happened.
@@ -703,7 +736,7 @@ mod tests {
         let rig = rig("board-stream", SourceSpec::Synthetic);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
 
         let Reply::Stream { content_type, run } = (rig.handler)(Request::for_test("GET", "/warp.mjpg", &[], "")) else {
@@ -748,7 +781,7 @@ mod tests {
         assert_eq!(rig.call("POST", "/api/game/promotion", ALICE, r#"{"piece": "n"}"#).0, 409);
 
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert_eq!(rig.call("POST", "/api/game/resume", ALICE, "").0, 200);
         let state = rig.state(ALICE);
@@ -797,7 +830,7 @@ mod tests {
         let rig = rig_with_unfinished_game("empty", None);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert_eq!(rig.call("POST", "/api/game/resume", ALICE, "").0, 200);
         // Take the only move back: an empty game, which is saved like any other.
@@ -812,7 +845,7 @@ mod tests {
         let rig = rig(name, SourceSpec::Synthetic);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
         rig
@@ -888,7 +921,7 @@ mod tests {
         let rig = rig("game", SourceSpec::Demo { move_interval: Duration::from_millis(40) });
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
 
         let start = json!({"white": "Morphy", "black": "Duke", "started_at": "2026-11-04T10:15:30.000Z"});
@@ -949,7 +982,7 @@ mod tests {
         let rig = rig_with("recording", SourceSpec::Demo { move_interval: Duration::from_millis(600) }, Duration::from_millis(100), true);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
         wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
@@ -992,7 +1025,7 @@ mod tests {
         let rig = rig_with("recording-manual", SourceSpec::Synthetic, Duration::from_millis(60), true);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         rig.call("POST", "/api/calibration", ALICE, &corners_json());
         assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
         assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move":"e2e4"}"#).0, 200);
@@ -1006,7 +1039,8 @@ mod tests {
         });
         let events: Vec<Value> =
             std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        let people: Vec<&Value> = events.iter().filter(|e| e["type"] != "frame" && e["type"] != "closed").collect();
+        let people: Vec<&Value> =
+            events.iter().filter(|e| !["frame", "views", "closed"].contains(&e["type"].as_str().unwrap_or(""))).collect();
         let kinds: Vec<&str> = people.iter().map(|e| e["type"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["manual", "manual", "undo", "end"], "{people:?}");
         assert_eq!(people[0]["text"], "e2e4");
@@ -1062,7 +1096,7 @@ mod tests {
         assert_eq!(list["cameras"][1], json!({"id": "1", "name": "USB Webcam"}));
 
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert!(!rig.state(ALICE)["calibration"].is_null());
 
@@ -1083,7 +1117,7 @@ mod tests {
         assert!(rig.state(ALICE)["calibration"].is_null());
         assert!(std::fs::read_to_string(dir.join("camera.json")).unwrap().contains("USB Webcam"));
         assert_eq!(rig.call("GET", "/api/camera/list", "", "").1["selected"], "1");
-        wait_for("a picture from the new camera", || rig.engine.latest_frame().is_some());
+        wait_for("a picture from the new camera", || rig.engine.latest_frame(0).is_some());
 
         // Not during a game.
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
@@ -1106,7 +1140,7 @@ mod tests {
         let rig = Rig { handler: handler(Arc::clone(&engine), 8), engine, dir };
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
         // The first move of the demo is taken with a doubt.
@@ -1172,11 +1206,246 @@ mod tests {
     }
 
     #[test]
+    fn a_program_with_one_camera_has_no_second_one_and_says_so() {
+        let rig = rig("onecamera", SourceSpec::Synthetic);
+        assert!(rig.state(ALICE)["second"].is_null());
+        assert!(rig.call("GET", "/api/camera/list", "", "").1["second"].is_null());
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        // The second camera is refused everywhere, and the first is not touched; so is a camera that cannot be.
+        assert_eq!(rig.call("POST", "/api/calibration?cam=2", ALICE, &corners_json()).0, 400);
+        assert_eq!(rig.call("POST", "/api/calibration/detect?cam=2", ALICE, "").0, 400);
+        assert_eq!(rig.call("POST", "/api/camera/rotate?cam=2", ALICE, r#"{"turns": 1}"#).0, 400);
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": "1"}"#).0, 400);
+        assert_eq!(rig.call("GET", "/frame.mjpg?cam=2", "", "").0, 400);
+        assert_eq!(rig.call("GET", "/frame.jpg?cam=2", "", "").0, 503);
+        assert_eq!(rig.call("GET", "/warp.jpg?cam=3", "", "").0, 400);
+        assert_eq!(rig.call("POST", "/api/calibration?cam=1", ALICE, &corners_json()).0, 200);
+        assert!(rig.state(ALICE)["calibration"].is_array());
+        // A game follows with the one camera, and the tracker says which cameras it looks through.
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
+        wait_for("the squares to be learned", || rig.state(ALICE)["tracker"]["status"] == "watching");
+        assert_eq!(rig.state(ALICE)["tracker"]["views"], json!([true, false]));
+    }
+
+    /// A rig with the demo game seen by two cameras on opposite sides of the board.
+    fn rig_two_cameras(name: &str, move_interval: Duration, record: bool) -> Rig {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let record = record.then(|| crate::record::RecordOptions {
+            backlog: 100_000,
+            ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
+        });
+        let config = EngineConfig { record, second_fixed: true, track_interval: Duration::from_millis(80), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        let (first, second) = camera::demo_pair(Duration::from_millis(100), move_interval);
+        engine.spawn_capture(first).unwrap();
+        engine.spawn_capture_second(second).unwrap();
+        Rig { handler: handler(Arc::clone(&engine), 8), engine, dir }
+    }
+
+    fn second_corners_json() -> String {
+        json!({ "corners": synthetic::second_corners().corners }).to_string()
+    }
+
+    /// Both cameras opened and calibrated, one at a time.
+    fn calibrate_both(rig: &Rig) {
+        rig.state(ALICE);
+        assert_eq!(rig.state(ALICE)["second"]["enabled"], true);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("pictures from both cameras", || rig.engine.latest_frame(0).is_some() && rig.engine.latest_frame(1).is_some());
+        // Each camera has its own calibration, picture and top-down view.
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        let state = rig.state(ALICE);
+        assert!(state["calibration"].is_array() && state["second"]["calibration"].is_null(), "only the first is calibrated");
+        assert_eq!(rig.call("GET", "/warp.jpg?cam=2", "", "").0, 409, "the second is not calibrated yet");
+        assert_eq!(rig.call("POST", "/api/calibration?cam=2", ALICE, &second_corners_json()).0, 200);
+        let state = rig.state(ALICE);
+        assert!(state["calibration"].is_array() && state["second"]["calibration"].is_array());
+        assert_ne!(state["calibration"], state["second"]["calibration"]);
+        assert_eq!(rig.call("GET", "/warp.jpg?cam=2", "", "").0, 200);
+        assert!(rig.dir.join("calibration.json").exists() && rig.dir.join("calibration2.json").exists());
+        assert!(state["second"]["source"].as_str().unwrap().contains("other side"), "{}", state["second"]["source"]);
+    }
+
+    #[test]
+    fn two_cameras_are_calibrated_one_by_one_follow_a_whole_game_and_the_recording_replays_with_both() {
+        use crate::replay::{TrackerOverrides, replay_folder};
+        let rig = rig_two_cameras("two-cameras", Duration::from_millis(600), true);
+        calibrate_both(&rig);
+
+        // The second camera can be turned and adjusted without touching the first.
+        let before = rig.state(ALICE);
+        assert_eq!(rig.call("POST", "/api/camera/picture?cam=2", ALICE, r#"{"brightness": 20, "contrast": 1.2}"#).0, 200);
+        let after = rig.state(ALICE);
+        assert_eq!(after["second"]["picture"]["brightness"], 20.0);
+        assert_eq!(after["picture"], before["picture"], "the first camera's picture is as it was");
+        assert_eq!(rig.call("POST", "/api/camera/picture/reset?cam=2", ALICE, "").0, 200);
+        assert!(rig.dir.join("picture2.json").exists());
+
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("both cameras to be used", || rig.state(BOB)["tracker"]["views"] == json!([true, true]));
+        wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
+        let state = rig.state(BOB);
+        assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 33);
+        assert_eq!(state["game"]["moves"][32]["san"], "Rd8#");
+
+        // The recording has the pictures of both cameras, given together, and a replay finds the game with both.
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let frames: Vec<&Value> = events.iter().filter(|e| e["type"] == "frame").collect();
+        assert!(frames.iter().any(|e| e["cam"] == 0) && frames.iter().any(|e| e["cam"] == 1));
+        assert!(frames.iter().all(|e| e["feed"].is_u64()));
+        let together = frames.windows(2).filter(|w| w[0]["feed"] == w[1]["feed"] && w[0]["cam"] != w[1]["cam"]).count();
+        assert!(together > 5, "the two pictures of a time carry one number: {together}");
+        assert!(events.iter().any(|e| e["type"] == "views"), "which cameras took part is noted");
+        let session: crate::record::SessionMeta = serde_json::from_slice(&std::fs::read(folder.join("session.json")).unwrap()).unwrap();
+        assert_eq!(session.calibration2.map(|c| c.corners), Some(synthetic::second_corners().corners));
+        assert!(session.source.contains(" + "), "{}", session.source);
+        let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        assert_eq!((report.summary.wrong, report.summary.behind), (0, 0), "{}", report.text);
+        assert!(report.summary.found > 0 && report.summary.pictures >= 66, "{}", report.text);
+    }
+
+    /// A camera that works for a number of pictures, and is gone after that (and cannot be opened again).
+    struct Dies {
+        inner: Box<dyn camera::FrameSource>,
+        left: usize,
+    }
+
+    impl camera::FrameSource for Dies {
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn next_frame(&mut self) -> anyhow::Result<image::RgbImage> {
+            if self.left == 0 {
+                anyhow::bail!("the camera was unplugged");
+            }
+            self.left -= 1;
+            self.inner.next_frame()
+        }
+        fn restart(&mut self) {
+            self.inner.restart();
+        }
+    }
+
+    #[test]
+    fn a_second_camera_that_goes_away_during_a_game_does_not_stop_it() {
+        let dir = std::env::temp_dir().join(format!("nicochess-second-dies-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let engine = Engine::new(EngineConfig { second_fixed: true, ..patient() }, store, dir.join("calibration.json"), None);
+        let (first, second) = camera::demo_pair(Duration::from_millis(100), Duration::from_millis(600));
+        engine.spawn_capture(first).unwrap();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (inner, count) = (second, Arc::clone(&opened));
+        engine
+            .spawn_capture_second(Box::new(move || {
+                // The first opening gives a camera that is gone after a while; later ones find nothing.
+                if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                    anyhow::bail!("no camera is there");
+                }
+                Ok(Box::new(Dies { inner: inner()?, left: 90 }) as Box<dyn camera::FrameSource>)
+            }))
+            .unwrap();
+        let rig = Rig { handler: handler(Arc::clone(&engine), 8), engine, dir };
+        calibrate_both(&rig);
+
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("both cameras to be used", || rig.state(BOB)["tracker"]["views"] == json!([true, true]));
+        // The second goes away in the middle of the game (after about nine seconds of pictures): it is reported, and
+        // the game goes on to its end with the first.
+        wait_for("the second camera to be reported", || !rig.state(BOB)["second"]["error"].is_null());
+        assert!(rig.state(BOB)["game"]["moves"].as_array().unwrap().len() < 33, "it went away before the end");
+        wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
+        let state = rig.state(BOB);
+        assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 33);
+        assert!(state["camera"]["error"].is_null(), "the first camera is fine");
+    }
+
+    #[test]
+    fn the_second_camera_is_chosen_and_switched_off_from_the_page() {
+        use crate::choice::{CameraInfo, CameraSelection};
+        let dir = std::env::temp_dir().join(format!("nicochess-choose-second-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let cameras = vec![
+            CameraInfo { id: "0".into(), name: "Integrated Camera".into() },
+            CameraInfo { id: "1".into(), name: "USB Webcam".into() },
+            CameraInfo { id: "2".into(), name: "Other Webcam".into() },
+        ];
+        let lister = |cameras: Vec<CameraInfo>| -> Box<dyn Fn() -> anyhow::Result<Vec<CameraInfo>> + Send + Sync> {
+            Box::new(move || Ok(cameras.clone()))
+        };
+        let first = Arc::new(CameraSelection::with_lister("0".into(), Some(dir.join("camera.json")), lister(cameras.clone())));
+        // No second camera chosen yet.
+        let second = Arc::new(CameraSelection::with_lister(String::new(), Some(dir.join("camera2.json")), lister(cameras)));
+        let store = Store::open(&dir.join("games")).unwrap();
+        let config = EngineConfig { camera: Some(Arc::clone(&first)), camera2: Some(Arc::clone(&second)), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        engine.spawn_capture(camera::factory(SourceSpec::Synthetic, Duration::from_millis(5))).unwrap();
+        engine.spawn_capture_second(camera::second_factory(SourceSpec::Synthetic, Duration::from_millis(5), None)).unwrap();
+        let rig = Rig { handler: handler(Arc::clone(&engine), 8), engine, dir: dir.clone() };
+
+        // A second camera can be had, and there is none yet: the first works alone.
+        let state = rig.state(ALICE);
+        assert_eq!((state["second"]["enabled"].clone(), state["second"]["choice"].clone()), (json!(false), json!(true)));
+        let (_, list) = rig.call("GET", "/api/camera/list", "", "");
+        assert_eq!(list["second"], json!({"choice": true, "selected": "", "fixed": false}));
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a picture from the first camera", || rig.engine.latest_frame(0).is_some());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rig.engine.latest_frame(1).is_none(), "no second camera is opened until one is chosen");
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", BOB, r#"{"id": "1"}"#).0, 403);
+
+        // Choosing one opens it at once, and keeps the choice.
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": "7"}"#).0, 400, "no such camera");
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": "0"}"#).0, 409, "the first camera has it");
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": "1"}"#).0, 200);
+        assert_eq!(second.device(), "1");
+        assert!(std::fs::read_to_string(dir.join("camera2.json")).unwrap().contains("USB Webcam"));
+        wait_for("a picture from the second camera", || rig.engine.latest_frame(1).is_some());
+        assert_eq!(rig.state(ALICE)["second"]["enabled"], true);
+        assert_eq!(rig.call("POST", "/api/camera/select", ALICE, r#"{"id": "1"}"#).0, 409, "the second camera has it");
+        assert_eq!(first.device(), "0");
+
+        // Calibrated, then another camera for the second: its calibration was made on the other and is forgotten.
+        assert_eq!(rig.call("POST", "/api/calibration?cam=2", ALICE, &second_corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": "2"}"#).0, 200);
+        assert!(rig.state(ALICE)["second"]["calibration"].is_null());
+        assert!(!dir.join("calibration2.json").exists());
+        wait_for("a picture from the other camera", || rig.engine.latest_frame(1).is_some());
+
+        // Switched off: the camera closes, the first goes on, and what was calibrated stays for the next time.
+        assert_eq!(rig.call("POST", "/api/calibration?cam=2", ALICE, &second_corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": ""}"#).0, 200);
+        assert_eq!(second.device(), "");
+        wait_for("the second camera to close", || rig.engine.latest_frame(1).is_none());
+        let state = rig.state(ALICE);
+        assert_eq!(state["second"]["enabled"], false);
+        assert!(state["second"]["calibration"].is_array(), "kept while it is off");
+        assert!(rig.engine.latest_frame(0).is_some(), "the first camera did not notice");
+        // And back on with the same camera it works again (the thread was only waiting).
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": "2"}"#).0, 200);
+        wait_for("a picture from the second camera again", || rig.engine.latest_frame(1).is_some());
+
+        // Not during a game.
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, "{}").0, 200);
+        assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": ""}"#).0, 409);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"*","reason":"abandoned"}"#).0, 200);
+    }
+
+    #[test]
     fn manual_moves_end_and_abort() {
         let rig = rig("manual", SourceSpec::Synthetic);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
-        wait_for("a frame", || rig.engine.latest_frame().is_some());
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         rig.call("POST", "/api/calibration", ALICE, &corners_json());
 
         // Nothing was played: aborting leaves no game behind.

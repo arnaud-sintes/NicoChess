@@ -28,7 +28,7 @@
   .chip.ctl { border-color: var(--accent); color: var(--accent); }
   .spacer { flex: 1; }
   nav { display: flex; gap: 6px; margin: 8px 0 12px; flex-wrap: wrap; }
-  nav button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  nav button.on, .bar button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
   button, select, input[type=text] {
     font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
     background: var(--card); color: var(--fg);
@@ -131,6 +131,7 @@
           <button class="primary" id="start">Start game</button>
           <button id="to-calibrate" hidden>Calibrate first</button>
         </div>
+        <p class="muted small" id="second-hint" hidden></p>
       </div>
       <div id="start-viewer" class="muted" hidden>No game is being recorded.</div>
 
@@ -213,10 +214,16 @@
 <section id="tab-calibrate" hidden>
   <div class="layout">
     <div class="card">
-      <h2>Camera</h2>
+      <h2 id="camera-title">Camera</h2>
       <div id="cal-viewer" class="muted" hidden>Only the controller can calibrate.</div>
       <div id="cal-controls">
-        <label class="check" id="cam-choose-row" hidden>Camera <select id="cam-select"></select> <button id="cam-refresh" title="Look for the cameras again">Refresh</button></label>
+        <div class="bar" id="cam-tabs" hidden title="The picture, the calibration and the picture settings below are those of the camera chosen here">
+          <button data-cam="0" class="on">Camera 1</button>
+          <button data-cam="1">Camera 2</button>
+        </div>
+        <div class="muted small" id="cam2-info"></div>
+        <label class="check" id="cam-choose-row" hidden><span id="cam-choose-label">Camera</span> <select id="cam-select"></select> <button id="cam-refresh" title="Look for the cameras again">Refresh</button></label>
+        <label class="check" id="cam2-choose-row" hidden>Camera 2 <select id="cam2-select"></select></label>
         <div class="muted small" id="cam-choose-info"></div>
         <div class="bar">
           <button id="cal-open" class="primary">Open the camera</button>
@@ -242,7 +249,7 @@
       <div class="muted small" id="and-camera-info"></div>
     </div>
     <div class="card" id="picture-card" hidden>
-      <h2>Picture</h2>
+      <h2 id="picture-title">Picture</h2>
       <div class="bar">
         <button id="rot-ccw" title="Turn the picture a quarter turn counter-clockwise">&#x27F2; 90&deg;</button>
         <button id="rot-cw" title="Turn the picture a quarter turn clockwise">&#x27F3; 90&deg;</button>
@@ -254,7 +261,7 @@
       <p class="muted">Turning the picture turns the calibration with it. Auto contrast measures the board once it is calibrated (otherwise the whole picture). Both are kept for the next time. They cannot be changed during a game.</p>
     </div>
     <div class="card" id="warp-card" hidden>
-      <h2>Board, top-down</h2>
+      <h2 id="warp-title">Board, top-down</h2>
       <div class="stage"><img id="warp" alt="warped board"></div>
       <p class="muted">White at the bottom, the a-file on the left. The green grid must follow the squares.</p>
     </div>
@@ -310,8 +317,9 @@ function toast(text) {
 }
 function renderNotice() {
   const el = $('notice');
-  const text = S && (S.notice || (S.camera && S.camera.error));
-  el.classList.toggle('err', !!(S && S.camera && S.camera.error));
+  const second = S && S.second && S.second.error ? 'Camera 2: ' + S.second.error : '';
+  const text = S && (S.notice || (S.camera && S.camera.error) || second);
+  el.classList.toggle('err', !!(S && ((S.camera && S.camera.error) || second)));
   el.textContent = text || ''; el.hidden = !text;
 }
 function mmss(sec) {
@@ -456,6 +464,10 @@ function renderLive(ctl) {
   $('game-panel').hidden = !g;
   $('to-calibrate').hidden = !!S.calibration;
   $('start').disabled = !S.calibration;
+  // A second camera that is in use but not calibrated is not looked through: say so before the game starts.
+  const uncalibrated = !!(S.second && S.second.enabled && !S.second.calibration);
+  $('second-hint').hidden = !(ctl && !playing && uncalibrated);
+  if (uncalibrated) $('second-hint').textContent = 'Camera 2 is chosen but not calibrated: only camera 1 will watch the board (see the Calibrate tab).';
 
   if (!g) {
     $('live-title').textContent = 'Board';
@@ -489,7 +501,10 @@ function renderLive(ctl) {
   const statusEl = $('status');
   if (playing) {
     const turn = g.turn === 'white' ? 'White' : 'Black';
-    statusEl.textContent = (STATUS[st] || st) + ' ' + turn + ' to move.';
+    const twoCameras = !!(S.second && S.second.enabled && S.second.calibration) && st !== 'learning';
+    const used = (S.tracker.views || []).filter(Boolean).length;
+    statusEl.textContent = (STATUS[st] || st) + ' ' + turn + ' to move.'
+      + (twoCameras ? (used >= 2 ? ' Two cameras are watching.' : ' Only one camera is giving a picture.') : '');
   } else {
     statusEl.textContent = over ? 'Game over.' : 'The recording is stopped.';
   }
@@ -567,6 +582,13 @@ function showTab(name) {
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
 // ---------- calibration ----------
+// The calibration card is about one camera at a time: the first, or the second when there is one.
+let camN = 0;
+const camQuery = () => camN ? '?cam=2' : '';
+const calOf = n => n ? (S && S.second && S.second.calibration) : (S && S.calibration);
+const pictureOf = n => n ? (S && S.second && S.second.picture) : (S && S.picture);
+// The second camera has a picture to work on only when it is in use.
+const camUsable = () => camN === 0 || !!(S && S.second && S.second.enabled);
 const NAMES = ['a1', 'h1', 'h8', 'a8'];
 const live = $('live'), warp = $('warp'), overlay = $('overlay');
 let clicks = [];
@@ -574,11 +596,22 @@ let calNote = null;                 // a message about the last auto-detect, kep
 
 function renderCalibrate(ctl) {
   if (!S) return;
+  if (camN === 1 && !S.second) camN = 0;
+  const cal = calOf(camN), usable = camUsable();
   const cameraOn = S.mode !== 'idle';
+  // With a second camera there is a tab for each; what is below is about the one chosen.
+  $('cam-tabs').hidden = !S.second;
+  document.querySelectorAll('#cam-tabs button').forEach(b => b.classList.toggle('on', +b.dataset.cam === camN));
+  $('camera-title').textContent = S.second ? 'Camera ' + (camN + 1) : 'Camera';
+  $('picture-title').textContent = S.second ? 'Picture of camera ' + (camN + 1) : 'Picture';
+  $('warp-title').textContent = S.second ? 'Board, top-down, from camera ' + (camN + 1) : 'Board, top-down';
+  $('cam2-info').textContent = !S.second ? ''
+    : camN === 1 && !S.second.enabled ? 'No second camera is in use: the board is watched by camera 1 alone. Choose a camera for camera 2 below (when this computer offers a choice).'
+    : 'Two cameras on opposite sides of the board see more than one: a hand or a tall piece that hides squares from one does not from the other. Each is calibrated by itself.';
   $('cal-viewer').hidden = ctl; $('cal-controls').hidden = !ctl;
   $('cal-open').hidden = cameraOn;
-  $('cal-detect').hidden = !(cameraOn && S.mode === 'calibrating');
-  $('cal-swap').hidden = !(S.calibration && S.mode === 'calibrating');
+  $('cal-detect').hidden = !(cameraOn && S.mode === 'calibrating' && usable);
+  $('cal-swap').hidden = !(cal && S.mode === 'calibrating' && usable);
   $('cal-close').hidden = !(cameraOn && S.mode === 'calibrating');
   if (S.stabilize) {
     $('follow').checked = S.stabilize.on;
@@ -587,19 +620,19 @@ function renderCalibrate(ctl) {
       ? 'Realigned ' + st.adjusted + (st.adjusted === 1 ? ' time' : ' times') + ' this session, the last time by ' + st.last_shift.toFixed(2) + ' of a square.'
       : 'During a game, the board is looked for every second or two and the calibration moves along if it shifted a little.';
   }
-  $('cal-clear').hidden = !(S.calibration && S.mode !== 'playing');
-  $('cal-stage').hidden = !(cameraOn && ctl);
-  $('warp-card').hidden = !(cameraOn && S.calibration);
-  $('picture-card').hidden = !(cameraOn && ctl && S.mode !== 'playing');
+  $('cal-clear').hidden = !(cal && S.mode !== 'playing');
+  $('cal-stage').hidden = !(cameraOn && ctl && usable);
+  $('warp-card').hidden = !(cameraOn && cal && usable);
+  $('picture-card').hidden = !(cameraOn && ctl && S.mode !== 'playing' && usable);
   showPicture();
   if (tab === 'calibrate') { andRender(); camRender(); }
   if (!cameraOn) { clicks = []; calNote = null; }
   if (cameraOn && ctl && !clicks.length && calNote) {
     $('cal-msg').className = 'status' + (calNote.bad ? ' unsure' : '');
     $('cal-msg').textContent = calNote.text;
-  } else if (cameraOn && ctl && !clicks.length) {
+  } else if (cameraOn && ctl && usable && !clicks.length) {
     $('cal-msg').className = 'status';
-    $('cal-msg').textContent = S.calibration
+    $('cal-msg').textContent = cal
       ? 'Calibrated. Click anywhere on the image to do it again.'
       : 'Click the 4 corners of the board, in this order: a1, h1, h8, a8 (a1 is the corner of the square at the left of White’s back row).';
   }
@@ -612,7 +645,7 @@ function drawOverlay() {
   if (!live.naturalWidth) return;
   const sx = w / live.naturalWidth, sy = h / live.naturalHeight;
   const ctx = overlay.getContext('2d');
-  const pts = clicks.length ? clicks : (S && S.calibration) || [];
+  const pts = clicks.length ? clicks : calOf(camN) || [];
   ctx.lineWidth = 2; ctx.strokeStyle = '#3ecf8e'; ctx.font = '14px system-ui';
   ctx.beginPath();
   pts.forEach((p, i) => i ? ctx.lineTo(p[0] * sx, p[1] * sy) : ctx.moveTo(p[0] * sx, p[1] * sy));
@@ -629,13 +662,13 @@ live.addEventListener('click', async ev => {
   if (S && S.mode === 'playing' && !clicks.length &&
       !confirm('A game is being recorded. Calibrating again makes the squares be learned again from the position now. Continue?')) return;
   calNote = null;
-  if (clicks.length === 4 || (S && S.calibration && !clicks.length)) clicks = [];
+  if (clicks.length === 4 || (calOf(camN) && !clicks.length)) clicks = [];
   const r = live.getBoundingClientRect();
   clicks.push([(ev.clientX - r.left) * live.naturalWidth / r.width, (ev.clientY - r.top) * live.naturalHeight / r.height]);
   drawOverlay();
   const msg = $('cal-msg'); msg.className = 'status';
   if (clicks.length < 4) { msg.textContent = 'Now click corner ' + NAMES[clicks.length] + '.'; return; }
-  const ok = await api('POST', '/api/calibration', { corners: clicks });
+  const ok = await api('POST', '/api/calibration' + camQuery(), { corners: clicks });
   clicks = [];
   msg.textContent = ok ? 'Calibration saved.' : 'Rejected. Click the 4 corners again, starting with a1.';
   msg.className = 'status' + (ok ? '' : ' unsure');
@@ -645,7 +678,7 @@ $('cal-open').onclick = () => api('POST', '/api/calibration/open');
 $('cal-detect').onclick = async () => {
   const b = $('cal-detect'); b.disabled = true; b.textContent = 'Looking for the board…';
   clicks = [];
-  const res = await api('POST', '/api/calibration/detect');
+  const res = await api('POST', '/api/calibration/detect' + camQuery());
   b.disabled = false; b.textContent = 'Auto-detect the board';
   calNote = res
     ? { text: res.message + ' Check that the outline and the labels a1, h1, h8, a8 sit on the board, or click the corners to adjust.', bad: false }
@@ -654,23 +687,29 @@ $('cal-detect').onclick = async () => {
 };
 // a1 and h8 are both dark: when the other one was picked, turn the labels half way round.
 $('cal-swap').onclick = async () => {
-  const c = S && S.calibration; if (!c) return;
+  const c = calOf(camN); if (!c) return;
   clicks = [];
-  if (await api('POST', '/api/calibration', { corners: [c[2], c[3], c[0], c[1]] })) {
+  if (await api('POST', '/api/calibration' + camQuery(), { corners: [c[2], c[3], c[0], c[1]] })) {
     calNote = { text: 'Sides swapped: a1 is now at the other dark corner.', bad: false };
     renderCalibrate(true);
   }
 };
 $('follow').onchange = () => api('POST', '/api/camera/follow', { on: $('follow').checked });
 $('cal-close').onclick = () => api('POST', '/api/calibration/close');
-$('cal-clear').onclick = () => confirm('Forget the calibration?') && api('DELETE', '/api/calibration');
+$('cal-clear').onclick = () => confirm('Forget the calibration' + (S && S.second ? ' of camera ' + (camN + 1) : '') + '?') && api('DELETE', '/api/calibration' + camQuery());
+document.querySelectorAll('#cam-tabs button').forEach(b => b.onclick = () => {
+  camN = +b.dataset.cam; clicks = []; calNote = null;
+  renderCalibrate(S && S.role === 'controller'); drawOverlay();
+});
 window.addEventListener('resize', drawOverlay);
 
 // The camera picture is one Motion JPEG stream: the server sends each picture as soon as
 // it has it, with no request and no pause in between.
-let liveOn = false, liveSize = '';
+let liveOn = false, liveSize = '', liveCam = 0;
 function liveStream(wanted) {
-  if (wanted && !liveOn) { liveOn = true; live.src = '/frame.mjpg?t=' + Date.now(); }
+  // Another camera was picked: the stream starts again for that one.
+  if (liveOn && liveCam !== camN) { liveOn = false; live.removeAttribute('src'); liveSize = ''; }
+  if (wanted && !liveOn) { liveOn = true; liveCam = camN; live.src = '/frame.mjpg?cam=' + (camN + 1) + '&t=' + Date.now(); }
   else if (!wanted && liveOn) { liveOn = false; live.removeAttribute('src'); liveSize = ''; }
 }
 // Draw the overlay again only when the picture changes size, not for every picture.
@@ -688,23 +727,24 @@ setInterval(() => {
 }, 300);
 
 // The top-down board is a stream too (a few pictures per second).
-let warpOn = false;
+let warpOn = false, warpCam = 0;
 function warpStream(wanted) {
-  if (wanted && !warpOn) { warpOn = true; warp.src = '/warp.mjpg?t=' + Date.now(); }
+  if (warpOn && warpCam !== camN) { warpOn = false; warp.removeAttribute('src'); }
+  if (wanted && !warpOn) { warpOn = true; warpCam = camN; warp.src = '/warp.mjpg?cam=' + (camN + 1) + '&t=' + Date.now(); }
   else if (!wanted && warpOn) { warpOn = false; warp.removeAttribute('src'); }
 }
 warp.onerror = () => { if (warpOn) { warpOn = false; setTimeout(cameraLoops, 1000); } };
 
 function cameraLoops() {
-  liveStream(tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle');
-  warpStream(tab === 'calibrate' && S && S.mode !== 'idle' && S.calibration);
+  liveStream(tab === 'calibrate' && S && S.role === 'controller' && S.mode !== 'idle' && camUsable());
+  warpStream(tab === 'calibrate' && S && S.mode !== 'idle' && calOf(camN) && camUsable());
 }
 
 // Speed figures under the camera picture, once in a while.
 setInterval(async () => {
   if (!liveOn) { $('cam-stats').textContent = ''; return; }
   try {
-    const r = await (await fetch('/api/camera/stats')).json();
+    const r = await (await fetch('/api/camera/stats?cam=' + (camN + 1))).json();
     $('cam-stats').textContent = r.fps.toFixed(1) + ' pictures/s from the camera · ' + r.process_ms.toFixed(0) + ' ms to process · ' + r.encode_ms.toFixed(0) + ' ms to compress';
   } catch (e) { /* the next time */ }
 }, 1500);
@@ -719,25 +759,34 @@ async function camRefresh() {
   camRender();
 }
 function camRender() {
-  const sel = $('cam-select');
+  const sel = $('cam-select'), sel2 = $('cam2-select');
   const ok = !!(S && S.camera && S.camera.choice && S.role === 'controller' && camList && camList.selectable);
   const list = ok ? camList.cameras : [];
+  // The second camera, when this program can have one that the page chooses: which one is in use ('' is none).
+  const second = ok && S.second && S.second.choice && camList.second ? camList.second : null;
+  const secondSel = second ? second.selected : '';
   $('cam-choose-row').hidden = list.length < 2;
+  $('cam-choose-label').textContent = S && S.second ? 'Camera 1' : 'Camera';
+  $('cam2-choose-row').hidden = !(second && list.length >= 2);
   const playing = !!S && S.mode === 'playing';
   if (list.length >= 2) {
-    const signature = list.map(c => c.id + c.name).join('|') + '/' + camList.selected;
-    if (signature !== camSignature && document.activeElement !== sel) {
+    const signature = list.map(c => c.id + c.name).join('|') + '/' + camList.selected + '/' + secondSel;
+    if (signature !== camSignature && document.activeElement !== sel && document.activeElement !== sel2) {
       camSignature = signature;
-      sel.innerHTML = list.map(c => '<option value="' + esc(c.id) + '">' + esc(c.id + ': ' + c.name) + '</option>').join('');
+      // A camera cannot be both: each list leaves out the one the other uses.
+      const option = c => '<option value="' + esc(c.id) + '">' + esc(c.id + ': ' + c.name) + '</option>';
+      sel.innerHTML = list.filter(c => c.id !== secondSel).map(option).join('');
       sel.value = camList.selected;
+      sel2.innerHTML = '<option value="">No second camera</option>' + list.filter(c => c.id !== camList.selected).map(option).join('');
+      sel2.value = secondSel;
     }
   }
-  sel.disabled = playing;
+  sel.disabled = playing; sel2.disabled = playing;
   $('cam-refresh').disabled = playing;
   $('cam-choose-info').textContent = !ok ? ''
     : camList.error ? 'Cannot list the cameras: ' + camList.error
     : playing ? 'The camera cannot be changed during a game.'
-    : list.length >= 2 ? 'Changing the camera forgets the calibration of the board: calibrate again.'
+    : list.length >= 2 ? 'Changing a camera forgets the calibration of the board on it: calibrate again.'
     : list.length === 1 ? 'One camera found: ' + list[0].name + '.'
     : 'No camera found: is it plugged in, and allowed in Settings > Privacy > Camera?';
 }
@@ -753,9 +802,22 @@ $('cam-select').onchange = async () => {
   camSignature = '';
   camRefresh();
 };
+$('cam2-select').onchange = async () => {
+  const sel = $('cam2-select');
+  if (sel.value && S && S.second && S.second.calibration && !confirm('Changing camera 2 forgets its calibration of the board. Go on?')) {
+    sel.value = camList && camList.second ? camList.second.selected : '';
+    return;
+  }
+  await api('POST', '/api/camera/select?cam=2', { id: sel.value });
+  sel.blur();
+  camSignature = '';
+  camRefresh();
+};
 $('cam-refresh').onclick = camRefresh;
 // A USB camera can be plugged in or pulled out while the page is open.
-setInterval(() => { if (tab === 'calibrate' && !document.hidden && document.activeElement !== $('cam-select')) camRefresh(); }, 5000);
+setInterval(() => {
+  if (tab === 'calibrate' && !document.hidden && document.activeElement !== $('cam-select') && document.activeElement !== $('cam2-select')) camRefresh();
+}, 5000);
 
 // ---------- the Android app: remote server, camera choice ----------
 // Only the WebView of the app has window.NicoAndroid; in a browser the card stays hidden.
@@ -812,7 +874,7 @@ if (NA) {
 // ---------- picture: turn, brightness, contrast ----------
 let pictureTimer = null, pictureDragging = false;
 function showPicture() {
-  const p = S && S.picture;
+  const p = pictureOf(camN);
   if (!p) return;
   if (!pictureDragging) { $('bright').value = p.brightness; $('contrast').value = p.contrast; }
   $('bright-val').textContent = Math.round(p.brightness);
@@ -823,16 +885,16 @@ function sendPicture() {
   $('bright-val').textContent = Math.round(+$('bright').value);
   $('contrast-val').textContent = (+$('contrast').value).toFixed(2);
   clearTimeout(pictureTimer);
-  pictureTimer = setTimeout(() => api('POST', '/api/camera/picture', { brightness: +$('bright').value, contrast: +$('contrast').value }), 120);
+  pictureTimer = setTimeout(() => api('POST', '/api/camera/picture' + camQuery(), { brightness: +$('bright').value, contrast: +$('contrast').value }), 120);
 }
 for (const id of ['bright', 'contrast']) {
   $(id).oninput = () => { pictureDragging = true; sendPicture(); };
   $(id).onchange = () => { pictureDragging = false; };
 }
-$('rot-cw').onclick = () => api('POST', '/api/camera/rotate', { turns: 1 });
-$('rot-ccw').onclick = () => api('POST', '/api/camera/rotate', { turns: -1 });
-$('auto-contrast').onclick = () => api('POST', '/api/camera/auto-contrast');
-$('pic-reset').onclick = () => api('POST', '/api/camera/picture/reset');
+$('rot-cw').onclick = () => api('POST', '/api/camera/rotate' + camQuery(), { turns: 1 });
+$('rot-ccw').onclick = () => api('POST', '/api/camera/rotate' + camQuery(), { turns: -1 });
+$('auto-contrast').onclick = () => api('POST', '/api/camera/auto-contrast' + camQuery());
+$('pic-reset').onclick = () => api('POST', '/api/camera/picture/reset' + camQuery());
 
 // ---------- past games and replay ----------
 let gamesTimer = null;

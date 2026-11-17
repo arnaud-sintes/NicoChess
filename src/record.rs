@@ -3,13 +3,14 @@
 //! Every time play begins (a new game, a resumed one, a game reopened by undo) a folder is made, named
 //! after the start (`2026-11-16_11-30-05`: local time on Windows, UTC elsewhere):
 //!
-//! - `session.json`: how the program was set up: calibration, picture settings, tracker settings, the
-//!   position the tracker started from.
+//! - `session.json`: how the program was set up: calibration, picture settings (of the second camera too, when
+//!   there is one), tracker settings, the position the tracker started from.
 //! - `frames/000001.jpg`, ...: the pictures the detection was given (turned and adjusted as it saw them).
 //!   One every `--record-every` seconds, and every picture while something happens: the tracker is learning,
-//!   a hand is moving, it is unsure, a move was found.
+//!   a hand is moving, it is unsure, a move was found. With two cameras each time brings two pictures.
 //! - `events.jsonl`: one JSON object per line, in order, each with `t` (seconds since the recording began)
-//!   and a `type`: `frame` (the file and the tracker's status), `detect` (moves found, and the position after),
+//!   and a `type`: `frame` (the file, the tracker's status, the camera `cam` and the number `feed` that the
+//!   pictures given together share), `detect` (moves found, and the position after),
 //!   `unsure` (the candidates offered), `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, and
 //!   `closed` last. Positions are FEN strings.
 //!
@@ -35,8 +36,10 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The format of the files below: a replay refuses a recording of a newer format.
-pub const FORMAT: u32 = 1;
+/// The format of the files below: a replay refuses a recording of a newer format. Format 2 added the second camera
+/// (`cam` and `feed` on a `frame` line, `calibration2` and `picture2` in `session.json`); a recording of format 1 is
+/// read as one made with one camera.
+pub const FORMAT: u32 = 2;
 
 /// Pictures that may wait for the writer: more than this and the next ones are dropped (a picture is about a
 /// megabyte in memory), so that a slow disk costs pictures, not memory.
@@ -82,11 +85,16 @@ pub struct SessionMeta {
     pub tracker: TrackerConfig,
     pub calibration: Option<Calibration>,
     pub picture: Picture,
+    /// The second camera, when the game was followed with two: its calibration and picture settings.
+    #[serde(default)]
+    pub calibration2: Option<Calibration>,
+    #[serde(default)]
+    pub picture2: Option<Picture>,
 }
 
 enum Msg {
     Session(Vec<u8>),
-    Frame { t: f64, image: Arc<RgbImage>, status: &'static str },
+    Frame { t: f64, camera: usize, feed: u64, image: Arc<RgbImage>, status: &'static str },
     Line(String),
 }
 
@@ -97,6 +105,9 @@ pub struct Recorder {
     every: Duration,
     backlog: usize,
     last_saved: Option<Instant>,
+    /// How many times pictures were given to the tracker (and offered here): the pictures of one such time, from the
+    /// two cameras, carry the same number, so that a replay gives them to the tracker together.
+    feeds: u64,
     queued: Arc<AtomicUsize>,
     dropped: Arc<AtomicU64>,
     folder: PathBuf,
@@ -129,6 +140,7 @@ impl Recorder {
             every: options.every,
             backlog: options.backlog,
             last_saved: None,
+            feeds: 0,
             queued,
             dropped,
             folder,
@@ -164,25 +176,34 @@ impl Recorder {
         (at.saturating_duration_since(self.begun).as_secs_f64() * 1000.0).round() / 1000.0
     }
 
-    /// Keeps a picture the detection was given, if it is time to (or `force`: something is happening).
-    /// Call it before the events that this picture led to, so that the file lists them in order.
-    pub fn frame(&mut self, at: Instant, image: &Arc<RgbImage>, status: &'static str, force: bool) {
+    /// Keeps the pictures the detection was given this time (each with the number of its camera), if it is time to
+    /// (or `force`: something is happening). Call it before the events that these pictures led to, so that the file
+    /// lists them in order.
+    pub fn frames(&mut self, at: Instant, images: &[(usize, Arc<RgbImage>)], status: &'static str, force: bool) {
+        self.feeds += 1;
         let due = force || self.last_saved.is_none_or(|last| at.saturating_duration_since(last) >= self.every);
         if !due {
             return;
         }
-        // Too many waiting: the pictures that would be kept are lost, never the lines, which are small.
-        if self.queued.load(Ordering::SeqCst) >= self.backlog {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        self.queued.fetch_add(1, Ordering::SeqCst);
         let t = self.seconds(at);
-        if self.send(Msg::Frame { t, image: Arc::clone(image), status }) {
-            self.last_saved = Some(at);
-        } else {
-            self.queued.fetch_sub(1, Ordering::SeqCst);
+        for (camera, image) in images {
+            // Too many waiting: the pictures that would be kept are lost, never the lines, which are small.
+            if self.queued.load(Ordering::SeqCst) >= self.backlog {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            self.queued.fetch_add(1, Ordering::SeqCst);
+            if self.send(Msg::Frame { t, camera: *camera, feed: self.feeds, image: Arc::clone(image), status }) {
+                self.last_saved = Some(at);
+            } else {
+                self.queued.fetch_sub(1, Ordering::SeqCst);
+            }
         }
+    }
+
+    /// Keeps the picture of the first camera: `frames` for one camera.
+    pub fn frame(&mut self, at: Instant, image: &Arc<RgbImage>, status: &'static str, force: bool) {
+        self.frames(at, &[(0, Arc::clone(image))], status, force);
     }
 
     /// Notes something that happened. `data` is an object: its fields go next to `t` and `type`.
@@ -250,13 +271,16 @@ fn writer(folder: PathBuf, rx: Receiver<Msg>, begun: Instant, queued: Arc<Atomic
                     report(format!("{e:#}"));
                 }
             }
-            Msg::Frame { t, image, status } => {
+            Msg::Frame { t, camera, feed, image, status } => {
                 queued.fetch_sub(1, Ordering::SeqCst);
                 n += 1;
                 let name = format!("frames/{n:06}.jpg");
                 let saved = encode_jpeg(&image, JPEG_QUALITY).and_then(|bytes| write_atomic(&folder.join(&name), &bytes));
                 match saved {
-                    Ok(()) => append(&json!({"t": t, "type": "frame", "file": name, "status": status}).to_string(), &mut report),
+                    Ok(()) => append(
+                        &json!({"t": t, "type": "frame", "file": name, "status": status, "cam": camera, "feed": feed}).to_string(),
+                        &mut report,
+                    ),
                     Err(e) => report(format!("{e:#}")),
                 }
             }
@@ -407,6 +431,8 @@ mod tests {
             tracker: TrackerConfig::default(),
             calibration: None,
             picture: Picture::default(),
+            calibration2: None,
+            picture2: None,
         }
     }
 

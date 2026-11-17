@@ -39,6 +39,39 @@ pub fn corners() -> Calibration {
     Calibration::new([[120.0, 440.0], [520.0, 425.0], [470.0, 90.0], [190.0, 100.0]])
 }
 
+/// Where the corners are in the picture of a second camera, which looks at the board from the other side: the
+/// picture of the first camera turned half way round. The corners stay in the order a1, h1, h8, a8.
+pub fn second_corners() -> Calibration {
+    let c = corners().corners;
+    Calibration::new(c.map(|[x, y]| [WIDTH as f32 - x, HEIGHT as f32 - y]))
+}
+
+/// What a second camera on the other side of the board shows, given what the first one shows.
+pub fn seen_from_the_other_side(image: &RgbImage) -> RgbImage {
+    image::imageops::rotate180(image)
+}
+
+/// Covers a square of the board and what is around it (`reach` squares more) with something that is not the
+/// board: a hand or an arm in front of the camera. `calibration` says where the board is in this picture.
+pub fn occlude(image: &mut RgbImage, calibration: &Calibration, square: usize, reach: f32) {
+    use crate::calibration::{MARGIN_PX, SQUARE_PX};
+    let Some(projection) = calibration.projection() else { return };
+    let to_camera = projection.invert();
+    let (file, rank) = ((square % 8) as f32, (square / 8) as f32);
+    let x = MARGIN_PX as f32 + (file + 0.5) * SQUARE_PX as f32;
+    let y = MARGIN_PX as f32 + (7.0 - rank + 0.5) * SQUARE_PX as f32;
+    let (cx, cy) = to_camera * (x, y);
+    let radius = (0.5 + reach) * 40.0;
+    for py in 0..image.height() {
+        for px in 0..image.width() {
+            let (dx, dy) = (px as f32 - cx, py as f32 - cy);
+            if dx * dx + dy * dy <= radius * radius {
+                image.put_pixel(px, py, Rgb([150, 120, 110]));
+            }
+        }
+    }
+}
+
 /// The board seen from above, white at the bottom, without any margin.
 pub fn board_top_down(square_px: u32, grid: &PieceGrid) -> RgbImage {
     let size = 8 * square_px;

@@ -25,6 +25,11 @@ OPTIONS:
                              port is reserved or taken, the next free one among 28080-28089, then any]
     --source <SRC>           camera | demo | synthetic | <image.jpg>   [default: camera]
     --device <X>             camera: /dev/videoN (Linux) or its number 0, 1... (Windows)  [default: /dev/video0, or 0 on Windows]
+    --device2 <X>            a second camera, to look at the board from another side; the pictures of both are used
+                             together. On Windows it can also be chosen on the page and is then kept. Without it the
+                             program works with one camera
+    --second-camera          with --source demo or synthetic: a second camera that shows the board from the other
+                             side, to try two cameras without any
     --width <N>              camera width                        [default: 640]
     --height <N>             camera height                       [default: 480]
     --fps <N>                frames per second kept              [default: 3]
@@ -92,6 +97,8 @@ fn run() -> Result<()> {
     // Without --device the camera chosen last time on the page is used (if it is still there).
     let remember_camera = device_option.is_none();
     let device: String = device_option.unwrap_or_else(|| default_device.into());
+    let second_device: Option<String> = args.opt_value_from_str("--device2")?;
+    let second_synthetic = args.contains("--second-camera");
     let width: u32 = args.opt_value_from_str("--width")?.unwrap_or(640);
     let height: u32 = args.opt_value_from_str("--height")?.unwrap_or(480);
     let fps: f32 = args.opt_value_from_str("--fps")?.unwrap_or(3.0);
@@ -150,6 +157,15 @@ fn run() -> Result<()> {
         bail!("--demo-interval must be positive");
     }
     let interval = Duration::from_secs_f32(1.0 / fps);
+    if second_device.is_some() && source != "camera" {
+        bail!("--device2 goes with --source camera (with the demo or the synthetic board, use --second-camera)");
+    }
+    if second_device.as_deref().is_some_and(|d| d == device) {
+        bail!("--device2 is the same camera as --device");
+    }
+    if second_synthetic && !matches!(source.as_str(), "demo" | "synthetic") {
+        bail!("--second-camera goes with --source demo or synthetic (with a camera, use --device2)");
+    }
 
     let spec = match source.as_str() {
         "camera" => {
@@ -203,6 +219,8 @@ fn run() -> Result<()> {
         max_viewers,
         record: record.then(|| RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))),
         remember_camera,
+        second_device,
+        second_synthetic,
     };
     app::serve_on(options, listener, on_ready)
 }

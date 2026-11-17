@@ -71,6 +71,15 @@ const SAVE_FAILED: &str = "cannot save the game";
 /// Shown when the picture has another size than the one the board was calibrated on.
 const SIZE_NOTICE: &str =
     "The camera picture is not the size it had when the board was calibrated (another camera or resolution): calibrate again.";
+const SIZE_NOTICE_SECOND: &str = "The picture of the second camera is not the size it had when the board was calibrated on it (another camera or resolution): calibrate it again.";
+
+/// How many cameras there can be: the main one, and a second one that is optional.
+pub const CAMERAS: usize = 2;
+/// A camera whose last picture is older than this is not working: the detection goes on without it.
+const FRESH: Duration = Duration::from_secs(2);
+/// A camera that has not given a picture yet is waited for this long after a game begins, so that the squares are
+/// learned from all the cameras at once (opening a USB camera takes a moment).
+const CAMERA_WAIT: Duration = Duration::from_secs(10);
 
 /// Microseconds the last preview JPEG took to make (for the speed figures on the page).
 static ENCODE_US: AtomicU32 = AtomicU32::new(0);
@@ -87,6 +96,11 @@ pub struct EngineConfig {
     pub record: Option<RecordOptions>,
     /// The camera in use, when the page may choose among the cameras of the computer (see `choice`).
     pub camera: Option<Arc<CameraSelection>>,
+    /// The second camera, when this program can have one: the one chosen (empty: none yet).
+    pub camera2: Option<Arc<CameraSelection>>,
+    /// A second camera that is always there (the demo and the synthetic board, which show the board from the other
+    /// side), when `camera2` is not used.
+    pub second_fixed: bool,
 }
 
 impl Default for EngineConfig {
@@ -98,6 +112,8 @@ impl Default for EngineConfig {
             track_interval: Duration::ZERO,
             record: None,
             camera: None,
+            camera2: None,
+            second_fixed: false,
         }
     }
 }
@@ -260,6 +276,50 @@ struct DoubtNote {
     alternatives: Vec<Candidate>,
 }
 
+/// Keeping the calibration of one camera on the board when the camera or the board moves a little.
+struct Follow {
+    /// When the board was last looked for, how many times the calibration was moved, and by how much (in squares)
+    /// the last time.
+    last: Option<Instant>,
+    count: u32,
+    shift: f32,
+    /// How often the board is looked for: slower on a machine where looking takes long.
+    every: Duration,
+    /// The calibration when following began: the board may not drift further than a square from it.
+    anchor: Option<Calibration>,
+    last_save: Option<Instant>,
+}
+
+/// Everything the engine keeps about one camera.
+struct Cam {
+    calibration: Option<Calibration>,
+    picture: Picture,
+    /// What the camera is, as the source says it ("" while it is off).
+    source: String,
+    camera_error: Option<String>,
+    /// When a picture last came, and the number of the last one given to the tracker.
+    last_frame: Option<Instant>,
+    last_fed: u64,
+    /// The pictures are the size the calibration was made for (or there is no calibration).
+    size_ok: bool,
+    follow: Follow,
+}
+
+impl Cam {
+    fn new(calibration: Option<Calibration>, picture: Picture) -> Cam {
+        Cam {
+            calibration,
+            picture,
+            source: String::new(),
+            camera_error: None,
+            last_frame: None,
+            last_fed: 0,
+            size_ok: true,
+            follow: Follow { last: None, count: 0, shift: 0.0, every: FOLLOW_EVERY, anchor: None, last_save: None },
+        }
+    }
+}
+
 struct Inner {
     roles: Roles,
     mode: Mode,
@@ -267,25 +327,17 @@ struct Inner {
     /// The game being recorded, or the last one that finished.
     game: Option<GameRecord>,
     game_started: Option<Instant>,
+    /// When play began (a game started or resumed): the cameras that have not given a picture are waited for a while.
+    begun_at: Option<Instant>,
     tracker: Tracker,
-    calibration: Option<Calibration>,
     candidates: Vec<Candidate>,
     notice: Option<String>,
-    camera_error: Option<String>,
-    source: String,
     last_status: Status,
-    picture: Picture,
+    /// The main camera and the second one.
+    cams: [Cam; CAMERAS],
     last_feed: Option<Instant>,
-    /// When the board was last looked for (to follow it), how many times the calibration was
-    /// moved, and by how much (in squares) the last time.
-    last_follow: Option<Instant>,
-    follow_count: u32,
-    follow_shift: f32,
-    /// How often the board is looked for: slower on a machine where looking takes long.
-    follow_every: Duration,
-    /// The calibration when following began: the board may not drift further than a square from it.
-    follow_anchor: Option<Calibration>,
-    last_follow_save: Option<Instant>,
+    /// Which cameras the tracker was told were giving pictures, the last time (for the recording).
+    last_active: Option<[bool; CAMERAS]>,
     /// The game to write to the disk: set under the lock, written by `flush_save` once the lock is
     /// released (writing and flushing a file can take long on a small machine).
     pending_save: Option<GameRecord>,
@@ -303,20 +355,46 @@ struct Stats {
     process_ms: f32,
 }
 
+/// What belongs to one camera and is not behind the engine's lock: its latest picture, the ways to tell its capture
+/// thread what to do, and where its files are.
+struct Slot {
+    frame: RwLock<Option<Arc<Latest>>>,
+    /// A game starts: a scripted source begins again, a real camera does nothing.
+    restart: AtomicBool,
+    /// Set when another camera was chosen: the capture loop closes the camera and opens the new one at once.
+    reopen: AtomicBool,
+    /// The way to choose this camera among those of the computer, when this program offers a choice.
+    selection: Option<Arc<CameraSelection>>,
+    calibration_path: PathBuf,
+    picture_path: PathBuf,
+    stats: Mutex<Stats>,
+}
+
+impl Slot {
+    fn new(selection: Option<Arc<CameraSelection>>, calibration_path: PathBuf, picture_path: PathBuf) -> Slot {
+        Slot {
+            frame: RwLock::new(None),
+            restart: AtomicBool::new(false),
+            reopen: AtomicBool::new(false),
+            selection,
+            calibration_path,
+            picture_path,
+            stats: Mutex::new(Stats::default()),
+        }
+    }
+}
+
 pub struct Engine {
     inner: Mutex<Inner>,
-    frame: RwLock<Option<Arc<Latest>>>,
+    /// The main camera and the second one.
+    slots: [Slot; CAMERAS],
+    /// The second camera is always there (see `EngineConfig::second_fixed`).
+    second_fixed: bool,
     camera_wanted: Mutex<bool>,
     camera_cv: Condvar,
     hub: Hub,
     clients: AtomicUsize,
-    restart_source: AtomicBool,
-    /// Set when another camera was chosen: the capture loop closes the camera and opens the new one at once.
-    reopen_source: AtomicBool,
-    camera: Option<Arc<CameraSelection>>,
     store: Store,
-    calibration_path: PathBuf,
-    picture_path: PathBuf,
     track_interval: Duration,
     /// Where games are recorded, and the settings of the tracker (kept in the recording).
     record: Option<RecordOptions>,
@@ -325,7 +403,6 @@ pub struct Engine {
     frame_count: Mutex<u64>,
     frame_cv: Condvar,
     frame_streams: AtomicUsize,
-    stats: Mutex<Stats>,
     /// Held while a game is written: one writer at a time, so that an older version cannot land
     /// after a newer one. Taken before `inner`, never while holding it.
     save_lock: Mutex<()>,
@@ -346,8 +423,20 @@ impl Engine {
     pub fn new(config: EngineConfig, store: Store, calibration_path: PathBuf, calibration: Option<Calibration>) -> Arc<Engine> {
         let tracker_config = config.tracker.clone();
         let mut tracker = Tracker::new(config.tracker);
-        tracker.set_calibration(calibration.as_ref());
+        tracker.set_view_calibration(0, calibration.as_ref());
         let picture_path = calibration_path.with_file_name("picture.json");
+        // The second camera has its own files next to those of the first.
+        let second_calibration_path = calibration_path.with_file_name("calibration2.json");
+        let second_picture_path = calibration_path.with_file_name("picture2.json");
+        let second_calibration = Calibration::load(&second_calibration_path).unwrap_or_else(|e| {
+            eprintln!("calibration (second camera): {e:#}; using none, calibrate again");
+            None
+        });
+        tracker.set_view_calibration(1, second_calibration.as_ref());
+        let second_picture = Picture::load(&second_picture_path).unwrap_or_else(|e| {
+            eprintln!("picture (second camera): {e:#}; using the defaults");
+            Picture::default()
+        });
         let unfinished = store.latest_unfinished().unwrap_or_else(|e| {
             eprintln!("store: {e:#}");
             None
@@ -366,45 +455,65 @@ impl Engine {
                 calibrating_since: None,
                 game: unfinished,
                 game_started: None,
+                begun_at: None,
                 tracker,
-                calibration,
                 candidates: Vec::new(),
                 notice: None,
-                camera_error: None,
-                source: String::new(),
                 last_status: Status::NoCalibration,
-                picture,
+                cams: [Cam::new(calibration, picture), Cam::new(second_calibration, second_picture)],
                 last_feed: None,
-                last_follow: None,
-                follow_count: 0,
-                follow_shift: 0.0,
-                follow_every: FOLLOW_EVERY,
-                follow_anchor: None,
-                last_follow_save: None,
+                last_active: None,
                 pending_save: None,
                 recorder: None,
                 doubt: None,
             }),
-            frame: RwLock::new(None),
+            slots: [
+                Slot::new(config.camera, calibration_path, picture_path),
+                Slot::new(config.camera2, second_calibration_path, second_picture_path),
+            ],
+            second_fixed: config.second_fixed,
             camera_wanted: Mutex::new(false),
             camera_cv: Condvar::new(),
             hub: Hub { subscribers: Mutex::new(Vec::new()) },
             clients: AtomicUsize::new(0),
-            restart_source: AtomicBool::new(false),
-            reopen_source: AtomicBool::new(false),
-            camera: config.camera,
             store,
-            calibration_path,
-            picture_path,
             track_interval: config.track_interval,
             record: config.record,
             tracker_config,
             frame_count: Mutex::new(0),
             frame_cv: Condvar::new(),
             frame_streams: AtomicUsize::new(0),
-            stats: Mutex::new(Stats::default()),
             save_lock: Mutex::new(()),
         })
+    }
+
+    // ---- The cameras ----------------------------------------------------------
+
+    /// This program can have a second camera: one to choose, or the always present synthetic one.
+    fn second_offered(&self) -> bool {
+        self.second_fixed || self.slots[1].selection.is_some()
+    }
+
+    /// The second camera is in use: chosen, or always there.
+    fn second_enabled(&self) -> bool {
+        self.second_fixed || self.slots[1].selection.as_ref().is_some_and(|s| !s.device().is_empty())
+    }
+
+    /// This program has a second camera to talk about (one to choose, or the synthetic one).
+    pub fn has_second_camera(&self) -> bool {
+        self.second_offered()
+    }
+
+    /// The camera takes part: the first always does, the second when it is in use.
+    fn cam_enabled(&self, cam: usize) -> bool {
+        cam == 0 || self.second_enabled()
+    }
+
+    /// Wakes the capture threads: a camera was chosen or switched off. The lock is held while notifying, so that
+    /// a thread that has just looked and is about to wait does not miss it.
+    fn wake_cameras(&self) {
+        let _wanted = self.camera_wanted.grab();
+        self.camera_cv.notify_all();
     }
 
     // ---- Camera thread ------------------------------------------------------
@@ -412,51 +521,62 @@ impl Engine {
     /// Runs the capture loop on its own thread: the camera is opened when someone
     /// needs it and closed when nobody does.
     pub fn spawn_capture(self: &Arc<Self>, factory: SourceFactory) -> std::io::Result<()> {
-        let engine = Arc::clone(self);
-        thread::Builder::new().name("capture".into()).spawn(move || engine.capture_loop(factory)).map(|_| ())
+        self.spawn_capture_of(0, factory)
     }
 
-    fn capture_loop(&self, factory: SourceFactory) {
+    /// The same for the second camera. Its thread waits until the camera is in use (chosen, or always there).
+    pub fn spawn_capture_second(self: &Arc<Self>, factory: SourceFactory) -> std::io::Result<()> {
+        self.spawn_capture_of(1, factory)
+    }
+
+    fn spawn_capture_of(self: &Arc<Self>, cam: usize, factory: SourceFactory) -> std::io::Result<()> {
+        let engine = Arc::clone(self);
+        let name = if cam == 0 { "capture" } else { "capture2" };
+        thread::Builder::new().name(name.into()).spawn(move || engine.capture_loop(cam, factory)).map(|_| ())
+    }
+
+    fn capture_loop(&self, cam: usize, factory: SourceFactory) {
+        let slot = &self.slots[cam];
         loop {
             {
                 let mut wanted = self.camera_wanted.grab();
-                while !*wanted {
+                while !(*wanted && self.cam_enabled(cam)) {
                     wanted = self.camera_cv.wait(wanted).unwrap_or_else(PoisonError::into_inner);
                 }
             }
             // A choice of camera made while it was off needs no reopening: it is opened now.
-            self.reopen_source.store(false, Ordering::SeqCst);
+            slot.reopen.store(false, Ordering::SeqCst);
             let mut reopening = false;
             match factory() {
                 Ok(mut source) => {
-                    self.set_source(source.describe());
-                    while self.camera_is_wanted() {
-                        if self.reopen_source.swap(false, Ordering::SeqCst) {
+                    self.set_source(cam, source.describe());
+                    while self.camera_is_wanted() && self.cam_enabled(cam) {
+                        if slot.reopen.swap(false, Ordering::SeqCst) {
                             reopening = true;
                             break;
                         }
-                        if self.restart_source.swap(false, Ordering::SeqCst) {
+                        if slot.restart.swap(false, Ordering::SeqCst) {
                             source.restart();
                         }
                         match source.next_frame() {
                             Ok(image) => {
-                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.on_frame(image))).is_err() {
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.on_frame(cam, image))).is_err() {
                                     eprintln!("camera: a picture could not be processed (internal error); going on");
                                 }
                             }
                             Err(e) => {
-                                self.camera_failed(format!("{e:#}"));
+                                self.camera_failed(cam, format!("{e:#}"));
                                 break;
                             }
                         }
                     }
                     // Dropping the source closes the camera.
                 }
-                Err(e) => self.camera_failed(format!("{e:#}")),
+                Err(e) => self.camera_failed(cam, format!("{e:#}")),
             }
-            *self.frame.write_ok() = None;
-            self.set_source(String::new());
-            if self.camera_is_wanted() && !reopening {
+            *slot.frame.write_ok() = None;
+            self.set_source(cam, String::new());
+            if self.camera_is_wanted() && self.cam_enabled(cam) && !reopening {
                 thread::sleep(CAMERA_RETRY);
             }
         }
@@ -476,30 +596,70 @@ impl Engine {
         inner.mode = Mode::Idle;
         inner.calibrating_since = None;
         // An error of a camera that is now off would only confuse.
-        inner.camera_error = None;
+        for cam in &mut inner.cams {
+            cam.camera_error = None;
+        }
         self.set_camera(false);
     }
 
-    fn set_source(&self, description: String) {
-        self.inner.grab().source = description;
+    fn set_source(&self, cam: usize, description: String) {
+        {
+            let mut inner = self.inner.grab();
+            // The pictures of a camera that was opened (or closed) are numbered from 1 again.
+            inner.cams[cam].last_fed = 0;
+            // A camera that is off has no pictures to be the wrong size.
+            if description.is_empty() {
+                inner.cams[cam].size_ok = true;
+                Self::size_notice(&mut inner);
+            }
+            inner.cams[cam].source = description;
+        }
         self.hub.notify();
     }
 
-    fn camera_failed(&self, message: String) {
-        eprintln!("camera: {message}");
-        self.inner.grab().camera_error = Some(message);
+    fn camera_failed(&self, cam: usize, message: String) {
+        if cam == 0 {
+            eprintln!("camera: {message}");
+        } else {
+            eprintln!("camera 2: {message}");
+        }
+        self.inner.grab().cams[cam].camera_error = Some(message);
         self.hub.notify();
+    }
+
+    /// The notice about a camera whose pictures are not the size its calibration was made for: set while there is
+    /// one, taken away when there is none. True when it changed.
+    fn size_notice(inner: &mut Inner) -> bool {
+        let wanted = if !inner.cams[0].size_ok {
+            Some(SIZE_NOTICE)
+        } else if !inner.cams[1].size_ok {
+            Some(SIZE_NOTICE_SECOND)
+        } else {
+            None
+        };
+        match wanted {
+            Some(text) if inner.notice.as_deref() != Some(text) => {
+                inner.notice = Some(text.to_string());
+                true
+            }
+            None if inner.notice.as_deref().is_some_and(|n| n == SIZE_NOTICE || n == SIZE_NOTICE_SECOND) => {
+                inner.notice = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Handles one camera frame.
-    fn on_frame(&self, image: RgbImage) {
+    fn on_frame(&self, cam: usize, image: RgbImage) {
         let started = Instant::now();
-        let seq = self.frame.read_ok().as_ref().map_or(1, |l| l.seq + 1);
-        let picture = self.inner.grab().picture;
+        let slot = &self.slots[cam];
+        let seq = slot.frame.read_ok().as_ref().map_or(1, |l| l.seq + 1);
+        let picture = self.inner.grab().cams[cam].picture;
         let raw = picture.rotate(image);
         let adjusted = picture.adjust(&raw);
         let latest = Arc::new(Latest::new(raw, adjusted, seq));
-        *self.frame.write_ok() = Some(Arc::clone(&latest));
+        *slot.frame.write_ok() = Some(Arc::clone(&latest));
         {
             *self.frame_count.grab() += 1;
             self.frame_cv.notify_all();
@@ -508,34 +668,65 @@ impl Engine {
         let now = Instant::now();
         let mut guard = self.inner.grab();
         let inner = &mut *guard;
-        let mut changed = inner.camera_error.take().is_some();
+        let mut changed = inner.cams[cam].camera_error.take().is_some();
+        inner.cams[cam].last_frame = Some(now);
         // Time-based clean-up also runs with no page open (the camera must not stay on for ever).
         changed |= self.housekeeping(inner, now);
 
         // A calibration is only good for the picture size it was made for.
         let size = [latest.image.width(), latest.image.height()];
         let mut size_ok = true;
-        if let Some(calibration) = inner.calibration.as_mut() {
+        if let Some(calibration) = inner.cams[cam].calibration.as_mut() {
             match calibration.size {
                 None => calibration.size = Some(size),
                 Some(known) if known != size => size_ok = false,
                 Some(_) => {}
             }
         }
-        if !size_ok {
-            if inner.notice.as_deref() != Some(SIZE_NOTICE) {
-                inner.notice = Some(SIZE_NOTICE.to_string());
-                changed = true;
-            }
-        } else if inner.notice.as_deref() == Some(SIZE_NOTICE) {
-            inner.notice = None;
-            changed = true;
-        }
+        inner.cams[cam].size_ok = size_ok;
+        changed |= Self::size_notice(inner);
 
         let feed_due = inner.last_feed.is_none_or(|t| now.duration_since(t) >= self.track_interval);
-        if inner.mode == Mode::Playing && feed_due && size_ok {
+        // The new pictures of the cameras that take part, for the tracker: one for each camera that has a calibration,
+        // gives pictures of that size, and has not been looked at yet.
+        let mut fed: Vec<(usize, Arc<Latest>)> = Vec::new();
+        if inner.mode == Mode::Playing && feed_due {
+            let mut active = [false; CAMERAS];
+            // Several arrays are indexed by the camera together.
+            #[allow(clippy::needless_range_loop)]
+            for c in 0..CAMERAS {
+                let usable = inner.cams[c].calibration.is_some() && inner.cams[c].size_ok && self.cam_enabled(c);
+                let fresh = inner.cams[c].last_frame.is_some_and(|t| now.duration_since(t) < FRESH);
+                // A camera that has gone quiet is left out, so that the others are not held up; one that has not
+                // given a picture since play began is waited for a little, so that all learn the squares together.
+                let waiting =
+                    inner.begun_at.is_some_and(|b| now.duration_since(b) < CAMERA_WAIT && inner.cams[c].last_frame.is_none_or(|t| t < b));
+                active[c] = usable && (fresh || waiting);
+                inner.tracker.set_view_active(c, active[c]);
+                if !usable || !fresh {
+                    continue;
+                }
+                let frame = if c == cam { Some(Arc::clone(&latest)) } else { self.slots[c].frame.read_ok().clone() };
+                if let Some(frame) = frame {
+                    fed.push((c, frame));
+                }
+            }
+            // A camera is not given the same picture twice: a repeat would count as one more still picture.
+            fed.retain(|(c, frame)| frame.seq != inner.cams[*c].last_fed);
+            // The recording says which cameras took part, so that a replay does the same (see `replay`).
+            if inner.last_active != Some(active) && !fed.is_empty() {
+                inner.last_active = Some(active);
+                Self::record(inner, "views", json!({"active": active}));
+            }
+        }
+        if !fed.is_empty() {
             inner.last_feed = Some(now);
-            let detection = inner.tracker.feed(&latest.image, now);
+            let mut images: Vec<Option<&RgbImage>> = vec![None; CAMERAS];
+            for (c, frame) in &fed {
+                images[*c] = Some(frame.image.as_ref());
+                inner.cams[*c].last_fed = frame.seq;
+            }
+            let detection = inner.tracker.feed_views(&images, now);
             // What the recording will say about this picture (see the module record).
             let mut noted: Option<(&'static str, Value)> = None;
             let found = matches!(detection, Detection::Move { .. } | Detection::Sequence { .. });
@@ -581,7 +772,8 @@ impl Engine {
             // The picture comes before what it led to, so that the file reads in order. Every picture is kept
             // while something is going on; only now and then while the board is quiet.
             if let Some(recorder) = inner.recorder.as_mut() {
-                recorder.frame(now, &latest.image, status_name(status), found || status != Status::Watching);
+                let pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|(c, frame)| (*c, Arc::clone(&frame.image))).collect();
+                recorder.frames(now, &pictures, status_name(status), found || status != Status::Watching);
                 if let Some((kind, data)) = noted {
                     recorder.event(now, kind, data);
                 }
@@ -594,14 +786,14 @@ impl Engine {
         if changed {
             self.hub.notify();
         }
-        self.follow_board(&latest, now);
-        self.note_speed(started);
+        self.follow_board(cam, &latest, now);
+        self.note_speed(cam, started);
     }
 
     /// Keeps the figures shown under the camera picture: pictures per second, and the time
     /// one picture takes here.
-    fn note_speed(&self, started: Instant) {
-        let mut stats = self.stats.grab();
+    fn note_speed(&self, cam: usize, started: Instant) {
+        let mut stats = self.slots[cam].stats.grab();
         let smooth = |old: f32, new: f32| if old == 0.0 { new } else { 0.8 * old + 0.2 * new };
         if let Some(last) = stats.last_frame {
             stats.interval_ms = smooth(stats.interval_ms, started.duration_since(last).as_secs_f32() * 1000.0);
@@ -616,8 +808,8 @@ impl Engine {
     }
 
     /// Pictures per second and milliseconds per picture, for the page.
-    pub fn camera_stats(&self) -> Value {
-        let stats = self.stats.grab();
+    pub fn camera_stats(&self, cam: usize) -> Value {
+        let stats = self.slots[cam.min(CAMERAS - 1)].stats.grab();
         let fps = match stats.last_frame {
             Some(last) if last.elapsed() < Duration::from_secs(3) && stats.interval_ms > 0.0 => 1000.0 / stats.interval_ms,
             _ => 0.0,
@@ -633,22 +825,23 @@ impl Engine {
     /// Stabilization: during a game, look for the board again now and then. If the camera or
     /// the board has shifted a little (a knock, a phone slipping on its stand), the calibration
     /// moves with it, so the squares stay where the detection looks for them.
-    fn follow_board(&self, latest: &Latest, now: Instant) {
+    fn follow_board(&self, cam: usize, latest: &Latest, now: Instant) {
         let size = [latest.image.width(), latest.image.height()];
         let calibration = {
             let mut inner = self.inner.grab();
-            if inner.mode != Mode::Playing || !inner.picture.follow {
+            // The switch is one for both cameras: it is kept with the first.
+            if inner.mode != Mode::Playing || !inner.cams[0].picture.follow {
                 return;
             }
-            if inner.last_follow.is_some_and(|t| now.duration_since(t) < inner.follow_every) {
+            if inner.cams[cam].follow.last.is_some_and(|t| now.duration_since(t) < inner.cams[cam].follow.every) {
                 return;
             }
             // Only while the board is quiet: no hand, no move being made.
             if !matches!(inner.tracker.status(), Status::Watching | Status::Learning) {
                 return;
             }
-            inner.last_follow = Some(now);
-            match inner.calibration {
+            inner.cams[cam].follow.last = Some(now);
+            match inner.cams[cam].calibration {
                 Some(c) if c.size.is_none_or(|known| known == size) => c,
                 _ => return,
             }
@@ -659,7 +852,7 @@ impl Engine {
         let found = boarddetect::refine(&latest.image, &calibration);
         let spent = started.elapsed();
         let mut inner = self.inner.grab();
-        inner.follow_every = FOLLOW_EVERY.max(spent * 20);
+        inner.cams[cam].follow.every = FOLLOW_EVERY.max(spent * 20);
         let Ok(found) = found else { return };
         let moved = Calibration::for_frame(found.corners, size[0], size[1]);
         let shift = boarddetect::shift_in_squares(&calibration, &moved);
@@ -667,31 +860,31 @@ impl Engine {
             return;
         }
         // Things may have changed while looking.
-        if inner.mode != Mode::Playing || inner.calibration != Some(calibration) {
+        if inner.mode != Mode::Playing || inner.cams[cam].calibration != Some(calibration) {
             return;
         }
-        let anchor = *inner.follow_anchor.get_or_insert(calibration);
+        let anchor = *inner.cams[cam].follow.anchor.get_or_insert(calibration);
         if boarddetect::shift_in_squares(&anchor, &moved) > FOLLOW_MAX_DRIFT {
             eprintln!("follow: the board is more than a square from where the game began; not following (calibrate again)");
             return;
         }
         match inner.tracker.status() {
             // Nothing learned yet: learn from the better grid.
-            Status::Learning => inner.tracker.set_calibration(Some(&moved)),
-            Status::Watching => inner.tracker.move_calibration(&moved),
+            Status::Learning => inner.tracker.set_view_calibration(cam, Some(&moved)),
+            Status::Watching => inner.tracker.move_view_calibration(cam, &moved),
             _ => return,
         }
-        inner.calibration = Some(moved);
-        Self::record(&inner, "calibration", json!({"how": "follow", "calibration": moved}));
-        let save_due = inner.last_follow_save.is_none_or(|t| now.duration_since(t) >= FOLLOW_SAVE_EVERY);
+        inner.cams[cam].calibration = Some(moved);
+        Self::record(&inner, "calibration", json!({"how": "follow", "cam": cam, "calibration": moved}));
+        let save_due = inner.cams[cam].follow.last_save.is_none_or(|t| now.duration_since(t) >= FOLLOW_SAVE_EVERY);
         if save_due {
-            inner.last_follow_save = Some(now);
+            inner.cams[cam].follow.last_save = Some(now);
         }
-        inner.follow_count += 1;
-        inner.follow_shift = shift;
-        eprintln!("follow: the board moved by {shift:.2} squares, calibration moved along");
+        inner.cams[cam].follow.count += 1;
+        inner.cams[cam].follow.shift = shift;
+        eprintln!("follow: the board moved by {shift:.2} squares in camera {}, calibration moved along", cam + 1);
         drop(inner);
-        if save_due && let Err(e) = moved.save(&self.calibration_path) {
+        if save_due && let Err(e) = moved.save(&self.slots[cam].calibration_path) {
             eprintln!("calibration: cannot save the moved board: {e:#}");
         }
         self.hub.notify();
@@ -789,8 +982,9 @@ impl Engine {
 
     // ---- Frames -------------------------------------------------------------
 
-    pub fn latest_frame(&self) -> Option<Arc<Latest>> {
-        self.frame.read_ok().clone()
+    /// The latest picture of a camera (0 is the main one).
+    pub fn latest_frame(&self, cam: usize) -> Option<Arc<Latest>> {
+        self.slots.get(cam)?.frame.read_ok().clone()
     }
 
     /// Registers an open picture stream. Returns `None` if there are too many.
@@ -803,11 +997,11 @@ impl Engine {
     }
 
     /// Waits for a picture other than `last`. Returns `None` if none comes in time.
-    pub fn wait_for_frame(&self, last: Option<&Arc<Latest>>, timeout: Duration) -> Option<Arc<Latest>> {
+    pub fn wait_for_frame(&self, cam: usize, last: Option<&Arc<Latest>>, timeout: Duration) -> Option<Arc<Latest>> {
         let deadline = Instant::now() + timeout;
         let mut count = self.frame_count.grab();
         loop {
-            if let Some(frame) = self.latest_frame()
+            if let Some(frame) = self.latest_frame(cam)
                 && last.is_none_or(|l| !Arc::ptr_eq(l, &frame))
             {
                 return Some(frame);
@@ -826,14 +1020,15 @@ impl Engine {
     }
 
     /// The top-down board for the current calibration, as JPEG.
-    pub fn warped_jpeg(&self, with_grid: bool) -> ApiResult<Vec<u8>> {
-        let latest = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off".into()))?;
-        self.warped_jpeg_of(&latest, with_grid)
+    pub fn warped_jpeg(&self, cam: usize, with_grid: bool) -> ApiResult<Vec<u8>> {
+        let latest = self.latest_frame(cam).ok_or_else(|| ApiError::Conflict("the camera is off".into()))?;
+        self.warped_jpeg_of(cam, &latest, with_grid)
     }
 
     /// The top-down board from one given camera frame.
-    pub fn warped_jpeg_of(&self, latest: &Latest, with_grid: bool) -> ApiResult<Vec<u8>> {
-        let calibration = self.inner.grab().calibration.ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
+    pub fn warped_jpeg_of(&self, cam: usize, latest: &Latest, with_grid: bool) -> ApiResult<Vec<u8>> {
+        let calibration =
+            self.inner.grab().cams.get(cam).and_then(|c| c.calibration).ok_or_else(|| ApiError::Conflict("not calibrated yet".into()))?;
         let mut warped = calibration::warp_board(&latest.image, &calibration).map_err(ApiError::internal)?;
         if with_grid {
             calibration::draw_grid(&mut warped);
@@ -862,7 +1057,7 @@ impl Engine {
         self.housekeeping(inner, now);
         let playing = inner.mode == Mode::Playing;
         let role = if roles::valid_token(token) { inner.roles.touch(token, now, playing) } else { Role::Viewer };
-        let frame = self.frame.read_ok().clone();
+        let frame = self.slots[0].frame.read_ok().clone();
 
         let game = inner.game.as_ref().map(|g| {
             let position = g.position().ok();
@@ -890,25 +1085,40 @@ impl Engine {
             "mode": inner.mode.name(),
             "camera": {
                 "on": frame.is_some() || inner.mode != Mode::Idle,
-                "source": inner.source,
-                "choice": self.camera.is_some(),
-                "error": inner.camera_error,
+                "source": inner.cams[0].source,
+                "choice": self.slots[0].selection.is_some(),
+                "error": inner.cams[0].camera_error,
                 "width": frame.as_ref().map_or(0, |f| f.image.width()),
                 "height": frame.as_ref().map_or(0, |f| f.image.height()),
             },
-            "calibration": inner.calibration.map(|c| c.corners),
-            "picture": {
-                "rotation": inner.picture.rotation,
-                "brightness": inner.picture.brightness,
-                "contrast": inner.picture.contrast,
+            "calibration": inner.cams[0].calibration.map(|c| c.corners),
+            "picture": picture_json(&inner.cams[0].picture),
+            // The second camera, when this program can have one: whether it is in use, and what the first camera has
+            // above (picture, calibration) for it.
+            "second": if self.second_offered() {
+                let second = self.slots[1].frame.read_ok().clone();
+                json!({
+                    "enabled": self.second_enabled(),
+                    "on": self.second_enabled() && (second.is_some() || inner.mode != Mode::Idle),
+                    "source": inner.cams[1].source,
+                    "choice": self.slots[1].selection.is_some(),
+                    "error": inner.cams[1].camera_error,
+                    "width": second.as_ref().map_or(0, |f| f.image.width()),
+                    "height": second.as_ref().map_or(0, |f| f.image.height()),
+                    "calibration": inner.cams[1].calibration.map(|c| c.corners),
+                    "picture": picture_json(&inner.cams[1].picture),
+                })
+            } else {
+                Value::Null
             },
             "stabilize": {
-                "on": inner.picture.follow,
-                "adjusted": inner.follow_count,
-                "last_shift": (inner.follow_shift * 100.0).round() / 100.0,
+                "on": inner.cams[0].picture.follow,
+                "adjusted": inner.cams.iter().map(|c| c.follow.count).sum::<u32>(),
+                "last_shift": (inner.cams.iter().map(|c| c.follow.shift).fold(0.0f32, f32::max) * 100.0).round() / 100.0,
             },
             "tracker": {
                 "status": status_name(inner.tracker.status()),
+                "views": inner.tracker.views_in_use(),
                 "candidates": candidates_json(&inner.candidates),
                 "doubt": doubt_json(inner),
                 "promotion_pending": promotion_pending,
@@ -996,18 +1206,30 @@ impl Engine {
         Ok(())
     }
 
-    pub fn set_calibration(&self, token: &str, corners: [[f32; 2]; 4]) -> ApiResult {
+    /// A camera number from a request: 0, or 1 when there is a second camera to talk about.
+    fn check_cam(&self, cam: usize) -> ApiResult {
+        if cam >= CAMERAS || (cam == 1 && !self.second_offered()) {
+            return Err(ApiError::BadRequest("there is no such camera".into()));
+        }
+        Ok(())
+    }
+
+    pub fn set_calibration(&self, token: &str, cam: usize, corners: [[f32; 2]; 4]) -> ApiResult {
+        self.check_cam(cam)?;
         let mut inner = self.controlled(token)?;
-        let frame = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
+        let frame = self.latest_frame(cam).ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
         let calibration = Calibration::for_frame(corners, frame.image.width(), frame.image.height());
         calibration.validate(frame.image.width(), frame.image.height())?;
-        calibration.save(&self.calibration_path).map_err(ApiError::internal)?;
-        inner.calibration = Some(calibration);
-        inner.follow_anchor = None;
-        Self::record(&inner, "calibration", json!({"how": "set", "calibration": calibration}));
+        calibration.save(&self.slots[cam].calibration_path).map_err(ApiError::internal)?;
+        inner.cams[cam].calibration = Some(calibration);
+        inner.cams[cam].follow.anchor = None;
+        inner.cams[cam].size_ok = true;
+        Self::record(&inner, "calibration", json!({"how": "set", "cam": cam, "calibration": calibration}));
         // During a game the squares are learned again from the position reached.
-        inner.tracker.set_calibration(Some(&calibration));
+        inner.tracker.set_view_calibration(cam, Some(&calibration));
+        // Any notice is old news now; a camera that is still the wrong size says so again.
         inner.notice = None;
+        Self::size_notice(&mut inner);
         drop(inner);
         self.hub.notify();
         Ok(())
@@ -1015,12 +1237,13 @@ impl Engine {
 
     /// Finds the board in the picture by itself and calibrates with it.
     /// Returns a sentence for the page: what was found, and what to check.
-    pub fn detect_calibration(&self, token: &str) -> ApiResult<String> {
+    pub fn detect_calibration(&self, token: &str, cam: usize) -> ApiResult<String> {
+        self.check_cam(cam)?;
         drop(self.controlled(token)?);
-        let frame = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
+        let frame = self.latest_frame(cam).ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
         // Without the lock: searching takes a fraction of a second.
         let found = boarddetect::find_board(&frame.image).map_err(|e| ApiError::Conflict(format!("{e:#}")))?;
-        self.set_calibration(token, found.corners)?;
+        self.set_calibration(token, cam, found.corners)?;
         let mut text = format!("Board found ({} of 49 inner corners seen). ", found.matched);
         if found.sides_from_pieces {
             text.push_str("White is on the side of the lighter pieces.");
@@ -1033,9 +1256,10 @@ impl Engine {
     /// Switches on or off the following of the board during a game.
     pub fn set_follow(&self, token: &str, on: bool) -> ApiResult {
         let mut inner = self.controlled(token)?;
-        let settings = Picture { follow: on, ..inner.picture };
-        settings.save(&self.picture_path).map_err(ApiError::internal)?;
-        inner.picture = settings;
+        // One switch for both cameras, kept with the first.
+        let settings = Picture { follow: on, ..inner.cams[0].picture };
+        settings.save(&self.slots[0].picture_path).map_err(ApiError::internal)?;
+        inner.cams[0].picture = settings;
         drop(inner);
         self.hub.notify();
         Ok(())
@@ -1053,33 +1277,34 @@ impl Engine {
 
     /// Keeps new picture settings. `turns` is how many quarter turns clockwise the picture
     /// was just turned by (0 when only brightness or contrast changed).
-    fn store_picture(&self, inner: &mut Inner, picture: Picture, turns: i32) -> ApiResult {
+    fn store_picture(&self, inner: &mut Inner, cam: usize, picture: Picture, turns: i32) -> ApiResult {
         picture.validate()?;
-        picture.save(&self.picture_path).map_err(ApiError::internal)?;
-        inner.picture = picture;
+        picture.save(&self.slots[cam].picture_path).map_err(ApiError::internal)?;
+        inner.cams[cam].picture = picture;
         // The next picture will have the new settings. Redo the one on show too, so the
         // page does not have to wait for it.
-        if let Some(latest) = self.latest_frame() {
+        if let Some(latest) = self.latest_frame(cam) {
             let raw = Picture::default().turned(turns).rotate((*latest.raw).clone());
             let adjusted = picture.adjust(&raw);
-            *self.frame.write_ok() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq)));
+            *self.slots[cam].frame.write_ok() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq)));
             *self.frame_count.grab() += 1;
             self.frame_cv.notify_all();
         }
         Ok(())
     }
 
-    /// Turns the picture by `turns` quarter turns clockwise (negative: counter-clockwise).
+    /// Turns the picture of a camera by `turns` quarter turns clockwise (negative: counter-clockwise).
     /// The calibration is turned with it, so it stays valid.
-    pub fn rotate_picture(&self, token: &str, turns: i32) -> ApiResult {
+    pub fn rotate_picture(&self, token: &str, cam: usize, turns: i32) -> ApiResult {
+        self.check_cam(cam)?;
         let mut inner = self.picture_guard(token)?;
         let turns = turns.rem_euclid(4);
         if turns == 0 {
             return Ok(());
         }
         let mut turned_calibration = None;
-        if let Some(calibration) = inner.calibration {
-            let frame = self.latest_frame().ok_or_else(|| {
+        if let Some(calibration) = inner.cams[cam].calibration {
+            let frame = self.latest_frame(cam).ok_or_else(|| {
                 ApiError::Conflict("the camera is off: open it first, so the calibration can be turned with the picture".into())
             })?;
             let (corners, width, height) = picture::turn_points(&calibration.corners, frame.raw.width(), frame.raw.height(), turns);
@@ -1087,24 +1312,25 @@ impl Engine {
             turned.validate(width, height)?;
             turned_calibration = Some(turned);
         }
-        let settings = inner.picture.turned(turns);
+        let settings = inner.cams[cam].picture.turned(turns);
         if let Some(turned) = turned_calibration {
-            turned.save(&self.calibration_path).map_err(ApiError::internal)?;
-            inner.calibration = Some(turned);
-            inner.follow_anchor = None;
-            inner.tracker.set_calibration(Some(&turned));
+            turned.save(&self.slots[cam].calibration_path).map_err(ApiError::internal)?;
+            inner.cams[cam].calibration = Some(turned);
+            inner.cams[cam].follow.anchor = None;
+            inner.tracker.set_view_calibration(cam, Some(&turned));
         }
-        self.store_picture(&mut inner, settings, turns)?;
+        self.store_picture(&mut inner, cam, settings, turns)?;
         drop(inner);
         self.hub.notify();
         Ok(())
     }
 
-    /// Sets brightness and contrast.
-    pub fn set_picture_adjust(&self, token: &str, brightness: f32, contrast: f32) -> ApiResult {
+    /// Sets brightness and contrast of a camera.
+    pub fn set_picture_adjust(&self, token: &str, cam: usize, brightness: f32, contrast: f32) -> ApiResult {
+        self.check_cam(cam)?;
         let mut inner = self.picture_guard(token)?;
-        let settings = Picture { brightness, contrast, ..inner.picture };
-        self.store_picture(&mut inner, settings, 0)?;
+        let settings = Picture { brightness, contrast, ..inner.cams[cam].picture };
+        self.store_picture(&mut inner, cam, settings, 0)?;
         drop(inner);
         self.hub.notify();
         Ok(())
@@ -1112,46 +1338,50 @@ impl Engine {
 
     /// Stretches the picture so that the board (or the whole picture, if the board is
     /// not calibrated yet) uses most of the range from dark to light.
-    pub fn auto_contrast(&self, token: &str) -> ApiResult {
+    pub fn auto_contrast(&self, token: &str, cam: usize) -> ApiResult {
+        self.check_cam(cam)?;
         let mut inner = self.picture_guard(token)?;
-        let frame = self.latest_frame().ok_or_else(|| ApiError::Conflict("the camera is off: open it first".into()))?;
-        let measured = match inner.calibration {
+        let frame = self.latest_frame(cam).ok_or_else(|| ApiError::Conflict("the camera is off: open it first".into()))?;
+        let measured = match inner.cams[cam].calibration {
             Some(calibration) => calibration::warp_board(&frame.raw, &calibration)?,
             None => (*frame.raw).clone(),
         };
         let (contrast, brightness) = Picture::auto_contrast(&measured)?;
-        let settings = Picture { brightness, contrast, ..inner.picture };
-        self.store_picture(&mut inner, settings, 0)?;
+        let settings = Picture { brightness, contrast, ..inner.cams[cam].picture };
+        self.store_picture(&mut inner, cam, settings, 0)?;
         drop(inner);
         self.hub.notify();
         Ok(())
     }
 
     /// Back to the picture as the camera gives it (the rotation stays).
-    pub fn reset_picture_adjust(&self, token: &str) -> ApiResult {
-        self.set_picture_adjust(token, 0.0, 1.0)
+    pub fn reset_picture_adjust(&self, token: &str, cam: usize) -> ApiResult {
+        self.set_picture_adjust(token, cam, 0.0, 1.0)
     }
 
-    pub fn clear_calibration(&self, token: &str) -> ApiResult {
+    pub fn clear_calibration(&self, token: &str, cam: usize) -> ApiResult {
+        self.check_cam(cam)?;
         let mut inner = self.controlled(token)?;
         if inner.mode == Mode::Playing {
             return Err(ApiError::Conflict("a game is running".into()));
         }
-        self.forget_calibration(&mut inner)?;
+        self.forget_calibration(&mut inner, cam)?;
         drop(inner);
         self.hub.notify();
         Ok(())
     }
 
-    fn forget_calibration(&self, inner: &mut Inner) -> ApiResult {
-        match std::fs::remove_file(&self.calibration_path) {
+    fn forget_calibration(&self, inner: &mut Inner, cam: usize) -> ApiResult {
+        match std::fs::remove_file(&self.slots[cam].calibration_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(ApiError::Internal(format!("cannot delete the calibration file: {e}"))),
         }
-        inner.calibration = None;
-        inner.follow_anchor = None;
-        inner.tracker.set_calibration(None);
+        inner.cams[cam].calibration = None;
+        inner.cams[cam].follow.anchor = None;
+        inner.cams[cam].size_ok = true;
+        inner.tracker.set_view_calibration(cam, None);
+        Self::size_notice(inner);
         Ok(())
     }
 
@@ -1160,23 +1390,55 @@ impl Engine {
     /// The cameras of the computer, and the one in use, for the page. `selectable` is false when this program
     /// has no choice to offer (another system, another source).
     pub fn cameras(&self) -> Value {
-        let Some(selection) = &self.camera else { return json!({"selectable": false, "cameras": [], "selected": null}) };
+        // The second camera: whether there is one to have, which one is chosen ("" is none), and whether the page
+        // may choose (a synthetic second camera is always there).
+        let second = if self.second_offered() {
+            json!({
+                "choice": self.slots[1].selection.is_some(),
+                "selected": self.slots[1].selection.as_ref().map_or_else(String::new, |s| s.device()),
+                "fixed": self.second_fixed,
+            })
+        } else {
+            Value::Null
+        };
+        let Some(selection) = &self.slots[0].selection else {
+            return json!({"selectable": false, "cameras": [], "selected": null, "second": second});
+        };
         match selection.list() {
-            Ok(cameras) => json!({"selectable": true, "cameras": cameras, "selected": selection.device()}),
-            Err(e) => json!({"selectable": true, "cameras": [], "selected": selection.device(), "error": format!("{e:#}")}),
+            Ok(cameras) => json!({"selectable": true, "cameras": cameras, "selected": selection.device(), "second": second}),
+            Err(e) => {
+                json!({"selectable": true, "cameras": [], "selected": selection.device(), "second": second, "error": format!("{e:#}")})
+            }
         }
     }
 
-    /// Uses another camera. It is opened at once if the camera is on, and chosen again at the next start.
-    /// The calibration was made on the picture of the other camera, so it is forgotten.
-    pub fn select_camera(&self, token: &str, id: &str) -> ApiResult {
-        let Some(selection) = &self.camera else {
+    /// Uses another camera as the main one (`cam` 0) or as the second one (`cam` 1; an empty `id` switches the second
+    /// camera off). It is opened at once if the cameras are on, and chosen again at the next start. The calibration
+    /// was made on the picture of the other camera, so it is forgotten; a second camera that is only switched off
+    /// keeps its calibration, for when it is switched on again.
+    pub fn select_camera(&self, token: &str, cam: usize, id: &str) -> ApiResult {
+        self.check_cam(cam)?;
+        let Some(selection) = &self.slots[cam].selection else {
             return Err(ApiError::Conflict("there is no choice of camera here".into()));
         };
         let refuse_when_playing = |inner: &Inner| {
             if inner.mode == Mode::Playing { Err(ApiError::Conflict("a game is running: end it first".into())) } else { Ok(()) }
         };
         refuse_when_playing(&*self.controlled(token)?)?;
+        if cam == 1 && id.is_empty() {
+            let mut inner = self.controlled(token)?;
+            refuse_when_playing(&inner)?;
+            if selection.device().is_empty() {
+                return Ok(());
+            }
+            selection.clear().map_err(ApiError::internal)?;
+            inner.cams[1].camera_error = None;
+            // Its thread closes the camera at once.
+            drop(inner);
+            self.wake_cameras();
+            self.hub.notify();
+            return Ok(());
+        }
         // Looking for the cameras takes a moment: not under the lock.
         let camera = selection.find(id).map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
         let mut inner = self.controlled(token)?;
@@ -1184,13 +1446,24 @@ impl Engine {
         if selection.device() == camera.id {
             return Ok(());
         }
-        selection.store(&camera).map_err(ApiError::internal)?;
-        if inner.calibration.is_some() {
-            self.forget_calibration(&mut inner)?;
+        // Two cameras cannot be one: the second opening the camera that the first has would fail.
+        let other = &self.slots[1 - cam].selection;
+        if other.as_ref().is_some_and(|o| o.device() == camera.id) {
+            return Err(ApiError::Conflict(format!(
+                "camera {} is in use as camera {}: choose another one",
+                camera.name,
+                if cam == 0 { 2 } else { 1 }
+            )));
         }
-        inner.camera_error = None;
-        self.reopen_source.store(true, Ordering::SeqCst);
+        selection.store(&camera).map_err(ApiError::internal)?;
+        if inner.cams[cam].calibration.is_some() {
+            self.forget_calibration(&mut inner, cam)?;
+        }
+        inner.cams[cam].camera_error = None;
+        self.slots[cam].reopen.store(true, Ordering::SeqCst);
         drop(inner);
+        // A second camera that was off starts now.
+        self.wake_cameras();
         self.hub.notify();
         Ok(())
     }
@@ -1202,7 +1475,7 @@ impl Engine {
         if inner.mode == Mode::Playing {
             return Err(ApiError::Conflict("a game is already running".into()));
         }
-        if inner.calibration.is_none() {
+        if inner.cams[0].calibration.is_none() {
             return Err(ApiError::Conflict("calibrate the board first".into()));
         }
         let id = self.store.new_id(request.started_at.as_deref());
@@ -1211,7 +1484,9 @@ impl Engine {
         inner.game = Some(game);
         self.begin_playing(&mut inner, position, 0.0);
         // A scripted source (the demo) begins its game again; a real camera does nothing.
-        self.restart_source.store(true, Ordering::SeqCst);
+        for slot in &self.slots {
+            slot.restart.store(true, Ordering::SeqCst);
+        }
         drop(inner);
         self.hub.notify();
         Ok(())
@@ -1226,14 +1501,20 @@ impl Engine {
             program: crate::version_text(),
             started_utc: String::new(),
             started_local: None,
-            source: inner.source.clone(),
+            source: if self.second_enabled() && !inner.cams[1].source.is_empty() {
+                format!("{} + {}", inner.cams[0].source, inner.cams[1].source)
+            } else {
+                inner.cams[0].source.clone()
+            },
             game_id: inner.game.as_ref().map(|g| g.id.clone()).unwrap_or_default(),
             start_fen: game::fen_of(position),
             resumed_at: resume_at,
             record_every: options.every.as_secs_f64(),
             tracker: self.tracker_config.clone(),
-            calibration: inner.calibration,
-            picture: inner.picture,
+            calibration: inner.cams[0].calibration,
+            picture: inner.cams[0].picture,
+            calibration2: if self.second_enabled() { inner.cams[1].calibration } else { None },
+            picture2: self.second_enabled().then_some(inner.cams[1].picture),
         };
         inner.recorder = match Recorder::begin(options, meta, Instant::now()) {
             Ok(recorder) => {
@@ -1283,7 +1564,11 @@ impl Engine {
         inner.candidates.clear();
         inner.notice = None;
         inner.last_status = Status::Learning;
-        inner.follow_anchor = None;
+        for cam in &mut inner.cams {
+            cam.follow.anchor = None;
+        }
+        inner.begun_at = Some(Instant::now());
+        inner.last_active = None;
         self.set_camera(true);
     }
 
@@ -1295,7 +1580,7 @@ impl Engine {
         if inner.mode == Mode::Playing {
             return Err(ApiError::Conflict("a game is already running".into()));
         }
-        if inner.calibration.is_none() {
+        if inner.cams[0].calibration.is_none() {
             return Err(ApiError::Conflict("calibrate the board first".into()));
         }
         let game = inner
@@ -1409,7 +1694,7 @@ impl Engine {
         if inner.mode != Mode::Playing && !reopenable {
             return Err(ApiError::Conflict("no game is running".into()));
         }
-        if reopenable && inner.calibration.is_none() {
+        if reopenable && inner.cams[0].calibration.is_none() {
             return Err(ApiError::Conflict("calibrate the board first".into()));
         }
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
@@ -1568,6 +1853,11 @@ impl Engine {
             None => Ok(None),
         }
     }
+}
+
+/// How a camera's picture is turned and adjusted, for the page.
+fn picture_json(picture: &Picture) -> Value {
+    json!({"rotation": picture.rotation, "brightness": picture.brightness, "contrast": picture.contrast})
 }
 
 /// The candidates of an unsure tracker, for the page and the recording.

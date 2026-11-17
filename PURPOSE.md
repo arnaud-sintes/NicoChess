@@ -50,6 +50,7 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
   people did, and `--replay` to run it through the detection again, also with other tuning values. For finding out
   why a move was missed in a test session and for tuning on real pictures; it is not a video of the game.
 - **Games**: one JSON file per game, a list by date, replay, PGN export, resume of an unfinished game after a restart.
+- **Two cameras (optional)**: a second camera on the opposite side of the board. What the two pictures say is put together square by square, each camera counting as far as it can explain what it sees on that square, so a hand, an arm or a tall piece that hides squares from one is made up for by the other. Each camera has its own calibration and picture settings. The game goes on with one if the other stops; one camera works exactly as before. The second camera is chosen on the page (Windows) or with `--device2`; not on Android.
 - **Camera choice**: on Windows the page lists the cameras of the computer (Calibrate > Camera) and switches to the one
   picked, not during a game; the choice is kept by the camera's name. On Android: see above, with the remote server.
 
@@ -67,6 +68,7 @@ The idea that makes it practical: it does not try to recognize pieces from scrat
 - Up to three moves made between two still pictures (an instant reply, or a moment nobody was looking) are recognised when the board matches that sequence clearly better than any shorter one and any other sequence; otherwise the page stays unsure, offers the likeliest explanations, and the moves can be entered by hand ("e4 e5", up to three). Since the camera only sees empty, white or black squares, two different sequences that leave the same squares occupied by the same colours cannot be told apart: such a case stays unsure.
 - The look of each square is learned and keeps adapting to a light that fades, warms or moves. After a move typed by hand the next still picture is adopted as the look of that position, so tracking resumes by itself. Very dark pictures with strong glare, or a heavy-noise camera, can still make the program unsure or, rarely, wrong; the page shows what was recorded, and a wrong move is undone by hand. All of this is measured on synthetic pictures only.
 - Promotion is guessed as a queen; the page offers the other pieces.
+- Two cameras: what they gain is measured on synthetic pictures only (see `examples/stress.rs`); the two pictures are not synchronised (each is the latest of its camera), and two high-resolution streams may not fit the USB bandwidth of one hub. The cameras are expected on opposite sides; two on the same side add little.
 - Detection quality on a real board, with real lighting and real pieces, is **not yet tested** with any camera. The auto-detect of the board was only tried on a few photos found on the web, and the stabilization only on synthetic pictures.
 - The Android app has been built but not yet run on a phone since the service and the settings were added; a USB camera works only on phones whose Android lists it to apps.
 - The Linux target (INEOS 600) has never run the program with the real camera.

@@ -73,6 +73,10 @@ const CERTAINTY_SCALE: f32 = 4.0;
 
 /// What a square may misfit, in nats, before it counts as unexplained: the noise on top of the usual.
 const SLACK: f32 = 4.0;
+/// With two cameras: how fast a camera is believed less about a square as no content explains what it sees there
+/// (the weight falls by a factor e for each this many nats of misfit), and the least it is ever believed.
+const TRUST_SCALE: f32 = 10.0;
+const TRUST_FLOOR: f32 = 0.02;
 /// What each move beyond "nothing happened" costs: of two explanations that fit as well, the shorter wins.
 const PLY_PENALTY: f32 = 1.5;
 /// What each move beyond the first costs on top: a second move can always soak up a misfit somewhere else on
@@ -224,6 +228,11 @@ impl Gate {
             }
         }
         self.previous = Some(features.to_vec());
+        self.ready()
+    }
+
+    /// When the board became still, once it has been for long enough.
+    fn ready(&self) -> Option<Instant> {
         if self.run >= self.stable_frames { self.since } else { None }
     }
 
@@ -234,11 +243,45 @@ impl Gate {
     }
 }
 
-pub struct Tracker {
-    cfg: TrackerConfig,
+/// What the tracker knows about one camera: where its squares are, what they look like, and when its picture has
+/// stopped moving. With two cameras there are two of these, and what they say is put together (see [`Evidence`]).
+struct View {
     sampler: Option<Sampler>,
     models: Option<Models>,
     gate: Gate,
+    /// What the board looked like in this camera (light corrected) when the position was last confirmed. Absent
+    /// after a person set the position by hand, until a picture of it is seen.
+    reference: Option<Vec<Features>>,
+    /// False while the camera gives no pictures (off, unplugged, too slow): the others do not wait for it.
+    active: bool,
+}
+
+impl View {
+    fn new(cfg: &TrackerConfig) -> View {
+        View { sampler: None, models: None, gate: Gate::new(cfg), reference: None, active: true }
+    }
+
+    /// The camera is calibrated and gives pictures.
+    fn counts(&self) -> bool {
+        self.sampler.is_some() && self.active
+    }
+
+    /// It also knows what the squares look like, so its pictures can be read.
+    fn judges(&self) -> bool {
+        self.counts() && self.models.is_some()
+    }
+}
+
+/// What the cameras that judge showed, averaged over the pictures since the board stopped moving: the number of the
+/// camera, and its squares.
+type Seen = Vec<(usize, Vec<Features>)>;
+
+pub struct Tracker {
+    cfg: TrackerConfig,
+    /// One per camera. There is always one; the others are made when they are first mentioned.
+    views: Vec<View>,
+    /// The cameras that judged the last still picture.
+    judged: Vec<usize>,
     position: Chess,
     learn_pending: bool,
     /// The position was set by hand: the next still picture that fits it teaches the models.
@@ -250,9 +293,6 @@ pub struct Tracker {
     /// The moves offered while unsure, kept so that they come back when the same picture is seen
     /// again after a hand passed over the board.
     candidates: Vec<Candidate>,
-    /// What the board looked like (light corrected) when the position was last confirmed. Absent after a
-    /// person set the position by hand, until a picture of it is seen.
-    reference: Option<Vec<Features>>,
     /// Set when the last moves taken were doubtful; the engine takes it (see `take_doubt`).
     doubt: Option<Doubt>,
     /// The person took back a doubtful move and has to say what was played: nothing is decided until then.
@@ -284,12 +324,26 @@ struct Evidence {
     change: Option<(Vec<f32>, Vec<f32>)>,
 }
 
-impl Evidence {
-    fn new(models: &Models, features: &[Features], base: Grid, reference: Option<&[Features]>) -> Evidence {
-        let change = reference.map(|before| {
+/// One camera's picture of the still board, with what is known about its squares.
+struct Look<'a> {
+    models: &'a Models,
+    features: &'a [Features],
+    reference: Option<&'a [Features]>,
+}
+
+/// What one camera's picture says: the numbers [`Evidence`] is made of.
+struct Part {
+    costs: Vec<[f32; 3]>,
+    typical: Vec<[f32; 3]>,
+    change: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+impl Part {
+    fn of(look: &Look) -> Part {
+        let change = look.reference.map(|before| {
             let mut unchanged = Vec::with_capacity(64);
             let mut changed = Vec::with_capacity(64);
-            for (now, then) in features.iter().zip(before).take(64) {
+            for (now, then) in look.features.iter().zip(before).take(64) {
                 let d = difference(now, then);
                 // Unchanged: how strange the difference is. Changed: how strange it is that there is none.
                 unchanged.push(0.5 * d);
@@ -297,7 +351,55 @@ impl Evidence {
             }
             (unchanged, changed)
         });
-        Evidence { costs: models.costs(features), typical: models.typical().to_vec(), base, change }
+        Part { costs: look.models.costs(look.features), typical: look.models.typical().to_vec(), change }
+    }
+
+    /// How far a camera can be believed about a square: it can when one of the three contents explains what it
+    /// sees. When none does (a hand or an arm in front of the square, a glare, a piece hiding it) it says little,
+    /// and the other camera is heard instead.
+    fn trust(&self, square: usize) -> f32 {
+        let misfit = (0..3).map(|c| (self.costs[square][c] - self.typical[square][c] - SLACK).max(0.0)).fold(f32::MAX, f32::min);
+        (-misfit / TRUST_SCALE).exp().max(TRUST_FLOOR)
+    }
+}
+
+impl Evidence {
+    /// What the pictures say. With one camera this is that camera's numbers. With more, each square takes the
+    /// numbers of the cameras that can be believed about it, weighted by how far they can: a square that one
+    /// camera cannot see well is read from the other, and a square both see badly stays badly seen. The result is
+    /// an average, so it is on the scale of one camera and the thresholds mean the same thing.
+    fn new(looks: &[Look], base: Grid) -> Evidence {
+        let mut parts: Vec<Part> = looks.iter().map(Part::of).collect();
+        if parts.len() == 1 {
+            let only = parts.remove(0);
+            return Evidence { costs: only.costs, typical: only.typical, base, change: only.change };
+        }
+        let trust: Vec<Vec<f32>> = parts.iter().map(|p| (0..64).map(|s| p.trust(s)).collect()).collect();
+        let mix = |value: &dyn Fn(&Part, usize) -> Option<f32>, square: usize| -> f32 {
+            let (mut total, mut weight) = (0.0f32, 0.0f32);
+            for (part, t) in parts.iter().zip(&trust) {
+                if let Some(v) = value(part, square) {
+                    total += t[square] * v;
+                    weight += t[square];
+                }
+            }
+            if weight > 0.0 { total / weight } else { 0.0 }
+        };
+        let mut costs = vec![[0.0f32; 3]; 64];
+        let mut typical = vec![[0.0f32; 3]; 64];
+        for square in 0..64 {
+            for c in 0..3 {
+                costs[square][c] = mix(&|p, s| Some(p.costs[s][c]), square);
+                typical[square][c] = mix(&|p, s| Some(p.typical[s][c]), square);
+            }
+        }
+        // What changed since the last confirmed picture: from the cameras that have one.
+        let change = parts.iter().any(|p| p.change.is_some()).then(|| {
+            let unchanged = (0..64).map(|s| mix(&|p, q| p.change.as_ref().map(|c| c.0[q]), s)).collect();
+            let changed = (0..64).map(|s| mix(&|p, q| p.change.as_ref().map(|c| c.1[q]), s)).collect();
+            (unchanged, changed)
+        });
+        Evidence { costs, typical, base, change }
     }
 
     /// How the picture fits a board: the misfit including what changed since the last confirmed picture, how
@@ -439,12 +541,11 @@ impl Pool {
 
 impl Tracker {
     pub fn new(cfg: TrackerConfig) -> Self {
-        let gate = Gate::new(&cfg);
+        let views = vec![View::new(&cfg)];
         Tracker {
             cfg,
-            sampler: None,
-            models: None,
-            gate,
+            views,
+            judged: Vec::new(),
             position: Chess::default(),
             learn_pending: true,
             resync_pending: false,
@@ -452,9 +553,31 @@ impl Tracker {
             still: false,
             unsure: false,
             candidates: Vec::new(),
-            reference: None,
             doubt: None,
             held: false,
+        }
+    }
+
+    /// The camera `view` (0 is the first), made when it is first mentioned.
+    fn view_mut(&mut self, view: usize) -> &mut View {
+        while self.views.len() <= view {
+            self.views.push(View::new(&self.cfg));
+        }
+        &mut self.views[view]
+    }
+
+    /// Which cameras the detection uses now: calibrated, giving pictures, and knowing what their squares look like.
+    pub fn views_in_use(&self) -> Vec<bool> {
+        self.views.iter().map(View::judges).collect()
+    }
+
+    /// Says whether a camera gives pictures. One that does not is left out until it does: the others neither wait
+    /// for it nor are held back by it.
+    pub fn set_view_active(&mut self, view: usize, active: bool) {
+        let view = self.view_mut(view);
+        if view.active != active {
+            view.active = active;
+            view.gate.reset();
         }
     }
 
@@ -472,7 +595,7 @@ impl Tracker {
     }
 
     pub fn status(&self) -> Status {
-        if self.sampler.is_none() {
+        if self.views.iter().all(|v| v.sampler.is_none()) {
             Status::NoCalibration
         } else if self.learn_pending {
             Status::Learning
@@ -490,18 +613,39 @@ impl Tracker {
         &self.position
     }
 
-    /// Sets (or clears) the calibration. The look of the squares is learned again.
+    /// Sets (or clears) the calibration of the first camera. The look of the squares is learned again.
     pub fn set_calibration(&mut self, calibration: Option<&Calibration>) {
-        self.sampler = calibration.and_then(Sampler::new);
-        self.relearn();
+        self.set_view_calibration(0, calibration);
+    }
+
+    /// Sets (or clears) the calibration of a camera. What its squares look like is forgotten. When no other camera
+    /// has learned the squares, everything is learned again; otherwise the game goes on with the others, and this
+    /// camera learns its squares at the next position that is confirmed (see `learn_late_views`).
+    pub fn set_view_calibration(&mut self, view: usize, calibration: Option<&Calibration>) {
+        let sampler = calibration.and_then(Sampler::new);
+        let view = self.view_mut(view);
+        view.sampler = sampler;
+        view.models = None;
+        view.reference = None;
+        view.gate.reset();
+        // While the squares are being learned, the other cameras go on with it: only this one starts again.
+        if !self.learn_pending && self.views.iter().all(|v| v.models.is_none()) {
+            self.relearn();
+        }
     }
 
     /// The board moved a little in the picture: look at the squares where they are now, but
     /// keep what was learned about them (the position is still the same).
     pub fn move_calibration(&mut self, calibration: &Calibration) {
+        self.move_view_calibration(0, calibration);
+    }
+
+    /// The same for one camera.
+    pub fn move_view_calibration(&mut self, view: usize, calibration: &Calibration) {
         if let Some(sampler) = Sampler::new(calibration) {
-            self.sampler = Some(sampler);
-            self.gate.reset();
+            let view = self.view_mut(view);
+            view.sampler = Some(sampler);
+            view.gate.reset();
         }
     }
 
@@ -519,47 +663,107 @@ impl Tracker {
         self.unsure = false;
         self.held = false;
         self.resync_pending = true;
-        // The reference shows another position: it says nothing about what changed.
-        self.reference = None;
+        // The references show another position: they say nothing about what changed.
+        for view in &mut self.views {
+            view.reference = None;
+        }
     }
 
     /// Learns the look of the squares again from the current position.
     pub fn relearn(&mut self) {
-        self.models = None;
-        self.reference = None;
+        for view in &mut self.views {
+            view.models = None;
+            view.reference = None;
+            view.gate.reset();
+        }
         self.learn_pending = true;
         self.resync_pending = false;
         self.last_eval = None;
         self.unsure = false;
         self.held = false;
         self.still = false;
-        self.gate.reset();
     }
 
+    /// Looks at a picture of the first (or only) camera.
     pub fn feed(&mut self, image: &RgbImage, now: Instant) -> Detection {
-        let Some(sampler) = &self.sampler else { return Detection::Nothing };
-        let mut features = sampler.features(image);
+        self.feed_views(&[Some(image)], now)
+    }
 
-        if self.learn_pending || self.models.is_none() {
-            if self.gate.push(&features, now).is_some() {
+    /// Looks at the pictures that came since the last call: `images[i]` is the new picture of camera `i`, or `None`
+    /// when it has none (a camera that is slower than the others, or off).
+    pub fn feed_views(&mut self, images: &[Option<&RgbImage>], now: Instant) -> Detection {
+        // What each camera that sent a picture shows.
+        let mut shown: Vec<Option<Vec<Features>>> = Vec::with_capacity(self.views.len());
+        for (i, view) in self.views.iter().enumerate() {
+            shown.push(match (&view.sampler, images.get(i).copied().flatten()) {
+                (Some(sampler), Some(image)) if view.active => Some(sampler.features(image)),
+                _ => None,
+            });
+        }
+        if shown.iter().all(Option::is_none) {
+            return Detection::Nothing;
+        }
+
+        if self.learn_pending || self.views.iter().all(|v| v.models.is_none()) {
+            for (view, features) in self.views.iter_mut().zip(&shown) {
+                if let Some(features) = features {
+                    view.gate.push(features, now);
+                }
+            }
+            // The squares are learned when every camera that gives pictures has seen the board still.
+            let waiting: Vec<usize> = (0..self.views.len()).filter(|&i| self.views[i].counts()).collect();
+            if !waiting.is_empty() && waiting.iter().all(|&i| self.views[i].gate.ready().is_some()) {
                 let labels = expected_grid(&self.position);
-                let learned = self.gate.average();
-                if let Ok(models) = Models::learn(&learned, &labels) {
-                    self.models = Some(models);
-                    self.reference = Some(learned);
+                let mut learned_any = false;
+                for &i in &waiting {
+                    let learned = self.views[i].gate.average();
+                    if let Ok(models) = Models::learn(&learned, &labels) {
+                        let view = &mut self.views[i];
+                        view.models = Some(models);
+                        view.reference = Some(learned);
+                        learned_any = true;
+                    }
+                }
+                if learned_any {
                     self.learn_pending = false;
                     self.last_eval = Some(labels);
+                    self.judged = (0..self.views.len()).filter(|&i| self.views[i].judges()).collect();
                     self.still = true;
-                    self.gate.reset();
+                    for view in &mut self.views {
+                        view.gate.reset();
+                    }
                 }
             }
             return Detection::Nothing;
         }
 
-        let models = self.models.as_ref().expect("checked above");
-        // A change of the light all over the board is taken out first.
-        models.compensate_light(&mut features, &expected_grid(&self.position));
-        let Some(since) = self.gate.push(&features, now) else {
+        let expected = expected_grid(&self.position);
+        for (view, features) in self.views.iter_mut().zip(shown.iter_mut()) {
+            let Some(features) = features else { continue };
+            // A change of the light all over the board is taken out first.
+            if let Some(models) = &view.models {
+                models.compensate_light(features, &expected);
+            }
+            view.gate.push(features, now);
+        }
+        // The board is still when every camera that can judge has seen it still; it became still when the last of
+        // them did.
+        let judging: Vec<usize> = (0..self.views.len()).filter(|&i| self.views[i].judges()).collect();
+        // Another set of cameras sees the board than the last time: what the pictures said then is no longer what
+        // they say (a camera that dropped out, or came back, changes how clear a move is), so they are judged afresh.
+        if self.judged != judging {
+            self.judged.clone_from(&judging);
+            self.last_eval = None;
+        }
+        let mut since: Option<Instant> = None;
+        let mut settled = !judging.is_empty();
+        for &i in &judging {
+            match self.views[i].gate.ready() {
+                Some(at) => since = Some(since.map_or(at, |t| t.max(at))),
+                None => settled = false,
+            }
+        }
+        let Some(since) = since.filter(|_| settled) else {
             self.still = false;
             return Detection::Nothing;
         };
@@ -568,36 +772,67 @@ impl Tracker {
             return Detection::Unsure { candidates: self.candidates.clone() };
         }
         // What the board shows is read from the pictures averaged since it stopped moving: steadier than one.
-        let averaged = self.gate.average();
-        let grid = Models::read(&models.costs(&averaged));
-        if self.last_eval == Some(grid) {
-            return if self.unsure { Detection::Unsure { candidates: self.candidates.clone() } } else { Detection::Nothing };
+        let seen: Seen = judging.iter().map(|&i| (i, self.views[i].gate.average())).collect();
+        let evidence = {
+            let looks: Vec<Look> = seen
+                .iter()
+                .filter_map(|(i, features)| {
+                    let view = &self.views[*i];
+                    Some(Look { models: view.models.as_ref()?, features, reference: view.reference.as_deref() })
+                })
+                .collect();
+            Evidence::new(&looks, expected)
+        };
+        let grid = Models::read(&evidence.costs);
+        let detection = if self.last_eval == Some(grid) {
+            if self.unsure { Detection::Unsure { candidates: self.candidates.clone() } } else { Detection::Nothing }
+        } else {
+            self.last_eval = Some(grid);
+            self.evaluate(&evidence, &seen, since)
+        };
+        // The position is confirmed: a camera that came late, with nothing learned, learns it now.
+        if !self.unsure && !matches!(detection, Detection::Unsure { .. }) {
+            self.learn_late_views();
         }
-        self.last_eval = Some(grid);
-        self.evaluate(&averaged, since)
+        detection
+    }
+
+    /// A camera that gave no pictures when the squares were learned (it opened later, or was calibrated during the
+    /// game) learns what its squares look like from the position the game is in, once the board is still.
+    fn learn_late_views(&mut self) {
+        let labels = expected_grid(&self.position);
+        for view in &mut self.views {
+            if !view.counts() || view.models.is_some() || view.gate.ready().is_none() {
+                continue;
+            }
+            let learned = view.gate.average();
+            if let Ok(models) = Models::learn(&learned, &labels) {
+                view.models = Some(models);
+                view.reference = Some(learned);
+                view.gate.reset();
+            }
+        }
     }
 
     /// Which explanation of the still picture is the likeliest, and whether it is clear enough to believe.
-    fn evaluate(&mut self, features: &[Features], since: Instant) -> Detection {
-        let Some(models) = self.models.as_ref() else { return Detection::Nothing };
-        let evidence = Evidence::new(models, features, expected_grid(&self.position), self.reference.as_deref());
+    fn evaluate(&mut self, evidence: &Evidence, seen: &Seen, since: Instant) -> Detection {
         self.doubt = None;
 
         // Nothing, one move, two moves: always looked at together (a reply played before the picture was
         // taken must not be mistaken for one move). Three only when those are not clear.
         let max_plies = self.cfg.max_plies.clamp(1, 3) as u8;
-        let mut pool = Pool::new(&self.position, &evidence);
+        let mut pool = Pool::new(&self.position, evidence);
         for depth in 1..=max_plies.min(2) {
-            pool.expand(depth, &evidence);
+            pool.expand(depth, evidence);
         }
         // Two moves are only believed once three have been looked at too: a pair that leaves a low-contrast
         // change unexplained (a white pawn on a light square) can look best only because the third move is missing.
-        if let Some(detection) = self.decide(&pool, features, since, max_plies <= 2) {
+        if let Some(detection) = self.decide(&pool, seen, since, max_plies <= 2) {
             return detection;
         }
         if max_plies >= 3 {
-            pool.expand(3, &evidence);
-            if let Some(detection) = self.decide(&pool, features, since, true) {
+            pool.expand(3, evidence);
+            if let Some(detection) = self.decide(&pool, seen, since, true) {
                 return detection;
             }
         }
@@ -616,7 +851,7 @@ impl Tracker {
     ///
     /// Nothing or one move are tried first: when one of them explains the picture there is no reason to
     /// invent more moves. Several are only looked at when the simple explanations leave too much unexplained.
-    fn decide(&mut self, pool: &Pool, features: &[Features], since: Instant, last_stage: bool) -> Option<Detection> {
+    fn decide(&mut self, pool: &Pool, seen: &Seen, since: Instant, last_stage: bool) -> Option<Detection> {
         let (simple, simple_runner_up) = pool.best_within(1);
         // A person has just said what the board shows, and the camera has had no time to see more than a reply:
         // a square that looks odd is the models being out of date, not two or three moves nobody saw. Without
@@ -630,15 +865,15 @@ impl Tracker {
             // The models are stale after a hand-set position, so a move that only looks somewhat better than the
             // position the person typed (a queen leaning over its neighbour) is not believed: the typed position
             // is adopted and the models learn from it.
-            return self.accept(pool, 0, simple_runner_up, features, since);
+            return self.accept(pool, 0, simple_runner_up, seen, since);
         }
         if pool.hyps[simple].excess <= limit * self.cfg.max_excess {
             if simple_runner_up - pool.hyps[simple].score < self.cfg.margin {
                 // Two simple explanations fit nearly alike: more moves would not help. If one leads a little,
                 // it is taken and flagged; else the person is asked.
-                return self.accept_doubtful(pool, simple, simple_runner_up, self.cfg.soft_margin, features, since);
+                return self.accept_doubtful(pool, simple, simple_runner_up, self.cfg.soft_margin, seen, since);
             }
-            return self.accept(pool, simple, simple_runner_up, features, since);
+            return self.accept(pool, simple, simple_runner_up, seen, since);
         }
         // The simple explanations leave too much unexplained: several moves may have been played.
         let (best, runner_up) = pool.best_within(3);
@@ -648,9 +883,9 @@ impl Tracker {
         // Several moves at once must be clearer than one: there are many more ways to look alike.
         let scale = 1.0 + 0.5 * f32::from(pool.hyps[best].plies.saturating_sub(1));
         if runner_up - pool.hyps[best].score < self.cfg.margin * scale {
-            return self.accept_doubtful(pool, best, runner_up, self.cfg.soft_margin * scale, features, since);
+            return self.accept_doubtful(pool, best, runner_up, self.cfg.soft_margin * scale, seen, since);
         }
-        self.accept(pool, best, runner_up, features, since)
+        self.accept(pool, best, runner_up, seen, since)
     }
 
     /// The explanations that move something, likeliest first (at most `n`, without `skip`), each with its chance.
@@ -680,7 +915,7 @@ impl Tracker {
         index: usize,
         runner_up: f32,
         soft_needed: f32,
-        features: &[Features],
+        seen: &Seen,
         since: Instant,
     ) -> Option<Detection> {
         let lead = runner_up - pool.hyps[index].score;
@@ -690,12 +925,12 @@ impl Tracker {
         // Written out before `accept` moves the position on.
         let chance = pool.chances(&[index])[0];
         let alternatives = self.likeliest(pool, 3, Some(index), pool.hyps[index].score);
-        let detection = self.accept(pool, index, runner_up, features, since)?;
+        let detection = self.accept(pool, index, runner_up, seen, since)?;
         self.doubt = Some(Doubt { certainty: chance, alternatives });
         Some(detection)
     }
 
-    fn accept(&mut self, pool: &Pool, index: usize, runner_up: f32, features: &[Features], since: Instant) -> Option<Detection> {
+    fn accept(&mut self, pool: &Pool, index: usize, runner_up: f32, seen: &Seen, since: Instant) -> Option<Detection> {
         let best = &pool.hyps[index];
         let gap = runner_up - best.score;
 
@@ -703,14 +938,14 @@ impl Tracker {
             // The board shows the position the game is in.
             if self.resync_pending && best.excess <= RESYNC_FACTOR * self.cfg.max_excess {
                 // A person set this position: whatever the picture looks like now is what it looks like.
-                self.teach(features, RESYNC_WEIGHT);
-                self.reference = Some(features.to_vec());
+                self.teach(seen, RESYNC_WEIGHT);
+                self.remember(seen);
             } else if best.excess > self.cfg.max_excess || best.worst > SQUARE_LIMIT {
                 if best.excess > ADAPT_FACTOR * self.cfg.max_excess || best.worst > SQUARE_LIMIT {
                     return None; // too much is unexplained, or one square is: not a drift of the light
                 }
-                self.teach(features, ADAPT_WEIGHT);
-                self.reference = Some(features.to_vec());
+                self.teach(seen, ADAPT_WEIGHT);
+                self.remember(seen);
             }
             self.resync_pending = false;
             self.unsure = false;
@@ -730,9 +965,9 @@ impl Tracker {
         }
         // A move seen clearly teaches the models what the board looks like now, and more when they were behind.
         if gap >= 2.0 * self.cfg.margin {
-            self.teach(features, if diffuse { ADAPT_WEIGHT } else { 1.0 });
+            self.teach(seen, if diffuse { ADAPT_WEIGHT } else { 1.0 });
         }
-        self.reference = Some(features.to_vec());
+        self.remember(seen);
         self.resync_pending = false;
         self.unsure = false;
         Some(match moves.as_slice() {
@@ -741,11 +976,20 @@ impl Tracker {
         })
     }
 
-    /// The models learn the picture as the look of the current position.
-    fn teach(&mut self, features: &[Features], weight: f32) {
+    /// The models of every camera learn its picture as the look of the current position.
+    fn teach(&mut self, seen: &Seen, weight: f32) {
         let labels = expected_grid(&self.position);
-        if let Some(models) = self.models.as_mut() {
-            models.update(features, &labels, weight);
+        for (i, features) in seen {
+            if let Some(models) = self.views[*i].models.as_mut() {
+                models.update(features, &labels, weight);
+            }
+        }
+    }
+
+    /// What each camera showed is what the board looks like in the position the game is in now.
+    fn remember(&mut self, seen: &Seen) {
+        for (i, features) in seen {
+            self.views[*i].reference = Some(features.clone());
         }
     }
 
@@ -1135,5 +1379,170 @@ mod tests {
         }
         assert_eq!(game.moves.iter().map(|m| m.san.as_str()).collect::<Vec<_>>(), ["e4", "e5", "Nf3"]);
         assert_eq!(game.position().unwrap(), *rig.tracker.position());
+    }
+
+    /// Two cameras on opposite sides of the board (or only the first, to compare). `covered` says, for a picture,
+    /// which squares a hand hides in which camera.
+    struct TwoCameras {
+        tracker: Tracker,
+        now: Instant,
+        frames: u64,
+    }
+
+    impl TwoCameras {
+        fn new(position: Chess, second: bool) -> TwoCameras {
+            let mut tracker = Tracker::new(TrackerConfig::default());
+            tracker.set_view_calibration(0, Some(&synthetic::corners()));
+            if second {
+                tracker.set_view_calibration(1, Some(&synthetic::second_corners()));
+            }
+            tracker.start(position);
+            TwoCameras { tracker, now: Instant::now(), frames: 0 }
+        }
+
+        fn show(&mut self, grid: &PieceGrid, times: usize, covered: &[(usize, usize)]) -> Vec<Detection> {
+            self.show_each(grid, grid, times, covered)
+        }
+
+        /// The cameras show different boards (one of them is wrong, or late).
+        fn show_each(
+            &mut self,
+            first_grid: &PieceGrid,
+            second_grid: &PieceGrid,
+            times: usize,
+            covered: &[(usize, usize)],
+        ) -> Vec<Detection> {
+            let mut out = Vec::new();
+            for _ in 0..times {
+                self.frames += 1;
+                self.now += Duration::from_millis(333);
+                let mut first = synthetic::frame_from_grid(first_grid);
+                synthetic::degrade(&mut first, -15, 10, self.frames);
+                let mut second = synthetic::seen_from_the_other_side(&synthetic::frame_from_grid(second_grid));
+                synthetic::degrade(&mut second, -10, 10, self.frames + 5000);
+                for &(camera, square) in covered {
+                    if camera == 0 {
+                        synthetic::occlude(&mut first, &synthetic::corners(), square, 0.6);
+                    } else {
+                        synthetic::occlude(&mut second, &synthetic::second_corners(), square, 0.6);
+                    }
+                }
+                match self.tracker.feed_views(&[Some(&first), Some(&second)], self.now) {
+                    Detection::Nothing => {}
+                    other => out.push(other),
+                }
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn two_cameras_follow_a_whole_game_as_one_does() {
+        let steps = synthetic::game_steps(&OPERA_GAME);
+        let mut rig = TwoCameras::new(Chess::default(), true);
+        assert!(rig.show(&synthetic::start_grid(), 7, &[]).is_empty());
+        assert_eq!(rig.tracker.status(), Status::Watching);
+        assert_eq!(rig.tracker.views_in_use(), vec![true, true]);
+
+        let mut seen = Vec::new();
+        for step in &steps {
+            let mut lifted = step.before;
+            lifted[usize::from(step.mv.from().unwrap())] = None;
+            assert!(rig.show(&lifted, 1, &[]).is_empty());
+            for detection in rig.show(&step.after, 4, &[]) {
+                match detection {
+                    Detection::Move { mv, .. } => seen.push(uci_of(mv)),
+                    other => panic!("unexpected {other:?} after {}", uci_of(step.mv)),
+                }
+            }
+        }
+        let expected: Vec<String> = steps.iter().map(|s| uci_of(s.mv)).collect();
+        assert_eq!(seen, expected);
+        assert!(rig.tracker.position().is_checkmate());
+    }
+
+    /// An arm comes into one camera's picture, over the squares where a move is played, and stays there. One
+    /// camera cannot see the move; the other one can.
+    #[test]
+    fn a_camera_that_cannot_see_the_squares_is_helped_by_the_other() {
+        let steps = synthetic::game_steps(&["e4", "e5", "Nf3", "Nc6"]);
+        let covered = [(0, usize::from(Square::E2)), (0, usize::from(Square::E4)), (0, usize::from(Square::E3))];
+
+        let mut results = Vec::new();
+        for second in [false, true] {
+            let mut rig = TwoCameras::new(Chess::default(), second);
+            rig.show(&synthetic::start_grid(), 7, &[]);
+            // The arm arrives before the move (a few pictures with it in the way and nothing else happening).
+            rig.show(&synthetic::start_grid(), 4, &covered);
+            let found = rig.show(&steps[0].after, 5, &covered);
+            let right = found.iter().any(|d| matches!(d, Detection::Move { mv, .. } if uci_of(*mv) == "e2e4"));
+            let wrong = found
+                .iter()
+                .any(|d| matches!(d, Detection::Move { mv, .. } if uci_of(*mv) != "e2e4") || matches!(d, Detection::Sequence { .. }));
+            results.push((right, wrong));
+        }
+        assert!(!results[0].1 && !results[1].1, "no wrong move may be recorded: {results:?}");
+        assert!(results[1].0, "with the other camera the move is found: {results:?}");
+        assert!(!results[0].0, "the camera with the arm in the way cannot have found it on its own: {results:?}");
+    }
+
+    #[test]
+    fn a_camera_that_gives_no_pictures_is_left_out_and_comes_back_by_itself() {
+        let steps = synthetic::game_steps(&["e4", "e5", "Nf3", "Nc6", "Bc4"]);
+        let mut rig = TwoCameras::new(Chess::default(), true);
+        rig.show(&synthetic::start_grid(), 7, &[]);
+
+        // The second camera stops: the game goes on with the first.
+        rig.tracker.set_view_active(1, false);
+        assert_eq!(rig.tracker.views_in_use(), vec![true, false]);
+        let found = rig.show(&steps[0].after, 5, &[]);
+        assert!(matches!(found.as_slice(), [Detection::Move { .. }]), "{found:?}");
+        let found = rig.show(&steps[1].after, 5, &[]);
+        assert!(matches!(found.as_slice(), [Detection::Move { .. }]), "{found:?}");
+
+        // It comes back: its squares were learned before, and it takes part again.
+        rig.tracker.set_view_active(1, true);
+        assert_eq!(rig.tracker.views_in_use(), vec![true, true]);
+        let found = rig.show(&steps[2].after, 6, &[]);
+        assert!(matches!(found.as_slice(), [Detection::Move { .. }]), "{found:?}");
+        assert_eq!(rig.tracker.status(), Status::Watching);
+    }
+
+    /// A camera that shows the old board (stuck, or late) makes the tracker unsure; when it is left out, the other
+    /// camera alone is clear, and the tracker decides with that one. (Judging again whenever the set of cameras changes
+    /// also covers the case where the board read is the same as before, which only shows with real timing: see
+    /// `a_second_camera_that_goes_away_during_a_game_does_not_stop_it` in `server`.)
+    #[test]
+    fn a_camera_that_drops_out_while_the_tracker_is_unsure_lets_it_decide_with_the_other() {
+        let steps = synthetic::game_steps(&["e4"]);
+        let mut rig = TwoCameras::new(Chess::default(), true);
+        rig.show(&synthetic::start_grid(), 7, &[]);
+        let found = rig.show_each(&steps[0].after, &synthetic::start_grid(), 6, &[]);
+        assert!(found.iter().all(|d| matches!(d, Detection::Unsure { .. })), "the cameras disagree: nothing is taken: {found:?}");
+        assert_eq!(rig.tracker.status(), Status::Unsure);
+
+        rig.tracker.set_view_active(1, false);
+        let found = rig.show_each(&steps[0].after, &synthetic::start_grid(), 6, &[]);
+        assert!(found.iter().any(|d| matches!(d, Detection::Move { mv, .. } if uci_of(*mv) == "e2e4")), "{found:?}");
+        assert_eq!(rig.tracker.status(), Status::Watching);
+    }
+
+    #[test]
+    fn a_camera_calibrated_during_the_game_learns_its_squares_when_the_position_is_confirmed() {
+        let steps = synthetic::game_steps(&["e4", "e5", "Nf3"]);
+        let mut rig = TwoCameras::new(Chess::default(), false);
+        rig.show(&synthetic::start_grid(), 7, &[]);
+        let found = rig.show(&steps[0].after, 5, &[]);
+        assert!(matches!(found.as_slice(), [Detection::Move { .. }]), "{found:?}");
+        assert_eq!(rig.tracker.views_in_use(), vec![true]);
+
+        // The second camera is switched on in the middle of the game: the first goes on, the second learns.
+        rig.tracker.set_view_calibration(1, Some(&synthetic::second_corners()));
+        assert_eq!(rig.tracker.status(), Status::Watching, "the game goes on with the first camera");
+        let found = rig.show(&steps[0].after, 6, &[]);
+        assert!(found.is_empty(), "{found:?}");
+        assert_eq!(rig.tracker.views_in_use(), vec![true, true]);
+        let found = rig.show(&steps[1].after, 5, &[]);
+        assert!(matches!(found.as_slice(), [Detection::Move { .. }]), "{found:?}");
     }
 }

@@ -7,6 +7,13 @@
 //!
 //! Real recordings are better, and there are none yet: this is what we have to measure the effect of a
 //! change to the tracker. A change should not make the numbers worse.
+//!
+//! Two cameras: STRESS_CAMERAS=2 adds a second camera on the other side of the board. STRESS_HAND=0.4 puts a hand
+//! (or an arm) over a square of the move in each camera, independently, in that share of the plies, and leaves it
+//! there while the move is judged. Run it with one camera and with two to see what the second one is worth:
+//!
+//!     STRESS_HAND=0.4 cargo run --release --example stress
+//!     STRESS_HAND=0.4 STRESS_CAMERAS=2 cargo run --release --example stress
 
 use nicochess::synthetic::{self, Conditions, OPERA_GAME};
 use nicochess::tracker::{Detection, Tracker, TrackerConfig};
@@ -83,11 +90,31 @@ fn moves_of(detection: &Detection) -> Vec<Move> {
     }
 }
 
+/// A number from 0 to 1 that depends only on its two arguments: the same plies get the same hands whatever the
+/// number of cameras.
+fn chance(a: u64, b: u64) -> f32 {
+    let mut state = (a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) | 1;
+    for _ in 0..4 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+    }
+    (state % 10_000) as f32 / 10_000.0
+}
+
 /// `unseen`: every this-many plies, no picture is taken (the tracker must catch up on two moves at once).
 fn play(game: &Game, conditions: &Conditions, config: &TrackerConfig, unseen: Option<usize>) -> Outcome {
+    let cameras: usize = std::env::var("STRESS_CAMERAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let hand: f32 = std::env::var("STRESS_HAND").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let game_seed: u64 = game.name.bytes().fold(7, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
     let mut tracker = Tracker::new(config.clone());
-    tracker.set_calibration(Some(&synthetic::corners()));
+    tracker.set_view_calibration(0, Some(&synthetic::corners()));
+    if cameras >= 2 {
+        tracker.set_view_calibration(1, Some(&synthetic::second_corners()));
+    }
     tracker.start(game.positions[0].clone());
+    // The squares a hand hides, in each camera, while the move of a ply is judged.
+    let hands = std::cell::Cell::new([None::<usize>; 2]);
     let mut now = Instant::now();
     let mut frames = 0u64;
     // The certainty of the last moves taken in doubt, read after the pictures of a ply were shown.
@@ -97,7 +124,19 @@ fn play(game: &Game, conditions: &Conditions, config: &TrackerConfig, unseen: Op
         for _ in 0..times {
             frames += 1;
             now += Duration::from_millis(333);
-            let detection = tracker.feed(&synthetic::frame_from_position(pos, conditions, progress, frames), now);
+            let mut first = synthetic::frame_from_position(pos, conditions, progress, frames);
+            if let Some(square) = hands.get()[0] {
+                synthetic::occlude(&mut first, &synthetic::corners(), square, 0.6);
+            }
+            let second = (cameras >= 2).then(|| {
+                let mut picture =
+                    synthetic::seen_from_the_other_side(&synthetic::frame_from_position(pos, conditions, progress, frames + 7919));
+                if let Some(square) = hands.get()[1] {
+                    synthetic::occlude(&mut picture, &synthetic::second_corners(), square, 0.6);
+                }
+                picture
+            });
+            let detection = tracker.feed_views(&[Some(&first), second.as_ref()], now);
             if matches!(detection, Detection::Move { .. } | Detection::Sequence { .. })
                 && let Some(doubt) = tracker.take_doubt()
             {
@@ -126,7 +165,18 @@ fn play(game: &Game, conditions: &Conditions, config: &TrackerConfig, unseen: Op
             println!("--- ply {} {}", k + 1, nicochess::game::uci_of(game.moves[k]));
         }
         doubt_cell.set(None);
+        // A hand over one of the squares of the move, in each camera by itself, and there while the move is judged.
+        let mut covered = [None; 2];
+        for (camera, place) in covered.iter_mut().enumerate() {
+            if chance(game_seed + camera as u64, k as u64) < hand {
+                let (from, to) = (game.moves[k].from(), game.moves[k].to());
+                let pick = chance(game_seed + 100 + camera as u64, k as u64);
+                *place = Some(usize::from(if pick < 0.5 { from.unwrap_or(to) } else { to }));
+            }
+        }
+        hands.set(covered);
         let detections = show(&mut tracker, truth, (k + 1) as f32 / total as f32, 4);
+        hands.set([None; 2]);
         let doubt_taken = doubt_cell.take();
         let mut brought_moves = false;
         for detection in &detections {
@@ -204,6 +254,9 @@ fn main() {
     if let Some(margin) = std::env::var("STRESS_MARGIN").ok().and_then(|v| v.parse().ok()) {
         config.margin = margin;
     }
+    let cameras: usize = std::env::var("STRESS_CAMERAS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let hand: f32 = std::env::var("STRESS_HAND").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    println!("{cameras} camera(s), a hand over the move in {:.0}% of the plies in each camera\n", 100.0 * hand);
     println!("{:<10} {:<16} {:>6} {:>10} {:>6} {:>7} {:>11}", "conditions", "game", "plies", "by itself", "wrong", "typed", "longest run");
     let dark = Conditions { final_gain: 0.5, final_warmth: 0.15, shadow: 0.4, glare: 0.6, ..Conditions::HARD };
     let noisy = Conditions { noise: 30, ..Conditions::HARD };

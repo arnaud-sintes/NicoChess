@@ -80,9 +80,11 @@ cargo run --release -- --source synthetic     # the starting position only
 cargo run --release -- --source photo.jpg     # a still JPEG
 cargo run --release -- --probe                # list the cameras, formats and controls
 cargo run --release -- --device 0 --width 1280 --height 720 --open    # Windows webcam (Linux: --device /dev/video0)
+cargo run --release -- --device 0 --device2 1 --open                 # two cameras (Windows numbers; Linux: --device2 /dev/video2)
+cargo run --release -- --source demo --second-camera                 # the demo seen by two cameras, no hardware needed
 ```
 
-`--open` opens the page in the browser of this computer. Default address `0.0.0.0:8080`; on Windows, if that port is reserved or taken, the program takes the next free one among 28080-28089, then any, and prints the addresses. For tests and scripts give the address yourself: `--listen 127.0.0.1:28080`. `--data-dir` and `--calibration` default to the current folder (`./data`, `./calibration.json`); `picture.json` goes next to the calibration file. `--help` lists every option, including the tuning flags (`--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--soft-margin`, `--max-plies`).
+`--open` opens the page in the browser of this computer. Default address `0.0.0.0:8080`; on Windows, if that port is reserved or taken, the program takes the next free one among 28080-28089, then any, and prints the addresses. For tests and scripts give the address yourself: `--listen 127.0.0.1:28080`. `--data-dir` and `--calibration` default to the current folder (`./data`, `./calibration.json`); `picture.json` goes next to the calibration file; so do the files of the second camera (`calibration2.json`, `picture2.json`, `camera2.json`). `--help` lists every option, including the tuning flags (`--stable-frames`, `--motion-threshold`, `--max-excess`, `--margin`, `--soft-margin`, `--max-plies`).
 
 ## Record and replay a game (investigating a bad session, tuning the detection)
 
@@ -118,6 +120,7 @@ sees: they stay on the PC, and look at them before sending them anywhere.
 ## Test
 
 - `cargo test` at the root. It covers: the chess rules and PGN, the vision and tracker on synthetic pictures (a whole game of 33 plies), board auto-detection (also rotated, noisy, scaled), picture settings, atomic file writes, the HTTP server (including the stoppable listener), and the engine through the API (roles, calibration, pictures, streams, a game from the demo camera to a PGN, resume, stabilization). It takes about a minute because the engine tests run real capture threads.
+- `STRESS_CAMERAS=2` and `STRESS_HAND=0.4` (see below) add a second camera and hands over the squares of the moves to the stress test.
 - `cargo run --release --example stress` measures how well the tracker follows whole games on synthetic pictures
   with a poor camera: `easy`, `drift` (fading, warming light and a moving shadow), `hard` (plus glare and leaning
   pieces), `dark`, `noisy`, and `catch-up` (every fifth move is never photographed). A simulated person types the
@@ -126,6 +129,9 @@ sees: they stay on the PC, and look at them before sending them anywhere.
   `STRESS_ONLY=hard,dark` runs some scenarios, `STRESS_VERBOSE=1` lists each failure, `STRESS_MARGIN=9` tries another
   `--margin`. Run it after any change to `vision.rs` or `tracker.rs`; the pictures are synthetic, so the numbers
   say that nothing got worse, not how a real board and camera behave.
+  `STRESS_CAMERAS=2` adds a second camera on the other side of the board, and `STRESS_HAND=0.4` puts a hand (an
+  arm, hiding a square of the move and what is around it) over a square of the move in 40% of the plies, in each
+  camera by itself, until the move is judged. Running it with one and with two cameras shows what the second is worth.
 - Temporary folders are `nicochess-<name>-<pid>` under the system temp folder and are removed afterwards.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` must pass; CI runs them with the tests (`--locked`), on Linux and Windows.
 - Android (Kotlin and JNI) has no unit tests: the Docker build is the compile check, and a run on a phone is the real test (not done yet).

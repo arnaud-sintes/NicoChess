@@ -81,8 +81,20 @@ impl CameraSelection {
         Ok(())
     }
 
+    /// Uses no camera from now on, and keeps the choice. This is how the second camera is switched off: the first
+    /// one always has a camera, so only the second selection is ever cleared.
+    pub fn clear(&self) -> Result<()> {
+        if let Some(file) = &self.file {
+            let saved = Saved { id: String::new(), name: String::new() };
+            write_atomic(file, &serde_json::to_vec_pretty(&saved)?).with_context(|| "cannot keep the choice of the camera")?;
+        }
+        self.device.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+        Ok(())
+    }
+
     /// Goes back to the camera chosen last time, if it is still there (by its name: the numbers may have changed).
-    /// Anything wrong (no file, no such camera any more) leaves the camera as it is.
+    /// Anything wrong (no file, no such camera any more) leaves the camera as it is. "No camera" was chosen last
+    /// time: no camera.
     pub fn restore(&self) {
         let Some(file) = &self.file else { return };
         let Ok(bytes) = std::fs::read(file) else { return };
@@ -90,6 +102,10 @@ impl CameraSelection {
             eprintln!("camera: {} cannot be read; using camera {}", file.display(), self.device());
             return;
         };
+        if saved.id.is_empty() {
+            self.device.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+            return;
+        }
         let Ok(cameras) = self.list() else { return };
         // The same number with the same name is the likeliest; two cameras of one model have one name.
         let found =
@@ -164,6 +180,24 @@ mod tests {
         let broken = selection(vec![camera("0", "A"), camera("1", "B")], Some(file.clone()));
         broken.restore();
         assert_eq!(broken.device(), "0");
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn no_camera_can_be_chosen_and_is_kept_for_the_next_start() {
+        let file = temp_file("none");
+        let cameras = vec![camera("0", "Integrated Camera"), camera("1", "USB Webcam")];
+        let second = selection(cameras.clone(), Some(file.clone()));
+        second.store(&cameras[1]).unwrap();
+        assert_eq!(second.device(), "1");
+        second.clear().unwrap();
+        assert_eq!(second.device(), "");
+
+        // At the next start the camera given then is not used: "no camera" was chosen.
+        let again = selection(cameras, Some(file.clone()));
+        assert_eq!(again.device(), "0");
+        again.restore();
+        assert_eq!(again.device(), "");
         std::fs::remove_dir_all(file.parent().unwrap()).ok();
     }
 

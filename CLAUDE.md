@@ -20,7 +20,7 @@ The page is one HTML file built into the program. Everything works offline.
 | To | Run |
 |---|---|
 | Try it without a camera | `cargo run --release -- --source demo` (also `--source synthetic`, `--source photo.jpg`), page on http://localhost:8080 |
-| Use a camera | `cargo run --release -- --probe` lists cameras (Windows: `--device 0`; Linux: `--device /dev/video0`), then `--device N --width 1280 --height 720 --open` |
+| Use a camera | `cargo run --release -- --probe` lists cameras (Windows: `--device 0`; Linux: `--device /dev/video0`), then `--device N --width 1280 --height 720 --open`; a second one: `--device2 M` (Windows: also on the page); `--source demo --second-camera` tries two without hardware |
 | Test | `cargo test` (a minute or so, runs real capture threads on the synthetic source) |
 | Record, replay | `--record` (with `--record-dir`, `--record-every`) keeps a folder per game: pictures, decisions, corrections; `--replay <folder>` runs it through the tracker again, tuning flags replace the recorded ones (ENVIRONMENT.md, "Record and replay") |
 | Format, lint | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (CI runs both) |
@@ -37,7 +37,7 @@ The page is one HTML file built into the program. Everything works offline.
 1. Comments, errors and docs are plain English prose that explain why. No emojis.
 2. Errors: `anyhow` with context; the API answers 403 (not controller), 400 (bad request), 409 (not possible now), 500 (server-side I/O failure), as JSON `{"ok":false,"error":...}` (pictures, a refused Host, 404 and 503 are plain text).
 3. Files are written with `fsutil::write_atomic` (temporary file, flush, rename), never with a plain `fs::write`. The one exception is the append-only `events.jsonl` of a recording.
-4. The engine has one `inner` mutex: the capture thread and the per-picture paths never hold it during slow work (detection, JPEG encoding). Games are written after it is released (`pending_save`, then `flush_save`). Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame`, `frame_count`.
+4. The engine has one `inner` mutex: the capture thread and the per-picture paths never hold it during slow work (detection, JPEG encoding). Games are written after it is released (`pending_save`, then `flush_save`). Lock order: `save_lock` before `inner`; `inner` before `camera_wanted`, `frame` (of either camera), `frame_count`.
 5. Everything user-supplied that reaches the page goes through `esc()`. The page has no external resource.
 6. Calibration corner order is a1, h1, h8, a8, counter-clockwise on screen, in the pixels of the rotated picture. Do not change it.
 7. Kotlin: camera state is touched only on the main thread (Camera2 callbacks are given the main handler; only the pictures arrive on the image-reader thread); bridge methods run on a WebView thread.
