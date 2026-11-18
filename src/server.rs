@@ -30,6 +30,8 @@
 //!   GET    /api/game/legal             {"moves": ["e2e4", ...]}  the legal moves of the game, for dragging a piece
 //!   POST   /api/depth                  {"on": true}  also use the depth of the camera (when it has a depth part)
 //!   POST   /api/depth/align            look for the board in the depth picture now (the pieces in their positions)
+//!   POST   /api/depth/settings         {"near_mm","far_mm","width","height","fps"} (any of them) what the depth camera
+//!                                      gives and which distances count; not during a game
 //!   POST   /api/camera/follow          {"on": true}  follow the board if it moves during a game
 //!   POST   /api/camera/select          {"id": "1"}  use that camera (not during a game; forgets the calibration);
 //!                                      with ?cam=2 also {"id": ""}: no second camera
@@ -181,6 +183,9 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             done(body_json::<Body>(&request).and_then(|b| engine.set_depth(&token, b.on)))
         }
         ("POST", "/api/depth/align") => done(engine.align_depth(&token)),
+        ("POST", "/api/depth/settings") => {
+            done(body_json::<crate::depthlink::DepthPatch>(&request).and_then(|p| engine.set_depth_settings(&token, p)))
+        }
         ("POST", "/api/camera/rate") => {
             #[derive(Deserialize)]
             struct Body {
@@ -458,6 +463,11 @@ mod tests {
 
     /// `record`: every game is recorded in the folder `recordings` of the rig, every picture the tracker sees.
     fn rig_with(name: &str, source: SourceSpec, frame_interval: Duration, record: bool) -> Rig {
+        rig_tracking(name, source, frame_interval, record, quick_tracker())
+    }
+
+    /// The same with a tracker of its own choosing.
+    fn rig_tracking(name: &str, source: SourceSpec, frame_interval: Duration, record: bool, tracker: crate::tracker::TrackerConfig) -> Rig {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::open(&dir.join("games")).unwrap();
@@ -467,7 +477,7 @@ mod tests {
             busy_every: Duration::ZERO,
             ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
         });
-        let engine = Engine::new(EngineConfig { record, ..patient() }, store, dir.join("calibration.json"), None);
+        let engine = Engine::new(EngineConfig { record, tracker, ..patient() }, store, dir.join("calibration.json"), None);
         engine.spawn_capture(camera::factory(source, frame_interval)).unwrap();
         let handler = handler(Arc::clone(&engine), 8);
         Rig { engine, handler, dir }
@@ -878,9 +888,12 @@ mod tests {
         assert!(rig.engine.list_games().unwrap().is_empty(), "the empty game is gone from the disk too");
     }
 
-    /// A running game on the synthetic source, with a calibration: for the commands that play moves.
+    /// A running game on the synthetic source, with a calibration: for the commands that play moves. The tracker never
+    /// decides anything here (the board of the synthetic camera never changes, and shows by chance the position that
+    /// a shuffle of the knights comes back to, which the tracker would then find by itself before the test typed it).
     fn running_game(name: &str) -> Rig {
-        let rig = rig(name, SourceSpec::Synthetic);
+        let never = crate::tracker::TrackerConfig { stable_frames: usize::MAX / 2, ..quick_tracker() };
+        let rig = rig_tracking(name, SourceSpec::Synthetic, Duration::from_millis(5), false, never);
         rig.state(ALICE);
         rig.call("POST", "/api/calibration/open", ALICE, "");
         wait_for("a frame", || rig.engine.latest_frame(0).is_some());
@@ -1158,6 +1171,7 @@ mod tests {
         wait_for("a picture from the new camera", || rig.engine.latest_frame(0).is_some());
 
         // Not during a game.
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
         assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
         assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
         assert_eq!(rig.call("POST", "/api/camera/select", ALICE, r#"{"id": "0"}"#).0, 409);
@@ -1378,7 +1392,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nicochess-second-dies-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::open(&dir.join("games")).unwrap();
-        let engine = Engine::new(EngineConfig { second_fixed: true, ..patient() }, store, dir.join("calibration.json"), None);
+        // The demo plays a move every 600 ms: a camera that has been silent for a few pictures is left out at once, not after
+        // the two seconds that people can wait (the game would be too many moves ahead of the tracker by then).
+        let config = EngineConfig { second_fixed: true, fresh: Duration::from_millis(350), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
         let (first, second) = camera::demo_pair(Duration::from_millis(100), Duration::from_millis(600));
         engine.spawn_capture(first).unwrap();
         let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1389,7 +1406,10 @@ mod tests {
                 if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
                     anyhow::bail!("no camera is there");
                 }
-                Ok(Box::new(Dies { inner: inner()?, left: 90 }) as Box<dyn camera::FrameSource>)
+                // The demo has 18 pictures before the first move and 6 for each move: 94 ends in the middle of the
+                // still pictures of a move, not on the boundary between two moves (90 did, and a camera that goes
+                // just as a move is made leaves the tracker behind: that is not what this test is about).
+                Ok(Box::new(Dies { inner: inner()?, left: 94 }) as Box<dyn camera::FrameSource>)
             }))
             .unwrap();
         let rig = Rig { handler: handler(Arc::clone(&engine), 8), engine, dir };
@@ -1524,6 +1544,11 @@ mod tests {
             "Fake depth (480x360)".into()
         }
 
+        fn modes(&self) -> Vec<crate::depthlink::DepthMode> {
+            use crate::depthlink::DepthMode;
+            vec![DepthMode { width: 320, height: 240, fps: 30 }, DepthMode { width: 480, height: 360, fps: 30 }]
+        }
+
         fn next_frame(&mut self) -> anyhow::Result<crate::depth::DepthFrame> {
             std::thread::sleep(Duration::from_millis(25));
             self.pictures += 1;
@@ -1546,7 +1571,7 @@ mod tests {
             occupied[square] = !(16..48).contains(&square);
             black[square] = square >= 48;
         }
-        let factory: crate::depthlink::DepthFactory = Box::new(move |_| {
+        let factory: crate::depthlink::DepthFactory = Box::new(move |_, _| {
             Ok(Box::new(FakeDepth { pictures: 0, corners: truth, occupied, black }) as Box<dyn crate::depthlink::DepthSource>)
         });
         let link = crate::depthlink::DepthLink::new(factory, Some(dir.join("depth.json")));
@@ -1595,6 +1620,78 @@ mod tests {
         assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": false}"#).0, 200);
         wait_for("the depth to be left out", || rig.state(ALICE)["depth"]["in_use"] == false);
         assert_eq!(rig.state(ALICE)["tracker"]["status"], "watching");
+    }
+
+    #[test]
+    fn the_depth_settings_are_chosen_checked_and_used() {
+        let dir = std::env::temp_dir().join(format!("nicochess-depthsettings-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let guess = crate::depth::guess_corners(&synthetic::corners(), (synthetic::WIDTH, synthetic::HEIGHT), (480, 360), 69.4, 63.4);
+        let truth = guess.map(|c| [c[0] + 12.0, c[1] - 8.0]);
+        let mut occupied = [false; 64];
+        let mut black = [false; 64];
+        for square in 0..64 {
+            occupied[square] = !(16..48).contains(&square);
+            black[square] = square >= 48;
+        }
+        let factory: crate::depthlink::DepthFactory = Box::new(move |_, _| {
+            Ok(Box::new(FakeDepth { pictures: 0, corners: truth, occupied, black }) as Box<dyn crate::depthlink::DepthSource>)
+        });
+        let link = crate::depthlink::DepthLink::new(factory, Some(dir.join("depth.json")));
+        link.set_offer(Some("Fake Depth".into()));
+        let config = EngineConfig { depth: Some(Arc::clone(&link)), track_interval: Duration::from_millis(100), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        engine.spawn_capture(camera::factory(SourceSpec::Synthetic, Duration::from_millis(5))).unwrap();
+        engine.spawn_depth().unwrap();
+        let handler = handler(Arc::clone(&engine), 8);
+        let rig = Rig { engine, handler, dir };
+
+        rig.state(ALICE);
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": true}"#).0, 200);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("the modes of the camera", || rig.state(ALICE)["depth"]["modes"].as_array().is_some_and(|m| m.len() == 2));
+        let state = rig.state(ALICE);
+        assert_eq!(state["depth"]["settings"], json!({"near_mm": 100, "far_mm": 4000, "width": 848, "height": 480, "fps": 30}));
+
+        // Only the controller; nothing that cannot be used; no picture that the camera does not have.
+        assert_eq!(rig.call("POST", "/api/depth/settings", BOB, r#"{"near_mm": 300}"#).0, 403);
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"near_mm": 20}"#).0, 400);
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"near_mm": 2000, "far_mm": 2100}"#).0, 400);
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"width": 640, "height": 360, "fps": 30}"#).0, 400);
+        assert_eq!(rig.state(ALICE)["depth"]["settings"]["near_mm"], 100, "nothing was changed");
+
+        // The distances work at once: the board is at about 600 mm.
+        wait_for("a picture with readings", || rig.state(ALICE)["depth"]["valid"].as_f64().unwrap_or(0.0) > 0.8);
+        let generation = link.generation();
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"near_mm": 300, "far_mm": 1200}"#).0, 200);
+        let state = rig.state(ALICE);
+        assert_eq!(
+            (state["depth"]["settings"]["near_mm"].clone(), state["depth"]["settings"]["far_mm"].clone()),
+            (json!(300), json!(1200))
+        );
+        assert_eq!(link.generation(), generation, "the camera is not opened again for that");
+        wait_for("the picture still has readings", || rig.state(ALICE)["depth"]["valid"].as_f64().unwrap_or(0.0) > 0.8);
+        // Ending before the board leaves nothing of it.
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"near_mm": 100, "far_mm": 400}"#).0, 200);
+        wait_for("nothing left in the picture", || rig.state(ALICE)["depth"]["valid"].as_f64().unwrap_or(1.0) < 0.05);
+
+        // Another size opens the camera again.
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"width": 320, "height": 240, "fps": 30}"#).0, 200);
+        assert_eq!(link.generation(), generation + 1);
+        assert_eq!(rig.state(ALICE)["depth"]["settings"]["width"], 320);
+        wait_for("the camera opened again", || !rig.state(ALICE)["depth"]["source"].as_str().unwrap_or("").is_empty());
+
+        // Kept for the next start.
+        let kept = std::fs::read_to_string(rig.dir.join("depth.json")).unwrap();
+        assert!(kept.contains("\"width\": 320") && kept.contains("\"far_mm\": 400"), "{kept}");
+
+        // Not during a game.
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        let (status, body) = rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(rig.call("POST", "/api/depth/settings", ALICE, r#"{"near_mm": 200}"#).0, 409);
     }
 
     /// The Opera game on the demo board, with a depth camera beside the camera that shows the same moment of it: the

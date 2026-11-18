@@ -131,6 +131,7 @@ pub fn build(options: ServerOptions) -> Result<Built> {
     };
     let config = EngineConfig {
         rate,
+        fresh: EngineConfig::default().fresh,
         depth: depth.clone(),
         idle_timeout: options.idle_timeout,
         game_timeout: options.game_timeout,

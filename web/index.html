@@ -243,6 +243,15 @@
           <label class="check"><input type="checkbox" id="depth-on"> Also use the depth of this camera</label>
           <div class="bar"><button id="depth-align" hidden title="Look for the board in the depth picture, with the pieces in their starting positions">Find the board in the depth picture</button></div>
           <div class="muted small" id="depth-info"></div>
+          <details id="depth-settings">
+            <summary>Depth settings</summary>
+            <label class="check" for="depth-near">Nearest <input type="range" id="depth-near" min="10" max="300" step="5" style="flex:1 1 140px"> <strong id="depth-near-val"></strong></label>
+            <label class="check" for="depth-far">Farthest <input type="range" id="depth-far" min="30" max="400" step="10" style="flex:1 1 140px"> <strong id="depth-far-val"></strong></label>
+            <div class="muted small">Only what is between these two distances from the camera is used. Set them just around the board: what is beyond it (screens, walls) only confuses the search for the board. The picture below shows what is kept; black is not used.</div>
+            <label class="check" id="depth-mode-row" for="depth-size">Picture <select id="depth-size"></select> <select id="depth-fps" title="Pictures a second from the depth camera"></select></label>
+            <div class="muted small" id="depth-mode-info">A larger picture shows more detail; a smaller one, or fewer pictures a second, takes less of the cable and of the computer. Changing it means finding the board in the depth picture again.</div>
+            <div class="muted small" id="depth-valid"></div>
+          </details>
           <div class="bar" id="depth-views" hidden>
             <img id="depth-img" alt="depth" style="max-width:48%;height:auto" title="What the depth camera sees: brighter is higher above the board">
             <img id="depth-warp" alt="depth, top-down" style="max-width:48%;height:auto" hidden>
@@ -846,10 +855,67 @@ function renderDepth(ctl) {
   else if (d.aligned) text = (d.message || 'The board was found in the depth picture.') + (playing ? (d.in_use ? ' The depth is helping.' : ' The depth is learning the squares.') : ' It is used in the next game.');
   else text = (d.message || 'The board is looked for in the depth picture when a game starts. To check now, open the camera, set the pieces in their starting positions and press the button.') + (d.source ? '' : ' (The depth camera is not open: it opens with the camera.)');
   $('depth-info').textContent = text;
+  renderDepthSettings(d, playing);
+  $('depth-settings').hidden = !d.on;
   const showViews = d.on && !!d.source;
   $('depth-views').hidden = !showViews;
   $('depth-warp').hidden = !(showViews && d.aligned);
 }
+
+// The settings of the depth camera: which distances count, and the size and speed of its picture. Not during a game.
+let depthSettingsSignature = '';
+function renderDepthSettings(d, playing) {
+  const set = d.settings;
+  if (!set) return;
+  const busy = id => document.activeElement === $(id);
+  if (!busy('depth-near')) $('depth-near').value = Math.round(set.near_mm / 10);
+  if (!busy('depth-far')) $('depth-far').value = Math.round(set.far_mm / 10);
+  $('depth-near-val').textContent = $('depth-near').value + ' cm';
+  $('depth-far-val').textContent = $('depth-far').value + ' cm';
+  // The pictures the camera has: the sizes, and for the size shown the speeds up to 30 a second.
+  const modes = (d.modes || []).filter(m => m.fps <= 30 && m.width >= 320);
+  const sizes = [...new Set(modes.map(m => m.width + 'x' + m.height))];
+  $('depth-mode-row').hidden = sizes.length < 2 && !modes.length;
+  const signature = JSON.stringify([modes, set.width, set.height, set.fps]);
+  if (signature !== depthSettingsSignature && !busy('depth-size') && !busy('depth-fps')) {
+    depthSettingsSignature = signature;
+    const sizeNow = set.width + 'x' + set.height;
+    $('depth-size').innerHTML = sizes.map(v => `<option value="${v}">${v.replace('x', ' x ')}</option>`).join('');
+    // The size in use may be the nearest the camera has to what was asked: show the one it has.
+    $('depth-size').value = sizes.includes(sizeNow) ? sizeNow : (sizes[0] || '');
+    fillSpeeds(modes, $('depth-size').value, set.fps);
+  }
+  const off = !!playing;
+  for (const id of ['depth-near', 'depth-far', 'depth-size', 'depth-fps']) $(id).disabled = off;
+  $('depth-valid').textContent = d.source ? 'Depth in ' + Math.round(100 * (d.valid || 0)) + '% of the picture.' + (d.valid < 0.2 ? ' Very little: the board may be nearer than the nearest distance or beyond the farthest.' : '') + (off ? ' (Settings cannot change during a game.)' : '') : '';
+}
+function fillSpeeds(modes, size, wanted) {
+  const speeds = [...new Set(modes.filter(m => m.width + 'x' + m.height === size).map(m => m.fps))].sort((a, b) => a - b);
+  $('depth-fps').innerHTML = speeds.map(v => `<option value="${v}">${v} a second</option>`).join('');
+  $('depth-fps').value = speeds.includes(wanted) ? wanted : (speeds[speeds.length - 1] || '');
+}
+function depthDistances() {
+  let near = +$('depth-near').value * 10, far = +$('depth-far').value * 10;
+  // At least 20 cm between them: the one that was not moved gives way.
+  if (far < near + 200) { if (document.activeElement === $('depth-far')) near = Math.max(100, far - 200); else far = near + 200; }
+  return { near_mm: near, far_mm: far };
+}
+$('depth-near').oninput = $('depth-far').oninput = () => {
+  const { near_mm, far_mm } = depthDistances();
+  $('depth-near-val').textContent = Math.round(near_mm / 10) + ' cm';
+  $('depth-far-val').textContent = Math.round(far_mm / 10) + ' cm';
+};
+$('depth-near').onchange = $('depth-far').onchange = () => api('POST', '/api/depth/settings', depthDistances());
+$('depth-size').onchange = () => {
+  const [width, height] = $('depth-size').value.split('x').map(Number);
+  const modes = ((S && S.depth && S.depth.modes) || []).filter(m => m.fps <= 30);
+  fillSpeeds(modes, $('depth-size').value, +$('depth-fps').value);
+  api('POST', '/api/depth/settings', { width, height, fps: +$('depth-fps').value });
+};
+$('depth-fps').onchange = () => {
+  const [width, height] = $('depth-size').value.split('x').map(Number);
+  api('POST', '/api/depth/settings', { width, height, fps: +$('depth-fps').value });
+};
 $('depth-on').onchange = async () => {
   await api('POST', '/api/depth', { on: $('depth-on').checked });
   $('depth-on').blur();

@@ -37,14 +37,93 @@ pub fn demo_depth_corners() -> [[f32; 2]; 4] {
 /// A depth picture older than this is not used: the depth camera has stopped.
 pub const DEPTH_FRESH: Duration = Duration::from_secs(2);
 
+/// One way the depth camera can give its pictures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DepthMode {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+/// What the depth camera is asked for, and how its readings are used. It is set on the Calibrate tab and kept in
+/// `depth.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DepthSettings {
+    /// Readings nearer or farther than this, in millimetres, are not used: what is beyond the board (walls, screens)
+    /// only confuses the search for the plane of the board.
+    pub near_mm: u16,
+    pub far_mm: u16,
+    /// The picture asked of the camera (the nearest mode it has is used) and how many pictures a second. A smaller
+    /// picture and fewer pictures take less of the cable and of the computer; a larger one shows more detail.
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+}
+
+impl Default for DepthSettings {
+    fn default() -> Self {
+        DepthSettings { near_mm: 100, far_mm: 4000, width: 848, height: 480, fps: 30 }
+    }
+}
+
+impl DepthSettings {
+    pub fn mode(&self) -> DepthMode {
+        DepthMode { width: self.width, height: self.height, fps: self.fps }
+    }
+
+    /// Says what is wrong with settings that cannot be used.
+    pub fn validate(&self) -> Result<()> {
+        if !(100..=3000).contains(&self.near_mm) {
+            anyhow::bail!("the nearest distance must be between 10 and 300 cm");
+        }
+        if !(200..=4000).contains(&self.far_mm) {
+            anyhow::bail!("the farthest distance must be between 20 and 400 cm");
+        }
+        if self.far_mm < self.near_mm + 200 {
+            anyhow::bail!("the farthest distance must be at least 20 cm beyond the nearest");
+        }
+        if !(160..=1280).contains(&self.width) || !(90..=720).contains(&self.height) || !(1..=90).contains(&self.fps) {
+            anyhow::bail!("the picture of the depth camera: from 160x90 to 1280x720, 1 to 90 pictures a second");
+        }
+        Ok(())
+    }
+}
+
+/// Which of the settings the page sends (the others stay as they are).
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+pub struct DepthPatch {
+    pub near_mm: Option<u16>,
+    pub far_mm: Option<u16>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<u32>,
+}
+
+impl DepthPatch {
+    pub fn applied_to(&self, settings: DepthSettings) -> DepthSettings {
+        DepthSettings {
+            near_mm: self.near_mm.unwrap_or(settings.near_mm),
+            far_mm: self.far_mm.unwrap_or(settings.far_mm),
+            width: self.width.unwrap_or(settings.width),
+            height: self.height.unwrap_or(settings.height),
+            fps: self.fps.unwrap_or(settings.fps),
+        }
+    }
+}
+
 /// Where depth pictures come from: opened for one depth camera, read until it fails.
 pub trait DepthSource: Send {
     fn describe(&self) -> String;
     fn next_frame(&mut self) -> Result<DepthFrame>;
+    /// The modes the camera has, when it can say (the page offers them).
+    fn modes(&self) -> Vec<DepthMode> {
+        Vec::new()
+    }
 }
 
-/// Opens the depth camera with this name (the name Windows gives it: "... Depth").
-pub type DepthFactory = Box<dyn Fn(&str) -> Result<Box<dyn DepthSource>> + Send + Sync>;
+/// Opens the depth camera with this name (the name Windows gives it: "... Depth") in the mode nearest to the settings.
+pub type DepthFactory = Box<dyn Fn(&str, &DepthSettings) -> Result<Box<dyn DepthSource>> + Send + Sync>;
 
 /// The name of the depth part of a camera, from the name of its colour part: "Intel(R) RealSense(TM) Depth Camera 415
 /// RGB" goes with "... 415 Depth". `None` for a camera that is not a colour part.
@@ -76,6 +155,8 @@ pub fn without_depth_parts(cameras: Vec<CameraInfo>) -> Vec<CameraInfo> {
 #[derive(Serialize, Deserialize)]
 struct Saved {
     on: bool,
+    #[serde(default)]
+    settings: DepthSettings,
 }
 
 /// The picture the depth thread read last.
@@ -114,6 +195,9 @@ pub struct DepthStatus {
     pub score: f32,
     /// What happened to the last alignment, for the page.
     pub message: String,
+    /// The share of the last picture (0 to 1) that has a reading within the nearest and farthest distances: what
+    /// is left of the picture to find the board in.
+    pub valid: f32,
 }
 
 pub struct DepthLink {
@@ -132,6 +216,11 @@ pub struct DepthLink {
     fed: AtomicU64,
     seq: AtomicU64,
     filter: Mutex<DepthFilter>,
+    settings: Mutex<DepthSettings>,
+    /// The modes the depth camera said it has, when it was opened.
+    modes: Mutex<Vec<DepthMode>>,
+    /// Changes when the camera has to be opened again (another mode was asked for).
+    generation: AtomicU64,
 }
 
 impl std::fmt::Debug for DepthLink {
@@ -147,11 +236,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl DepthLink {
     /// `file` is where the box is kept (`depth.json`); a kept "on" is restored.
     pub fn new(factory: DepthFactory, file: Option<PathBuf>) -> Arc<DepthLink> {
-        let on = file
-            .as_ref()
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
-            .is_some_and(|saved| saved.on);
+        let saved = file.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok());
+        let on = saved.as_ref().is_some_and(|s| s.on);
+        // Settings that cannot be used (a file edited by hand) are not used.
+        let settings = saved.map(|s| s.settings).filter(|s| s.validate().is_ok()).unwrap_or_default();
         Arc::new(DepthLink {
             factory,
             file,
@@ -165,7 +253,55 @@ impl DepthLink {
             fed: AtomicU64::new(0),
             seq: AtomicU64::new(0),
             filter: Mutex::new(DepthFilter::default()),
+            settings: Mutex::new(settings),
+            modes: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
         })
+    }
+
+    /// Keeps the box and the settings for the next start.
+    fn persist(&self, on: bool, settings: DepthSettings) -> Result<()> {
+        if let Some(file) = &self.file {
+            write_atomic(file, &serde_json::to_vec_pretty(&Saved { on, settings })?).with_context(|| "cannot keep the depth settings")?;
+        }
+        Ok(())
+    }
+
+    pub fn settings(&self) -> DepthSettings {
+        *lock(&self.settings)
+    }
+
+    /// Uses these settings (they were checked) and keeps them. True when the camera has to be opened again, because
+    /// the picture it gives is another one: what was found about where the board is no longer holds.
+    pub fn set_settings(&self, next: DepthSettings) -> Result<bool> {
+        let old = self.settings();
+        if next == old {
+            return Ok(false);
+        }
+        self.persist(self.on(), next)?;
+        *lock(&self.settings) = next;
+        // The pictures kept so far were taken out with other limits.
+        *lock(&self.filter) = DepthFilter::default();
+        *lock(&self.latest) = None;
+        let reopen = next.mode() != old.mode();
+        if reopen {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.forget();
+        }
+        Ok(reopen)
+    }
+
+    /// Changes whenever the camera has to be opened again.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn modes(&self) -> Vec<DepthMode> {
+        lock(&self.modes).clone()
+    }
+
+    pub fn set_modes(&self, modes: Vec<DepthMode>) {
+        *lock(&self.modes) = modes;
     }
 
     pub fn on(&self) -> bool {
@@ -174,9 +310,7 @@ impl DepthLink {
 
     /// The box: use the depth too. Kept for the next start.
     pub fn set_on(&self, on: bool) -> Result<()> {
-        if let Some(file) = &self.file {
-            write_atomic(file, &serde_json::to_vec_pretty(&Saved { on })?).with_context(|| "cannot keep the choice about the depth")?;
-        }
+        self.persist(on, self.settings())?;
         self.on.store(on, Ordering::SeqCst);
         if !on {
             self.forget();
@@ -204,7 +338,7 @@ impl DepthLink {
     }
 
     pub fn open(&self, colour_name: &str) -> Result<Box<dyn DepthSource>> {
-        (self.factory)(colour_name)
+        (self.factory)(colour_name, &self.settings())
     }
 
     /// Nothing is known about where the squares are in the depth picture (another camera, or the depth was switched off).
@@ -245,7 +379,10 @@ impl DepthLink {
 
     /// A picture came from the depth camera: steadied, then kept as the latest.
     pub fn publish(&self, frame: &DepthFrame) {
-        let steady = lock(&self.filter).push(frame);
+        let settings = self.settings();
+        let kept = depth::clip(frame, settings.near_mm, settings.far_mm);
+        lock(&self.status).valid = depth::valid_share(&kept);
+        let steady = lock(&self.filter).push(&kept);
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         *lock(&self.latest) = Some(DepthStamp { frame: Arc::new(steady), seq, at: Instant::now() });
     }
@@ -357,12 +494,66 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_are_checked_kept_and_used_by_the_pictures() {
+        let dir = std::env::temp_dir().join(format!("nicochess-depthset-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("depth.json");
+        let factory = || -> DepthFactory { Box::new(|_, _| anyhow::bail!("no depth camera here")) };
+        let link = DepthLink::new(factory(), Some(file.clone()));
+        assert_eq!(link.settings(), DepthSettings::default());
+
+        // What cannot be used is refused.
+        let bad = |patch: DepthPatch| patch.applied_to(DepthSettings::default()).validate().is_err();
+        assert!(bad(DepthPatch { near_mm: Some(50), ..Default::default() }));
+        assert!(bad(DepthPatch { far_mm: Some(5000), ..Default::default() }));
+        assert!(bad(DepthPatch { near_mm: Some(1000), far_mm: Some(1100), ..Default::default() }), "too close together");
+        assert!(bad(DepthPatch { width: Some(5000), ..Default::default() }));
+
+        // The distances work at once, without opening the camera again.
+        let narrow = DepthPatch { near_mm: Some(300), far_mm: Some(1000), ..Default::default() }.applied_to(link.settings());
+        let generation = link.generation();
+        assert!(!link.set_settings(narrow).unwrap());
+        assert_eq!(link.generation(), generation);
+        let mut mm = vec![0u16; 60 * 40];
+        for (i, z) in mm.iter_mut().enumerate() {
+            // Half the picture is the board at 600 mm, half is a wall at 2500 mm.
+            *z = if i % 60 < 30 { 600 } else { 2500 };
+        }
+        link.publish(&DepthFrame::new(60, 40, mm));
+        assert!((link.status().valid - 0.5).abs() < 0.01, "{}", link.status().valid);
+        let stamp = link.fresh().unwrap();
+        assert!(stamp.frame.mm.iter().all(|&z| z == 0 || z == 600), "the wall is not in the picture");
+
+        // Another picture needs the camera opened again, and what was found about the board is forgotten.
+        let bigger = DepthPatch { width: Some(1280), height: Some(720), fps: Some(15), ..Default::default() }.applied_to(link.settings());
+        assert!(link.set_settings(bigger).unwrap());
+        assert_eq!(link.generation(), generation + 1);
+        assert!(link.fresh().is_none());
+
+        // Kept for the next start, in the same file as the box.
+        link.set_on(true).unwrap();
+        let again = DepthLink::new(factory(), Some(file.clone()));
+        assert_eq!(again.settings(), bigger);
+        assert!(again.on());
+        // A file that was edited into something unusable is not used.
+        std::fs::write(&file, r#"{"on": true, "settings": {"near_mm": 10, "far_mm": 20}}"#).unwrap();
+        assert_eq!(DepthLink::new(factory(), Some(file.clone())).settings(), DepthSettings::default());
+        // A file from before there were settings still works.
+        std::fs::write(&file, r#"{"on": true}"#).unwrap();
+        let old = DepthLink::new(factory(), Some(file));
+        assert!(old.on());
+        assert_eq!(old.settings(), DepthSettings::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn the_box_is_kept_and_a_height_picture_needs_a_recent_flat_picture() {
         let dir = std::env::temp_dir().join(format!("nicochess-depthlink-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("depth.json");
-        let factory = || -> DepthFactory { Box::new(|_| anyhow::bail!("no depth camera here")) };
+        let factory = || -> DepthFactory { Box::new(|_, _| anyhow::bail!("no depth camera here")) };
         let link = DepthLink::new(factory(), Some(file.clone()));
         assert!(!link.on() && !link.wanted());
         link.set_offer(Some("X Depth".into()));

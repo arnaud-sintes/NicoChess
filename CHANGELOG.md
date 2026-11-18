@@ -5,6 +5,22 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.7.1
+
+- **Depth settings on the Calibrate tab** (under "Also use the depth of this camera"): the nearest and the farthest
+  distance that count (what is beyond the board, screens and walls, no longer confuses the search for the board
+  plane, and the picture shows what is kept), the size and the speed of the depth picture (the sizes and speeds that
+  the camera says it has: 424x240 to 1280x720, 6 to 30 a second), and how much of the picture has depth. The distances
+  work at once; another size or speed opens the camera again and the board has to be found again. Not during a game.
+  Kept in `depth.json`. Not offered: the camera's own controls (laser power, exposure, presets), which need the
+  maker's library or its extension unit.
+- **Tests:** the test build is optimised (`[profile.test]`), so the whole suite takes 25 s instead of two to four minutes
+  and no longer times out on a small CI machine. The tests that type moves by hand use a tracker that never decides on its
+  own (the synthetic board shows by chance the position that a shuffle of knights returns to). The test of a camera that
+  goes away ends it in the middle of a move's still pictures; the engine's wait for a silent camera is a setting
+  (`EngineConfig::fresh`, 2 s). Seen in that test: a camera that goes away *just as a move is made* can leave the tracker
+  behind, and it then explains the board with wrong sequences of three moves. Not fixed yet.
+
 ## 0.7.0
 
 **A page that follows the game as it is played, and more pictures a second.**

@@ -82,7 +82,9 @@ type FollowJob = (usize, Arc<Latest>, Instant);
 /// What the tracker looks at: the cameras, and after them the height picture of the depth camera (see `depth`).
 const VIEWS: usize = CAMERAS + 1;
 const DEPTH_VIEW: usize = CAMERAS;
-/// A camera whose last picture is older than this is not working: the detection goes on without it.
+/// A camera whose last picture is older than this is not working: the detection goes on without it. (Until then
+/// the other cameras wait for it to be still: a game that goes on meanwhile may get too far for the tracker, which
+/// takes up to three moves at once. People are not that quick; a test with a demo game is, and sets it shorter.)
 const FRESH: Duration = Duration::from_secs(2);
 /// A camera that has not given a picture yet is waited for this long after a game begins, so that the squares are
 /// learned from all the cameras at once (opening a USB camera takes a moment).
@@ -110,6 +112,8 @@ pub struct EngineConfig {
     pub second_fixed: bool,
     /// The depth camera that goes with the main camera, when this program can read one (see `depthlink`).
     pub depth: Option<Arc<DepthLink>>,
+    /// How long a camera may be silent before the detection goes on without it.
+    pub fresh: Duration,
     /// How many pictures a second the main camera keeps, when the page may change it (a real camera).
     pub rate: Option<Arc<FrameRate>>,
 }
@@ -126,6 +130,7 @@ impl Default for EngineConfig {
             camera2: None,
             second_fixed: false,
             depth: None,
+            fresh: FRESH,
             rate: None,
         }
     }
@@ -414,6 +419,8 @@ pub struct Engine {
     store: Store,
     /// The least time between two pictures given to the tracker, in microseconds (it follows the rate of the camera).
     track_interval: AtomicU64,
+    /// How long a camera may be silent before the detection goes on without it.
+    fresh: Duration,
     /// The pictures a second of the main camera, and where the page's choice is kept.
     rate: Option<Arc<FrameRate>>,
     rate_path: PathBuf,
@@ -516,6 +523,7 @@ impl Engine {
             clients: AtomicUsize::new(0),
             store,
             track_interval: AtomicU64::new(config.track_interval.as_micros() as u64),
+            fresh: config.fresh,
             rate: config.rate,
             rate_path,
             save_signal: (Mutex::new(false), Condvar::new()),
@@ -697,12 +705,19 @@ impl Engine {
                 }
             }
             let Some(name) = link.offer() else { continue };
+            // Another mode asked for (a size, a speed) ends the reading, and the camera is opened again at once.
+            let generation = link.generation();
             match link.open(&name) {
                 Ok(mut source) => {
                     link.set_error(None);
                     link.set_source(source.describe());
+                    link.set_modes(source.modes());
                     self.hub.notify();
-                    while self.camera_is_wanted() && link.wanted() && link.offer().as_deref() == Some(name.as_str()) {
+                    while self.camera_is_wanted()
+                        && link.wanted()
+                        && link.offer().as_deref() == Some(name.as_str())
+                        && link.generation() == generation
+                    {
                         match source.next_frame() {
                             Ok(frame) => link.publish(&frame),
                             Err(e) => {
@@ -728,7 +743,7 @@ impl Engine {
             }
             link.set_source(String::new());
             self.hub.notify();
-            if self.camera_is_wanted() && link.wanted() {
+            if self.camera_is_wanted() && link.wanted() && link.generation() == generation {
                 thread::sleep(CAMERA_RETRY);
             }
         }
@@ -948,7 +963,7 @@ impl Engine {
             #[allow(clippy::needless_range_loop)]
             for c in 0..CAMERAS {
                 let usable = inner.cams[c].calibration.is_some() && inner.cams[c].size_ok && self.cam_enabled(c);
-                let fresh = inner.cams[c].last_frame.is_some_and(|t| now.duration_since(t) < FRESH);
+                let fresh = inner.cams[c].last_frame.is_some_and(|t| now.duration_since(t) < self.fresh);
                 // A camera that has gone quiet is left out, so that the others are not held up; one that has not
                 // given a picture since play began is waited for a little, so that all learn the squares together.
                 let waiting =
@@ -1385,6 +1400,9 @@ impl Engine {
                 "message": status.message,
                 "in_use": views.get(DEPTH_VIEW).copied().unwrap_or(false),
                 "ignored": inner.tracker.depth_ignored(),
+                "settings": link.settings(),
+                "modes": link.modes(),
+                "valid": (status.valid * 100.0).round() / 100.0,
             })
         });
 
@@ -1817,6 +1835,37 @@ impl Engine {
         }
         drop(guard);
         // The depth thread starts or stops reading.
+        self.wake_cameras();
+        self.hub.notify();
+        Ok(())
+    }
+
+    /// Changes what the depth camera is asked for and how its readings are used (the Calibrate tab): the distances
+    /// that count, the size of the picture, its speed. Not during a game. The distances work at once; another size or
+    /// speed opens the camera again, and the board has to be found in the new picture again.
+    pub fn set_depth_settings(&self, token: &str, patch: crate::depthlink::DepthPatch) -> ApiResult {
+        let Some(link) = &self.depth else { return Err(ApiError::Conflict("this program cannot read a depth camera".into())) };
+        let mut guard = self.controlled(token)?;
+        let inner = &mut *guard;
+        if inner.mode == Mode::Playing {
+            return Err(ApiError::Conflict("a game is running: end it first".into()));
+        }
+        let current = link.settings();
+        let next = patch.applied_to(current);
+        next.validate().map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
+        // A picture the camera does not have is refused when it has said which it has.
+        let modes = link.modes();
+        if next.mode() != current.mode() && !modes.is_empty() && !modes.contains(&next.mode()) {
+            return Err(ApiError::BadRequest("the depth camera has no such picture size and speed".into()));
+        }
+        let reopen = link.set_settings(next).map_err(ApiError::internal)?;
+        if reopen {
+            // What was found about the board belonged to the other picture.
+            inner.tracker.set_view_active(DEPTH_VIEW, false);
+            inner.tracker.set_view_calibration(DEPTH_VIEW, None);
+        }
+        drop(guard);
+        // The depth thread opens the camera again.
         self.wake_cameras();
         self.hub.notify();
         Ok(())

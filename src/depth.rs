@@ -67,6 +67,21 @@ impl DepthFrame {
     }
 }
 
+/// The picture with the readings outside `near..=far` (millimetres) taken out: they become "no reading". What is beyond
+/// the board (walls, screens, the room) only confuses the search for the plane of the board.
+pub fn clip(frame: &DepthFrame, near: u16, far: u16) -> DepthFrame {
+    let mm = frame.mm.iter().map(|&z| if z < near || z > far { 0 } else { z }).collect();
+    DepthFrame { width: frame.width, height: frame.height, mm }
+}
+
+/// The share of the picture (0 to 1) that has a reading that is believed.
+pub fn valid_share(frame: &DepthFrame) -> f32 {
+    if frame.mm.is_empty() {
+        return 0.0;
+    }
+    frame.mm.iter().filter(|z| (NEAREST_MM..=FARTHEST_MM).contains(z)).count() as f32 / frame.mm.len() as f32
+}
+
 /// Steadies the readings of a depth camera, which flicker: a point with no reading for a moment takes its last
 /// one for a few pictures, and the readings of a point are smoothed, unless the distance really changed.
 #[derive(Default)]
@@ -619,6 +634,16 @@ mod tests {
     fn start_frame(absorbing: bool, holes: f32, seed: u32) -> DepthFrame {
         let (occupied, black) = start_occupied();
         fake::frame(W, H, &corners(), &occupied, &black, absorbing, holes, seed)
+    }
+
+    #[test]
+    fn readings_outside_the_range_are_taken_out() {
+        let frame = DepthFrame::new(5, 1, vec![0, 200, 600, 1200, 3000]);
+        let kept = clip(&frame, 300, 1500);
+        assert_eq!(kept.mm, vec![0, 0, 600, 1200, 0]);
+        assert!((valid_share(&kept) - 0.4).abs() < 1e-6);
+        assert!((valid_share(&frame) - 0.8).abs() < 1e-6, "the reading of 0 is not a reading");
+        assert_eq!(valid_share(&DepthFrame::new(0, 0, vec![])), 0.0);
     }
 
     #[test]

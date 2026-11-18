@@ -881,7 +881,7 @@ pub fn demo_trio(frame_interval: Duration, move_interval: Duration) -> (SourceFa
     // first opened; drawing one takes longer than a frame.
     let drawn: Arc<std::sync::OnceLock<Arc<Vec<Arc<crate::depth::DepthFrame>>>>> = Arc::new(std::sync::OnceLock::new());
     let depth_shared = Arc::clone(&shared);
-    let depth: crate::depthlink::DepthFactory = Box::new(move |_| {
+    let depth: crate::depthlink::DepthFactory = Box::new(move |_, _| {
         let pictures = drawn.get_or_init(|| Arc::new(DemoDepth::draw(frame_interval, move_interval))).clone();
         Ok(Box::new(DemoDepth { pictures, shared: Arc::clone(&depth_shared), pacer: Pacer::new(frame_interval) })
             as Box<dyn crate::depthlink::DepthSource>)
