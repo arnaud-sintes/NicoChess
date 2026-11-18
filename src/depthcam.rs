@@ -10,7 +10,7 @@ use crate::depthlink::{DepthFactory, DepthSource};
 /// Without Windows there is no depth camera to read (yet).
 #[cfg(not(windows))]
 pub fn factory() -> DepthFactory {
-    Box::new(|_| -> anyhow::Result<Box<dyn DepthSource>> { anyhow::bail!("reading a depth camera is only done on Windows") })
+    Box::new(|_, _| -> anyhow::Result<Box<dyn DepthSource>> { anyhow::bail!("reading a depth camera is only done on Windows") })
 }
 
 #[cfg(windows)]
