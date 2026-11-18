@@ -304,7 +304,7 @@ pub fn height_picture(frame: &DepthFrame, plane: &Plane) -> RgbImage {
 pub fn preview(frame: &DepthFrame) -> RgbImage {
     let mut valid: Vec<u16> = frame.mm.iter().copied().filter(|z| (NEAREST_MM..=FARTHEST_MM).contains(z)).collect();
     valid.sort_unstable();
-    let (near, far) = match (valid.get(valid.len() / 50), valid.get(valid.len() - 1 - valid.len() / 50)) {
+    let (near, far) = match (valid.get(valid.len() / 50), valid.get(valid.len().saturating_sub(1 + valid.len() / 50))) {
         (Some(&n), Some(&f)) if f > n => (f32::from(n), f32::from(f)),
         _ => (0.0, 1.0),
     };
@@ -634,6 +634,17 @@ mod tests {
     fn start_frame(absorbing: bool, holes: f32, seed: u32) -> DepthFrame {
         let (occupied, black) = start_occupied();
         fake::frame(W, H, &corners(), &occupied, &black, absorbing, holes, seed)
+    }
+
+    #[test]
+    fn a_picture_with_no_reading_at_all_can_be_shown() {
+        // `/depth.jpg` of a camera that sees nothing (a cap on the lens) must not panic.
+        let empty = DepthFrame::new(8, 4, vec![0; 32]);
+        let shown = preview(&empty);
+        assert_eq!((shown.width(), shown.height()), (8, 4));
+        assert!(shown.pixels().all(|p| p[0] == 0));
+        let none = DepthFrame::new(0, 0, vec![]);
+        assert_eq!(preview(&none).width(), 0);
     }
 
     #[test]

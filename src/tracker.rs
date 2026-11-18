@@ -229,8 +229,9 @@ impl Gate {
     fn new(cfg: &TrackerConfig) -> Self {
         Gate {
             stable_frames: cfg.stable_frames.max(1),
-            stable_time: Duration::from_secs_f32(cfg.stable_time.max(0.0)),
-            motion_span: Duration::from_secs_f32(cfg.motion_span.max(0.0)),
+            // From the command line or a recording: not a value that `Duration` cannot hold (or that would never end).
+            stable_time: Duration::from_secs_f32(if cfg.stable_time.is_finite() { cfg.stable_time.clamp(0.0, 60.0) } else { STABLE_TIME }),
+            motion_span: Duration::from_secs_f32(if cfg.motion_span.is_finite() { cfg.motion_span.clamp(0.0, 10.0) } else { MOTION_SPAN }),
             motion_threshold: cfg.motion_threshold,
             history: VecDeque::new(),
             run: 0,

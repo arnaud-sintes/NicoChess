@@ -118,3 +118,21 @@ fn entering_the_move_that_was_played_ends_the_wait_after_an_undo() {
     let reply = rig.show(&steps[1].after, 3.0);
     assert!(matches!(reply.as_slice(), [(Detection::Move { mv, .. }, _)] if uci_of(*mv) == "e7e5"), "{reply:?}");
 }
+
+#[test]
+fn a_still_time_that_cannot_be_held_does_not_stop_the_program() {
+    // From the command line or the file of a recording: infinite, not a number, negative, huge.
+    for (stable, span) in [(f32::INFINITY, f32::NAN), (f32::NAN, f32::INFINITY), (-5.0, -1.0), (1.0e30, 1.0e30)] {
+        let config = TrackerConfig { stable_time: stable, motion_span: span, ..TrackerConfig::default() };
+        let mut tracker = Tracker::new(config);
+        tracker.set_calibration(Some(&synthetic::corners()));
+        tracker.start(Chess::default());
+        let mut now = Instant::now();
+        for i in 0..6 {
+            now += Duration::from_millis(333);
+            let mut frame = synthetic::frame_from_grid(&synthetic::start_grid());
+            synthetic::degrade(&mut frame, -15, 10, i);
+            let _ = tracker.feed(&frame, now);
+        }
+    }
+}

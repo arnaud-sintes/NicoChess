@@ -1090,8 +1090,10 @@ mod tests {
         });
         let events: Vec<Value> =
             std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        // What the people did: not the pictures, nor the notes of the program (which cameras took part, and that the
+        // tracker was unsure: the synthetic board never changes, so it may well say so between the moves typed).
         let people: Vec<&Value> =
-            events.iter().filter(|e| !["frame", "views", "closed"].contains(&e["type"].as_str().unwrap_or(""))).collect();
+            events.iter().filter(|e| !["frame", "views", "unsure", "closed"].contains(&e["type"].as_str().unwrap_or(""))).collect();
         let kinds: Vec<&str> = people.iter().map(|e| e["type"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["manual", "manual", "undo", "end"], "{people:?}");
         assert_eq!(people[0]["text"], "e2e4");
@@ -1479,8 +1481,12 @@ mod tests {
         assert!(!dir.join("calibration2.json").exists());
         wait_for("a picture from the other camera", || rig.engine.latest_frame(1).is_some());
 
-        // Switched off: the camera closes, the first goes on, and what was calibrated stays for the next time.
-        assert_eq!(rig.call("POST", "/api/calibration?cam=2", ALICE, &second_corners_json()).0, 200);
+        // Switched off: the camera closes, the first goes on, and what was calibrated stays for the next time. (The old
+        // picture is still there for a moment after the choice of another camera, then gone until the new one comes:
+        // the calibration is refused in between, so it is tried until it is taken.)
+        wait_for("the calibration of the second camera", || {
+            rig.call("POST", "/api/calibration?cam=2", ALICE, &second_corners_json()).0 == 200
+        });
         assert_eq!(rig.call("POST", "/api/camera/select?cam=2", ALICE, r#"{"id": ""}"#).0, 200);
         assert_eq!(second.device(), "");
         wait_for("the second camera to close", || rig.engine.latest_frame(1).is_none());

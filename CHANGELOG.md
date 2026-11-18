@@ -5,6 +5,59 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.8.0
+
+The first full release since 0.6.0: it holds everything of the test builds 0.7.0 and 0.7.1 (the faster page, the
+clocks, dragging pieces, the board turn, the undo that holds, the depth camera and its settings), and the result of an
+audit for reliability and performance. Three independent reviewers (Claude Sonnet, Opus and Fable, each reading the
+whole code on its own) were given the same brief; what two or three of them found alike was checked in the code and
+fixed, and the claims about speed were measured before anything was changed for them.
+
+**Fixed**
+- **One picture that cannot be decoded closed the camera.** A truncated picture is routine on a busy USB bus; it ended
+  the camera thread, and the engine then closed the camera, waited 2 s and opened it again: several seconds without
+  pictures in the middle of a game. Such a picture is now skipped, and only ten in a row fail the camera (Windows and
+  Linux). Decoded MJPEG pictures are also no longer copied once more each.
+- **A game that could not be written was forgotten.** If the disk refused for a moment (full, or a file held by a
+  scanner), the game was dropped and written again only at the next move. It is now kept and written again, after a
+  pause that grows from 1 to 10 s, and the page shows the notice until it is written.
+- **The depth camera read could block for ever** (Media Foundation has no time limit), so that ending the game, unticking
+  the box or changing the settings never took effect. It is read on a thread of its own and waited for 5 s at most, as
+  the colour camera is. Its shutdown also happened in the wrong order (Media Foundation before the objects were let go
+  of); the source is now shut down properly.
+- **A camera driver that hangs left one more stuck thread every few seconds.** A camera (and the depth camera) is not opened
+  while the thread of the last opening is still there; the page says the driver did not answer.
+- **Listing the cameras could take the depth away in the middle of a game.** The page lists them every 5 s on the Calibrate
+  tab; a listing that missed the depth part for a moment (the camera renumbering on the USB bus) cleared what was found
+  about the board. During a game the depth is kept; outside one the list is believed, and the depth thread is woken when
+  it changes.
+- **Two writers of one file shared one temporary file** (a calibration set by hand and one moved by the board following):
+  they could mix their bytes or fail the rename. Each write has its own temporary file now, removed if the write fails.
+- **A calibration file that cannot be used** (corners not numbers, all on one spot) left the program "calibrated" while the
+  tracker had no squares; it is now ignored with a message, as an unreadable file already was.
+- **Threads that could end for good on a panic**: reading a picture is guarded like the processing of it, the depth thread
+  starts again, the saver goes on. A picture that panics every time prints one line, not 25 a second.
+- **Recordings no longer grow without limit** while the tracker stays in one status other than "watching": after 20 s the
+  pictures come at the slow pace of `--record-every`.
+- Smaller: `--stable-time` (or the file of a recording) with an infinite or absurd value panicked; `/depth.jpg` of a
+  picture with no reading panicked in debug builds; the accept loop spun at full speed on an error that did not go away.
+
+**Looked at, measured, and not changed.** The reviewers estimated tens of milliseconds for the search over three moves
+(under the engine lock), for the game being replayed on every page update, and for the height picture of the depth
+camera. Measured in a release build on this PC: 4.6 ms at the most for a picture that needs the three-move search, 0.1 ms
+for a game of 150 moves, 2.6 ms for a height picture at 848x480. Nothing to gain at those costs, and the search is the
+heart of the detection: it was left alone. On the 32-bit Atom they would be several times more.
+
+**Known, not fixed**
+- A camera that goes away, or pictures that are late, just as a move is made can leave the tracker behind the game; it
+  then explains the board with wrong sequences of three moves. The whole-game test of two cameras stalls in about one run
+  in ten for what looks like the same reason (it also did before this version).
+- The games list reads every game file each time it is asked (slow with thousands of games, on a small machine); the
+  preview stream of the camera is compressed at the full rate of the camera; a picture stream whose page left is only
+  ended when pictures flow again.
+- The depth reader was rewritten (reader thread, time limit, shutdown) and checked on its failure paths and by tests, but
+  **not on live pictures of the D415 for this release: it was unplugged**. The version before was.
+
 ## 0.7.1
 
 - **Depth settings on the Calibrate tab** (under "Also use the depth of this camera"): the nearest and the farthest

@@ -134,7 +134,11 @@ pub fn serve_on(listener: TcpListener, max_connections: usize, handler: Handler,
     }
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        // An error that does not go away (no more handles, say) must not make this loop spin at full speed.
+        let Ok(stream) = stream else {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        };
         accept(stream, max_connections, &handler, &active, None);
     }
     Ok(())

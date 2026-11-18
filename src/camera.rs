@@ -207,6 +207,40 @@ impl Decimator {
     }
 }
 
+/// How many pictures in a row that cannot be decoded are skipped before the camera is called failed.
+const MAX_BAD_PICTURES: u32 = 10;
+
+/// Counts the pictures in a row that could not be decoded. A truncated picture is routine on a busy USB bus (a webcam
+/// beside another camera on one controller): it is skipped, not a reason to close the camera and open it again, which
+/// would leave the game without pictures for several seconds. Only a camera that keeps giving them is failed.
+#[derive(Default)]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+struct BadPictures(u32);
+
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+impl BadPictures {
+    /// Takes the result of decoding a picture: the picture, `None` for one to skip, or the error of a camera that fails.
+    fn check(&mut self, decoded: Result<RgbImage>) -> Result<Option<RgbImage>> {
+        match decoded {
+            Ok(image) => {
+                self.0 = 0;
+                Ok(Some(image))
+            }
+            Err(e) => {
+                self.0 += 1;
+                if self.0 == 1 {
+                    eprintln!("camera: a picture could not be decoded ({e:#}); skipped");
+                }
+                if self.0 >= MAX_BAD_PICTURES {
+                    Err(e.context(format!("{MAX_BAD_PICTURES} pictures in a row could not be decoded")))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
 /// Settings for the real camera.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -257,6 +291,7 @@ mod windows_camera {
         ApiBackend, CameraFormat, CameraIndex, ControlValueSetter, FrameFormat, KnownCameraControl, RequestedFormat, RequestedFormatType,
     };
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Mutex, PoisonError};
 
     const BACKEND: ApiBackend = ApiBackend::MediaFoundation;
     const WANTED: &[FrameFormat] = &[FrameFormat::MJPEG, FrameFormat::YUYV, FrameFormat::NV12, FrameFormat::RAWRGB, FrameFormat::RAWBGR];
@@ -344,6 +379,7 @@ mod windows_camera {
         format: FrameFormat,
         rate: Arc<FrameRate>,
         keeper: Decimator,
+        bad: BadPictures,
     }
 
     impl Grabber {
@@ -394,6 +430,7 @@ mod windows_camera {
                 format: format.format(),
                 rate: Arc::clone(&settings.rate),
                 keeper: Decimator::default(),
+                bad: BadPictures::default(),
             })
         }
     }
@@ -440,25 +477,88 @@ mod windows_camera {
                 }
                 let data = buffer.buffer();
                 let (w, h) = (self.width, self.height);
-                let image = match buffer.source_frame_format() {
-                    FrameFormat::YUYV => yuyv_to_rgb(data, w, h)?,
-                    FrameFormat::NV12 => nv12_to_rgb(data, w, h)?,
-                    FrameFormat::MJPEG => {
-                        image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.to_rgb8()
-                    }
-                    FrameFormat::RAWRGB => RgbImage::from_raw(w, h, data.to_vec()).context("bad RGB frame size")?,
-                    FrameFormat::RAWBGR => {
-                        let mut rgb = data.to_vec();
-                        rgb.as_chunks_mut::<3>().0.iter_mut().for_each(|p| p.swap(0, 2));
-                        RgbImage::from_raw(w, h, rgb).context("bad BGR frame size")?
-                    }
-                    FrameFormat::GRAY => {
-                        let rgb: Vec<u8> = data.iter().flat_map(|&g| [g, g, g]).collect();
-                        RgbImage::from_raw(w, h, rgb).context("bad gray frame size")?
-                    }
-                };
-                return Ok(image);
+                let decoded = (|| -> Result<RgbImage> {
+                    Ok(match buffer.source_frame_format() {
+                        FrameFormat::YUYV => yuyv_to_rgb(data, w, h)?,
+                        FrameFormat::NV12 => nv12_to_rgb(data, w, h)?,
+                        // `into_rgb8` moves the decoded picture; `to_rgb8` would copy all of it.
+                        FrameFormat::MJPEG => {
+                            image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.into_rgb8()
+                        }
+                        FrameFormat::RAWRGB => RgbImage::from_raw(w, h, data.to_vec()).context("bad RGB frame size")?,
+                        FrameFormat::RAWBGR => {
+                            let mut rgb = data.to_vec();
+                            rgb.as_chunks_mut::<3>().0.iter_mut().for_each(|p| p.swap(0, 2));
+                            RgbImage::from_raw(w, h, rgb).context("bad BGR frame size")?
+                        }
+                        FrameFormat::GRAY => {
+                            let rgb: Vec<u8> = data.iter().flat_map(|&g| [g, g, g]).collect();
+                            RgbImage::from_raw(w, h, rgb).context("bad gray frame size")?
+                        }
+                    })
+                })();
+                if let Some(image) = self.bad.check(decoded)? {
+                    return Ok(image);
+                }
             }
+        }
+    }
+
+    /// The cameras whose thread is still running. A driver that hangs leaves its thread blocked for good (it cannot be
+    /// stopped from outside); opening the camera again would then leave one more such thread every few seconds, and
+    /// find the camera "in use". So a camera is not opened while the thread of the last opening is still there.
+    static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+    struct Running(u32);
+
+    impl Running {
+        /// Waits a moment for the thread of a camera that was closed just now to end (it ends within one picture),
+        /// then takes the camera. `None` when the thread is stuck.
+        fn take(index: u32) -> Option<Running> {
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            loop {
+                {
+                    let mut running = RUNNING.lock().unwrap_or_else(PoisonError::into_inner);
+                    if !running.contains(&index) {
+                        running.push(index);
+                        return Some(Running(index));
+                    }
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            RUNNING.lock().unwrap_or_else(PoisonError::into_inner).retain(|&i| i != self.0);
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::items_after_test_module)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_camera_is_not_opened_again_while_the_thread_of_the_last_opening_is_stuck() {
+            // Camera numbers that no other test uses: the list is shared by the whole process.
+            let stuck = Running::take(901).expect("free");
+            let started = Instant::now();
+            assert!(Running::take(901).is_none(), "the thread is still there");
+            assert!(started.elapsed() >= Duration::from_millis(1400), "a moment is given for it to end");
+            // Another camera is not held up.
+            assert!(Running::take(902).is_some());
+            // The thread of a camera that was just closed ends within a picture: its camera can be opened at once.
+            let ending = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                drop(stuck);
+            });
+            assert!(Running::take(901).is_some(), "taken as soon as the thread ended");
+            ending.join().unwrap();
         }
     }
 
@@ -472,12 +572,17 @@ mod windows_camera {
     impl WindowsCamera {
         pub fn open(settings: &CameraSettings) -> Result<Self> {
             let settings = settings.clone();
+            let Some(running) = Running::take(index_of(&settings.device)) else {
+                bail!("the camera driver did not answer the last time and has not let go of the camera: unplug it and plug it in again");
+            };
             let (ready_tx, ready_rx) = mpsc::channel::<Result<String>>();
             // One frame at most is kept ahead: the camera waits for the program.
             let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<RgbImage>>(1);
             thread::Builder::new()
                 .name("camera".into())
                 .spawn(move || {
+                    // Dropped when this thread ends, whatever the way.
+                    let _running = running;
                     let mut grabber = match Grabber::open(&settings) {
                         Ok(g) => {
                             let _ = ready_tx.send(Ok(g.describe()));
@@ -624,6 +729,7 @@ mod v4l_camera {
         pixel_format: PixelFormat,
         rate: Arc<FrameRate>,
         keeper: Decimator,
+        bad: BadPictures,
     }
 
     impl V4lCamera {
@@ -664,6 +770,7 @@ mod v4l_camera {
                 pixel_format,
                 rate: Arc::clone(&settings.rate),
                 keeper: Decimator::default(),
+                bad: BadPictures::default(),
             })
         }
     }
@@ -715,14 +822,18 @@ mod v4l_camera {
                 }
                 let used = (meta.bytesused as usize).min(buffer.len());
                 let data = &buffer[..used];
-                let image = match self.pixel_format {
-                    PixelFormat::Yuyv => yuyv_to_rgb(data, self.width, self.height)?,
-                    PixelFormat::Nv12 => nv12_to_rgb(data, self.width, self.height)?,
-                    PixelFormat::Mjpeg => {
-                        image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.to_rgb8()
-                    }
-                };
-                return Ok(image);
+                let decoded = (|| -> Result<RgbImage> {
+                    Ok(match self.pixel_format {
+                        PixelFormat::Yuyv => yuyv_to_rgb(data, self.width, self.height)?,
+                        PixelFormat::Nv12 => nv12_to_rgb(data, self.width, self.height)?,
+                        PixelFormat::Mjpeg => {
+                            image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.into_rgb8()
+                        }
+                    })
+                })();
+                if let Some(image) = self.bad.check(decoded)? {
+                    return Ok(image);
+                }
             }
         }
     }
@@ -1081,6 +1192,27 @@ mod tests {
         assert!(decimator.keep(later, interval));
         assert!(!decimator.keep(later + Duration::from_millis(30), interval));
         assert!(decimator.keep(later + Duration::from_millis(100), interval));
+    }
+
+    #[test]
+    fn a_picture_that_cannot_be_decoded_is_skipped_and_only_a_run_of_them_fails_the_camera() {
+        let bad = || -> Result<RgbImage> { bail!("truncated") };
+        let good = || -> Result<RgbImage> { Ok(RgbImage::new(2, 2)) };
+        let mut counter = BadPictures::default();
+        // A few bad pictures between good ones are skipped, and the count starts again after a good one.
+        for _ in 0..3 {
+            for _ in 0..(MAX_BAD_PICTURES - 1) {
+                assert!(counter.check(bad()).unwrap().is_none());
+            }
+            assert!(counter.check(good()).unwrap().is_some());
+        }
+        // A camera that gives nothing else is failed, with the reason.
+        let mut counter = BadPictures::default();
+        for _ in 0..(MAX_BAD_PICTURES - 1) {
+            assert!(counter.check(bad()).unwrap().is_none());
+        }
+        let error = counter.check(bad()).unwrap_err();
+        assert!(format!("{error:#}").contains("in a row could not be decoded"), "{error:#}");
     }
 
     #[test]

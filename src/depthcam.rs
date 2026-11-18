@@ -4,6 +4,10 @@
 //! The depth part of such a camera is a camera of its own for Windows ("... Depth"), whose pictures are 16 bits
 //! per point (format `Z16`): the distance in millimetres with the camera's default settings, 0 where it has no
 //! reading. `nokhwa` cannot read that format, so this talks to Media Foundation itself.
+//!
+//! A read of Media Foundation has no time limit: a camera that stalls without an error (a USB hiccup) would block the
+//! caller for ever. So the camera is read on a thread of its own, which hands over the pictures through a channel, and
+//! the caller waits for them with a time limit, as the colour cameras do (`camera::WindowsCamera`).
 
 use crate::depthlink::{DepthFactory, DepthSource};
 
@@ -22,32 +26,140 @@ mod windows_impl {
     use crate::depth::DepthFrame;
     use crate::depthlink::{DepthMode, DepthSettings};
     use anyhow::{Context, Result, bail};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+    use std::time::{Duration, Instant};
     use windows::Win32::Media::MediaFoundation::*;
     use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemFree};
     use windows::core::PWSTR;
+
+    /// Opening a camera can hang in the driver: do not wait for it for ever.
+    const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+    /// A camera that gives no picture for this long is not working.
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// True while the reading thread of a depth camera runs. A driver that hangs leaves that thread blocked for good
+    /// (it cannot be stopped from outside), and opening the camera again would leave one more every few seconds.
+    static READING: AtomicBool = AtomicBool::new(false);
+
+    struct ReadingGuard;
+
+    impl Drop for ReadingGuard {
+        fn drop(&mut self) {
+            READING.store(false, Ordering::SeqCst);
+        }
+    }
 
     pub fn factory() -> DepthFactory {
         Box::new(|depth_name, settings| Ok(Box::new(MfDepth::open(depth_name, settings)?) as Box<dyn DepthSource>))
     }
 
-    struct MfDepth {
-        reader: IMFSourceReader,
-        _source: IMFMediaSource,
+    /// What the camera said about itself when it was opened.
+    #[derive(Clone)]
+    struct Info {
         width: u32,
         height: u32,
         fps: u32,
-        name: String,
         /// Every depth mode the camera has.
         modes: Vec<DepthMode>,
     }
 
-    // The reader is made and used on the depth thread alone (it was started free-threaded).
-    unsafe impl Send for MfDepth {}
+    /// What the program uses: the pictures come from the thread that owns the camera.
+    struct MfDepth {
+        frames: Receiver<Result<DepthFrame>>,
+        name: String,
+        info: Info,
+    }
 
-    impl Drop for MfDepth {
+    impl MfDepth {
+        fn open(depth_name: &str, settings: &DepthSettings) -> Result<MfDepth> {
+            // The thread of the last opening ends within a picture of the camera being closed.
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while READING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "the depth camera driver did not answer the last time and has not let go of the camera: unplug it and plug it in again"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            let guard = ReadingGuard;
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<Info>>();
+            // One picture at most is kept ahead: the camera waits for the program.
+            let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<DepthFrame>>(1);
+            let (name, wanted) = (depth_name.to_string(), *settings);
+            thread::Builder::new()
+                .name("depth-read".into())
+                .spawn(move || {
+                    // Ends with this thread, whatever the way.
+                    let _guard = guard;
+                    let mut reader = match Reader::open(&name, &wanted) {
+                        Ok(r) => {
+                            let _ = ready_tx.send(Ok(r.info()));
+                            r
+                        }
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    loop {
+                        let frame = reader.next_frame();
+                        let failed = frame.is_err();
+                        // The receiver is gone when the camera is closed.
+                        if frames_tx.send(frame).is_err() || failed {
+                            return;
+                        }
+                    }
+                })
+                .context("cannot start the depth camera thread")?;
+            match ready_rx.recv_timeout(OPEN_TIMEOUT) {
+                Ok(opened) => Ok(MfDepth { frames: frames_rx, name: depth_name.to_string(), info: opened? }),
+                Err(mpsc::RecvTimeoutError::Timeout) => bail!("the depth camera did not open within {} seconds", OPEN_TIMEOUT.as_secs()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the depth camera thread stopped"),
+            }
+        }
+    }
+
+    impl DepthSource for MfDepth {
+        fn describe(&self) -> String {
+            format!("{} ({}x{} depth, {} a second)", self.name.trim(), self.info.width, self.info.height, self.info.fps)
+        }
+
+        fn modes(&self) -> Vec<DepthMode> {
+            self.info.modes.clone()
+        }
+
+        fn next_frame(&mut self) -> Result<DepthFrame> {
+            match self.frames.recv_timeout(FRAME_TIMEOUT) {
+                Ok(frame) => frame,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bail!("no depth picture from the camera for {} seconds (is another program using it?)", FRAME_TIMEOUT.as_secs())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the depth camera thread stopped"),
+            }
+        }
+    }
+
+    /// The camera itself. Its Media Foundation objects live on the thread that opened them.
+    struct Reader {
+        reader: Option<IMFSourceReader>,
+        source: Option<IMFMediaSource>,
+        info: Info,
+    }
+
+    impl Drop for Reader {
         fn drop(&mut self) {
-            // Safe to call: Media Foundation counts the starts, the colour cameras have their own.
+            // In this order: the reader is let go of, then the source is shut down (that is what releases the camera),
+            // and only then Media Foundation is told this thread is done with it. (Fields would otherwise be released
+            // after this function, that is after the shutdown.) Media Foundation counts the starts: the colour cameras
+            // have their own.
             unsafe {
+                self.reader = None;
+                if let Some(source) = self.source.take() {
+                    let _ = source.Shutdown();
+                }
                 let _ = MFShutdown();
             }
         }
@@ -58,8 +170,12 @@ mod windows_impl {
         squash(a) == squash(b)
     }
 
-    impl MfDepth {
-        fn open(depth_name: &str, settings: &DepthSettings) -> Result<MfDepth> {
+    impl Reader {
+        fn info(&self) -> Info {
+            self.info.clone()
+        }
+
+        fn open(depth_name: &str, settings: &DepthSettings) -> Result<Reader> {
             unsafe {
                 // A thread that already has COM in another way says so: nothing to do about it here.
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -74,7 +190,7 @@ mod windows_impl {
             }
         }
 
-        unsafe fn open_started(depth_name: &str, settings: &DepthSettings) -> Result<MfDepth> {
+        unsafe fn open_started(depth_name: &str, settings: &DepthSettings) -> Result<Reader> {
             unsafe {
                 let mut attributes: Option<IMFAttributes> = None;
                 MFCreateAttributes(&mut attributes, 1)?;
@@ -138,30 +254,20 @@ mod windows_impl {
                 let rate = media_type.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
                 let fps = if rate as u32 > 0 { ((rate >> 32) as f32 / (rate as u32) as f32).round() as u32 } else { 0 };
                 modes.sort_by_key(|m| (m.width, m.height, m.fps));
-                Ok(MfDepth { reader, _source: source, width, height, fps, name: depth_name.to_string(), modes })
+                Ok(Reader { reader: Some(reader), source: Some(source), info: Info { width, height, fps, modes } })
             }
-        }
-    }
-
-    impl DepthSource for MfDepth {
-        fn describe(&self) -> String {
-            format!("{} ({}x{} depth, {} a second)", self.name.trim(), self.width, self.height, self.fps)
-        }
-
-        fn modes(&self) -> Vec<DepthMode> {
-            self.modes.clone()
         }
 
         fn next_frame(&mut self) -> Result<DepthFrame> {
             let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+            let reader = self.reader.as_ref().context("the depth camera is closed")?;
+            let (width, height) = (self.info.width, self.info.height);
             unsafe {
                 // A few empty reads (stream ticks) are normal; a camera that goes on giving nothing is not working.
                 for _ in 0..200 {
                     let mut flags = 0u32;
                     let mut sample: Option<IMFSample> = None;
-                    self.reader
-                        .ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))
-                        .context("the depth camera stopped")?;
+                    reader.ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample)).context("the depth camera stopped")?;
                     if flags & (MF_SOURCE_READERF_ERROR.0 as u32 | MF_SOURCE_READERF_ENDOFSTREAM.0 as u32) != 0 {
                         bail!("the depth camera stopped (unplugged?)");
                     }
@@ -172,12 +278,12 @@ mod windows_impl {
                     buffer.Lock(&mut data, None, Some(&mut length))?;
                     let bytes = std::slice::from_raw_parts(data, length as usize).to_vec();
                     buffer.Unlock()?;
-                    let points = (self.width * self.height) as usize;
+                    let points = (width * height) as usize;
                     if bytes.len() < points * 2 {
-                        bail!("a depth picture of {} bytes is too small for {}x{}", bytes.len(), self.width, self.height);
+                        bail!("a depth picture of {} bytes is too small for {width}x{height}", bytes.len());
                     }
                     let mm = bytes.as_chunks::<2>().0.iter().take(points).map(|c| u16::from_le_bytes(*c)).collect();
-                    return Ok(DepthFrame::new(self.width, self.height, mm));
+                    return Ok(DepthFrame::new(width, height, mm));
                 }
             }
             bail!("the depth camera gives no pictures")

@@ -79,6 +79,8 @@ pub const CAMERAS: usize = 2;
 /// A picture to look for the board in: the camera it came from, the picture, and when.
 type FollowJob = (usize, Arc<Latest>, Instant);
 
+/// How long every picture is recorded while the tracker is in a status other than "watching" (see `loud`).
+const RECORD_LOUD: Duration = Duration::from_secs(20);
 /// What the tracker looks at: the cameras, and after them the height picture of the depth camera (see `depth`).
 const VIEWS: usize = CAMERAS + 1;
 const DEPTH_VIEW: usize = CAMERAS;
@@ -354,8 +356,9 @@ struct Inner {
     /// The main camera and the second one.
     cams: [Cam; CAMERAS],
     last_feed: Option<Instant>,
-    /// When a picture was last handed to the recording.
+    /// When a picture was last handed to the recording, and since when the tracker has been in the status it is in.
     last_recorded: Option<Instant>,
+    status_since: Option<Instant>,
     /// Which cameras (and the depth) the tracker was told were giving pictures, the last time (for the recording).
     last_active: Option<[bool; VIEWS]>,
     /// The game to write to the disk: set under the lock, written by `flush_save` once the lock is
@@ -461,10 +464,29 @@ pub fn remembered_fps(calibration_path: &Path) -> Option<f32> {
     (1.0..=30.0).contains(&fps).then_some(fps)
 }
 
+/// A calibration read from a file is used only if it can be: a degenerate one (edited by hand, or from a damaged file)
+/// would leave the engine "calibrated", and a game could be started, while the tracker has no squares to look at.
+fn usable_calibration(calibration: Option<Calibration>, which: &str) -> Option<Calibration> {
+    let calibration = calibration?;
+    // Corners that are numbers and make a projection are enough: a calibration made for another picture size is still
+    // reported as such when the pictures come (and the sampler keeps its reads inside the picture).
+    let numbers = calibration.corners.iter().all(|c| c[0].is_finite() && c[1].is_finite());
+    // The checks of a calibration (not all on one spot or one line, convex, in order, a board's worth of picture) are made
+    // in the smallest picture that holds the corners, so that a calibration for another size passes.
+    let (width, height) = calibration.corners.iter().fold((1.0f32, 1.0f32), |a, c| (a.0.max(c[0]), a.1.max(c[1])));
+    if numbers && calibration.validate(width.ceil() as u32, height.ceil() as u32).is_ok() && calibration.projection().is_some() {
+        Some(calibration)
+    } else {
+        eprintln!("calibration{which}: the one on the disk cannot be used; using none, calibrate again");
+        None
+    }
+}
+
 impl Engine {
     pub fn new(config: EngineConfig, store: Store, calibration_path: PathBuf, calibration: Option<Calibration>) -> Arc<Engine> {
         let tracker_config = config.tracker.clone();
         let mut tracker = Tracker::new(config.tracker);
+        let calibration = usable_calibration(calibration, "");
         tracker.set_view_calibration(0, calibration.as_ref());
         let picture_path = calibration_path.with_file_name("picture.json");
         let rate_path = calibration_path.with_file_name("rate.json");
@@ -475,6 +497,7 @@ impl Engine {
             eprintln!("calibration (second camera): {e:#}; using none, calibrate again");
             None
         });
+        let second_calibration = usable_calibration(second_calibration, " (second camera)");
         tracker.set_view_calibration(1, second_calibration.as_ref());
         let second_picture = Picture::load(&second_picture_path).unwrap_or_else(|e| {
             eprintln!("picture (second camera): {e:#}; using the defaults");
@@ -506,6 +529,7 @@ impl Engine {
                 cams: [Cam::new(calibration, picture), Cam::new(second_calibration, second_picture)],
                 last_feed: None,
                 last_recorded: None,
+                status_since: None,
                 last_active: None,
                 pending_save: None,
                 recorder: None,
@@ -642,6 +666,8 @@ impl Engine {
         }
         let engine = Arc::clone(self);
         let _ = thread::Builder::new().name("saver".into()).spawn(move || {
+            // How long to wait before trying again after a failure: the disk may be full or held for a moment.
+            let mut pause = Duration::from_secs(1);
             loop {
                 {
                     let (flag, wake) = &engine.save_signal;
@@ -651,8 +677,15 @@ impl Engine {
                     }
                     *wanted = false;
                 }
-                // A failure is reported to the pages by `flush_save` itself.
-                let _ = engine.flush_save();
+                // A failure is reported to the pages by `flush_save` itself, which also asks for another try.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.flush_save())) {
+                    Ok(Ok(())) => pause = Duration::from_secs(1),
+                    Ok(Err(_)) => {
+                        thread::sleep(pause);
+                        pause = (pause * 2).min(Duration::from_secs(10));
+                    }
+                    Err(_) => eprintln!("store: the game could not be written (internal error); going on"),
+                }
             }
         });
     }
@@ -683,7 +716,16 @@ impl Engine {
     pub fn spawn_depth(self: &Arc<Self>) -> std::io::Result<()> {
         let Some(link) = self.depth.clone() else { return Ok(()) };
         let engine = Arc::clone(self);
-        thread::Builder::new().name("depth".into()).spawn(move || engine.depth_loop(&link)).map(|_| ())
+        thread::Builder::new()
+            .name("depth".into())
+            .spawn(move || {
+                // The loop does not end by itself: if it panics, it starts again.
+                while std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.depth_loop(&link))).is_err() {
+                    eprintln!("depth: internal error; starting again");
+                    thread::sleep(CAMERA_RETRY);
+                }
+            })
+            .map(|_| ())
     }
 
     /// Looks whether the main camera in use has a depth part, and tells the depth link. Looking for the cameras takes a
@@ -796,6 +838,7 @@ impl Engine {
             // A choice of camera made while it was off needs no reopening: it is opened now.
             slot.reopen.store(false, Ordering::SeqCst);
             let mut reopening = false;
+            let mut broken = 0u32;
             match factory() {
                 Ok(mut source) => {
                     self.set_source(cam, source.describe());
@@ -807,10 +850,18 @@ impl Engine {
                         if slot.restart.swap(false, Ordering::SeqCst) {
                             source.restart();
                         }
-                        match source.next_frame() {
+                        // A panic while reading (a decoder that chokes on a picture) is a failure of the camera, not the end of
+                        // the thread that reads it.
+                        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.next_frame()))
+                            .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error while reading a picture")));
+                        match read {
                             Ok(image) => {
                                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.on_frame(cam, image))).is_err() {
-                                    eprintln!("camera: a picture could not be processed (internal error); going on");
+                                    // At 25 pictures a second the same line would come 25 times a second.
+                                    broken += 1;
+                                    if broken == 1 || broken.is_multiple_of(250) {
+                                        eprintln!("camera: a picture could not be processed (internal error); going on ({broken} so far)");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -1045,8 +1096,12 @@ impl Engine {
             let status = inner.tracker.status();
             if status != inner.last_status {
                 inner.last_status = status;
+                inner.status_since = Some(now);
                 changed = true;
             }
+            // Every picture is wanted while something is going on, but not for ever: a game left "unsure" overnight would
+            // fill the disk. After a while in the same status the pictures come at the slow pace of `--record-every`.
+            let loud = found || (status != Status::Watching && inner.status_since.is_none_or(|t| now.duration_since(t) < RECORD_LOUD));
             // The picture comes before what it led to, so that the file reads in order. Every picture is kept
             // while something is going on; only now and then while the board is quiet.
             // At 25 pictures a second the recording keeps a few a second, not all (a replay takes the time from the file).
@@ -1058,7 +1113,7 @@ impl Engine {
                     if let Some((_, picture)) = &depth_given {
                         pictures.push((DEPTH_VIEW, Arc::new(picture.clone())));
                     }
-                    recorder.frames(now, &pictures, status_name(status), found || status != Status::Watching);
+                    recorder.frames(now, &pictures, status_name(status), loud);
                     inner.last_recorded = Some(now);
                 }
                 if let Some((kind, data)) = noted {
@@ -1279,8 +1334,17 @@ impl Engine {
             Err(e) => {
                 eprintln!("store: {e:#}");
                 let message = format!("{SAVE_FAILED}: {e:#}");
-                self.inner.grab().notice = Some(message.clone());
+                {
+                    let mut inner = self.inner.grab();
+                    // Kept to be written again (the saver thread tries again), unless a newer version was marked meanwhile:
+                    // a disk that is full for a moment, or a file held by a scanner, must not lose the last moves.
+                    if inner.pending_save.is_none() {
+                        inner.pending_save = Some(game);
+                    }
+                    inner.notice = Some(message.clone());
+                }
                 self.hub.notify();
+                self.request_save();
                 Err(ApiError::Internal(message))
             }
         }
@@ -1739,7 +1803,14 @@ impl Engine {
             Ok(all) => {
                 // A camera with a depth part is one camera for the page, with a box for the depth.
                 let cameras = if let Some(link) = &self.depth {
-                    link.set_offer(crate::depthlink::offer_for(&all, &selection.device()));
+                    let offer = crate::depthlink::offer_for(&all, &selection.device());
+                    // A listing that misses the depth part for a moment (the camera numbering itself again on the USB
+                    // bus) must not drop the depth, and with it what was found about the board, in the middle of a game.
+                    if (offer.is_some() || !self.is_playing()) && offer != link.offer() {
+                        link.set_offer(offer);
+                        // The depth thread starts or stops reading.
+                        self.wake_cameras();
+                    }
                     crate::depthlink::without_depth_parts(all)
                 } else {
                     all
@@ -2498,6 +2569,101 @@ mod tests {
         // A game that is not running has none.
         engine.inner.grab().mode = Mode::Idle;
         assert!(engine.legal_moves().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_game_that_could_not_be_written_is_kept_and_written_when_the_disk_allows_it() {
+        let (engine, dir) = engine_playing("save-retry");
+        let moves = {
+            let mut inner = engine.inner.grab();
+            let start = shakmaty::Chess::default();
+            let e4 = crate::game::parse_move(&start, "e2e4").unwrap();
+            engine.apply_detected_move(&mut inner, e4, Instant::now(), false);
+            inner.pending_save.is_some()
+        };
+        assert!(moves, "the game is marked to be written");
+        // The disk refuses (here: the folder of the games is gone).
+        let games = dir.join("games");
+        std::fs::remove_dir_all(&games).unwrap();
+        assert!(engine.flush_save().is_err());
+        {
+            let inner = engine.inner.grab();
+            assert!(inner.pending_save.is_some(), "the game is kept for another try, not thrown away");
+            assert!(inner.notice.as_deref().is_some_and(|n| n.starts_with(SAVE_FAILED)), "{:?}", inner.notice);
+        }
+        // A newer version marked meanwhile is the one that stays.
+        {
+            let mut inner = engine.inner.grab();
+            inner.game.as_mut().unwrap().push_text("e5", 2.0).unwrap();
+            inner.pending_save = inner.game.clone();
+        }
+        assert!(engine.flush_save().is_err());
+        assert_eq!(engine.inner.grab().pending_save.as_ref().unwrap().moves.len(), 2, "the newest version is kept");
+        // The disk is back: the next try writes it, and the notice goes away.
+        std::fs::create_dir_all(&games).unwrap();
+        engine.flush_save().unwrap();
+        assert!(engine.inner.grab().pending_save.is_none());
+        assert!(engine.inner.grab().notice.is_none());
+        assert_eq!(engine.list_games().unwrap()[0].moves, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_calibration_on_the_disk_that_cannot_be_used_is_not_used() {
+        let dir = std::env::temp_dir().join(format!("nicochess-bad-calibration-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let config = || EngineConfig::default();
+        let make = |calibration: Option<Calibration>, name: &str| {
+            Engine::new(config(), Store::open(&dir.join(name)).unwrap(), dir.join(format!("{name}.json")), calibration)
+        };
+        let token = "a11ce000a11ce000";
+        // All four corners in one place: the engine must not call the board calibrated.
+        let degenerate = make(Some(Calibration::for_frame([[10.0, 10.0]; 4], 640, 480)), "degenerate");
+        assert!(degenerate.snapshot(token)["calibration"].is_null());
+        // Corners that are not numbers.
+        let broken =
+            make(Some(Calibration::for_frame([[f32::NAN, 10.0], [500.0, 10.0], [500.0, 400.0], [10.0, 400.0]], 640, 480)), "broken");
+        assert!(broken.snapshot(token)["calibration"].is_null());
+        // A good one is kept.
+        let good = make(Some(crate::synthetic::corners()), "good");
+        assert!(!good.snapshot(token)["calibration"].is_null());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_listing_of_the_cameras_that_misses_the_depth_part_does_not_take_the_depth_away_during_a_game() {
+        use crate::choice::{CameraInfo, CameraSelection};
+        use crate::depthlink::{DepthFactory, DepthLink};
+        let camera = |id: &str, name: &str| CameraInfo { id: id.into(), name: name.into() };
+        let both = vec![camera("0", "Webcam"), camera("1", "RealSense  RGB"), camera("2", "RealSense  Depth")];
+        let listed = Arc::new(Mutex::new(both.clone()));
+        let source = Arc::clone(&listed);
+        let selection = Arc::new(CameraSelection::with_lister("1".into(), None, Box::new(move || Ok(source.lock().unwrap().clone()))));
+        let dir = std::env::temp_dir().join(format!("nicochess-offer-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let factory: DepthFactory = Box::new(|_, _| anyhow::bail!("no depth camera here"));
+        let link = DepthLink::new(factory, None);
+        let config = EngineConfig { camera: Some(selection), depth: Some(Arc::clone(&link)), ..EngineConfig::default() };
+        let engine = Engine::new(config, Store::open(&dir.join("games")).unwrap(), dir.join("calibration.json"), None);
+
+        let listing = engine.cameras();
+        assert_eq!(link.offer().as_deref(), Some("RealSense  Depth"), "found with the list of the cameras");
+        assert_eq!(listing["cameras"].as_array().unwrap().len(), 2, "the depth part is not one more camera");
+
+        // The camera renumbers itself on the USB bus: for a moment the list has no depth part.
+        *listed.lock().unwrap() = vec![camera("0", "Webcam"), camera("1", "RealSense  RGB")];
+        engine.inner.grab().mode = Mode::Playing;
+        engine.cameras();
+        assert_eq!(link.offer().as_deref(), Some("RealSense  Depth"), "during a game the depth is kept");
+        // Outside a game the list is believed (the camera was unplugged).
+        engine.inner.grab().mode = Mode::Idle;
+        engine.cameras();
+        assert_eq!(link.offer(), None);
+        // And it comes back with the camera.
+        *listed.lock().unwrap() = both;
+        engine.cameras();
+        assert_eq!(link.offer().as_deref(), Some("RealSense  Depth"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
