@@ -6,6 +6,7 @@
 use crate::calibration::Calibration;
 use crate::camera::{self, SourceSpec};
 use crate::choice::CameraSelection;
+use crate::depthlink::DepthLink;
 use crate::engine::{Engine, EngineConfig};
 use crate::http::Handler;
 use crate::record::RecordOptions;
@@ -45,6 +46,8 @@ pub struct ServerOptions {
     /// With the demo or the synthetic board: also a second camera, which shows the board from the other side
     /// (`--second-camera`), to try two cameras without any.
     pub second_synthetic: bool,
+    /// With the demo: also a depth camera beside the camera (`--depth-camera`), to try the depth without one.
+    pub depth_synthetic: bool,
 }
 
 /// The engine is running and the web handler is ready; nothing listens yet.
@@ -98,7 +101,37 @@ pub fn build(options: ServerOptions) -> Result<Built> {
         _ => None,
     };
     let second_fixed = options.second_synthetic && matches!(options.source, SourceSpec::Synthetic | SourceSpec::Demo { .. });
+    // The demo game seen by two cameras, or by a camera and a depth camera: they all show the same moment of it.
+    let demo_trio = match &options.source {
+        SourceSpec::Demo { move_interval } if second_fixed || options.depth_synthetic => {
+            Some(camera::demo_trio(options.frame_interval, *move_interval))
+        }
+        _ => None,
+    };
+    let (demo_first, demo_second, demo_depth) = match demo_trio {
+        Some((first, second, depth)) => (Some(first), Some(second), Some(depth)),
+        None => (None, None, None),
+    };
+    // A camera of this computer may have a depth part beside its colour part (Windows): the page offers to use it.
+    let depth = match (&options.source, demo_depth) {
+        (SourceSpec::Camera(_), _) if cfg!(windows) => {
+            Some(DepthLink::new(crate::depthcam::factory(), Some(options.calibration_path.with_file_name("depth.json"))))
+        }
+        (_, Some(factory)) if options.depth_synthetic => {
+            let link = DepthLink::new(factory, None);
+            link.set_offer(Some("demo depth camera".into()));
+            Some(link)
+        }
+        _ => None,
+    };
+    // A real camera keeps the pictures a second that the page sets; the other sources come at a pace of their own.
+    let rate = match &options.source {
+        SourceSpec::Camera(settings) => Some(Arc::clone(&settings.rate)),
+        _ => None,
+    };
     let config = EngineConfig {
+        rate,
+        depth: depth.clone(),
         idle_timeout: options.idle_timeout,
         game_timeout: options.game_timeout,
         tracker: options.tracker,
@@ -109,9 +142,9 @@ pub fn build(options: ServerOptions) -> Result<Built> {
         second_fixed,
     };
     let engine = Engine::new(config, store, options.calibration_path, calibration);
-    // The demo's two cameras see the same moment of the game; the other sources have nothing to keep in step.
-    let (first_source, second_source) = match (&options.source, second_fixed) {
-        (SourceSpec::Demo { move_interval }, true) => camera::demo_pair(options.frame_interval, *move_interval),
+    // The demo's cameras see the same moment of the game; the other sources have nothing to keep in step.
+    let (first_source, second_source) = match (demo_first, demo_second) {
+        (Some(first), Some(second)) => (first, second),
         _ => (
             camera::factory_with(options.source.clone(), options.frame_interval, camera),
             camera::second_factory(options.source, options.frame_interval, camera2.clone()),
@@ -121,6 +154,9 @@ pub fn build(options: ServerOptions) -> Result<Built> {
         engine.spawn_capture_second(second_source)?;
     }
     engine.spawn_capture(first_source)?;
+    if depth.is_some() {
+        engine.spawn_depth()?;
+    }
 
     // A page holds up to three long connections (events, camera picture, top-down board) and
     // makes ordinary requests besides: leave room for all of that.
@@ -172,6 +208,7 @@ mod tests {
             remember_camera: false,
             second_device: None,
             second_synthetic: false,
+            depth_synthetic: false,
         };
         let built = build(options).expect("the program starts without a calibration");
         let reply = (built.handler)(Request::for_test("GET", "/api/state?token=", &[], ""));

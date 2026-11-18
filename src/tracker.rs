@@ -24,15 +24,24 @@ use crate::vision::{ADAPT_WEIGHT, Cell, DIM, Features, Grid, Models, Sampler, di
 use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use shakmaty::{Chess, Color, Move, Position, Role, Square};
-use std::collections::HashMap;
-use std::time::Instant;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// The settings of the tracker. They are kept in a recording (see `record`), so that a replay can use the
 /// ones the game was played with.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackerConfig {
-    /// Frames in a row that must agree before the board counts as still.
+    /// Pictures in a row that must agree before the board counts as still (at least this many, and for
+    /// `stable_time`).
     pub stable_frames: usize,
+    /// How long, in seconds, the board must have been still before it counts as still. Time, not a number of pictures,
+    /// so that it means the same at 3 pictures a second and at 25.
+    #[serde(default = "default_stable_time")]
+    pub stable_time: f32,
+    /// How far back, in seconds, the picture is that a new one is compared with to see whether something moved (0: the
+    /// picture before). A hand that creeps in changes little from one picture to the next at 25 pictures a second.
+    #[serde(default = "default_motion_span")]
+    pub motion_span: f32,
     /// Mean change of the square colours between two frames above which something
     /// (a hand, a shadow) is moving over the board.
     pub motion_threshold: f32,
@@ -54,8 +63,33 @@ pub struct TrackerConfig {
 
 impl Default for TrackerConfig {
     fn default() -> Self {
-        TrackerConfig { stable_frames: 3, motion_threshold: 4.0, max_excess: 60.0, margin: 6.0, max_plies: 3, soft_margin: SOFT_MARGIN }
+        TrackerConfig {
+            stable_frames: 3,
+            stable_time: STABLE_TIME,
+            motion_span: MOTION_SPAN,
+            motion_threshold: 4.0,
+            max_excess: 60.0,
+            margin: 6.0,
+            max_plies: 3,
+            soft_margin: SOFT_MARGIN,
+        }
     }
+}
+
+/// How long the board must have been still before the tracker looks at it, in seconds: about as long as the three
+/// pictures in a row of the first versions took at 3 pictures a second, and a little less.
+const STABLE_TIME: f32 = 0.35;
+
+/// The still time of recordings made before there was one.
+fn default_stable_time() -> f32 {
+    STABLE_TIME
+}
+
+/// How far back the picture is that a new one is compared with, to see whether something moved, in seconds.
+const MOTION_SPAN: f32 = 0.15;
+
+fn default_motion_span() -> f32 {
+    MOTION_SPAN
 }
 
 /// The soft margin of recordings made before there was one.
@@ -117,6 +151,8 @@ pub enum Status {
     Moving,
     /// The board is still but no move explains it clearly.
     Unsure,
+    /// A move was taken back, and the board does not show the position yet (see [`Tracker::undo_to`]).
+    Undone,
 }
 
 #[derive(Clone, Debug)]
@@ -167,14 +203,21 @@ pub enum Detection {
 /// Tells when the image has stopped changing, and keeps the average of the pictures since.
 ///
 /// The board is moving when the squares change on the whole (a hand, a shadow) or when any single square
-/// changes a lot between two pictures (a piece was lifted or put down). It is still when neither happened
-/// for `stable_frames` pictures in a row.
+/// changes a lot (a piece was lifted or put down) between a picture and the one taken about `motion_span` before
+/// it. (The picture just before would do at 3 pictures a second, but at 25 a hand that creeps in changes very little
+/// from one picture to the next.) It is still when neither happened for `stable_frames` pictures in a row and
+/// `stable_time`.
 struct Gate {
     stable_frames: usize,
+    stable_time: Duration,
+    motion_span: Duration,
     motion_threshold: f32,
-    previous: Option<Vec<Features>>,
+    /// The latest pictures, to compare the new one with a picture of about `motion_span` ago.
+    history: VecDeque<(Instant, Vec<Features>)>,
     run: usize,
     since: Option<Instant>,
+    /// When the latest picture of this run came.
+    last: Option<Instant>,
     /// The sum of the features of the pictures of this run.
     sum: Vec<[f32; DIM]>,
 }
@@ -186,25 +229,32 @@ impl Gate {
     fn new(cfg: &TrackerConfig) -> Self {
         Gate {
             stable_frames: cfg.stable_frames.max(1),
+            stable_time: Duration::from_secs_f32(cfg.stable_time.max(0.0)),
+            motion_span: Duration::from_secs_f32(cfg.motion_span.max(0.0)),
             motion_threshold: cfg.motion_threshold,
-            previous: None,
+            history: VecDeque::new(),
             run: 0,
             since: None,
+            last: None,
             sum: Vec::new(),
         }
     }
 
     fn reset(&mut self) {
-        self.previous = None;
+        self.history.clear();
         self.run = 0;
         self.since = None;
+        self.last = None;
         self.sum.clear();
     }
 
     /// Adds a frame. Returns when the board became still, once it has been for long enough.
     fn push(&mut self, features: &[Features], now: Instant) -> Option<Instant> {
-        let moved = match &self.previous {
-            Some(prev) => {
+        // The picture to compare with: the newest one that is at least MOTION_SPAN old, else the oldest there is.
+        let reference =
+            self.history.iter().rev().find(|(at, _)| now.saturating_duration_since(*at) >= self.motion_span).or(self.history.front());
+        let moved = match reference {
+            Some((_, prev)) => {
                 let colours: f32 = features
                     .iter()
                     .zip(prev)
@@ -227,13 +277,22 @@ impl Gate {
                 }
             }
         }
-        self.previous = Some(features.to_vec());
+        self.last = Some(now);
+        self.history.push_back((now, features.to_vec()));
+        // Pictures older than needed are dropped (one older than the span stays: it is what the next is compared with).
+        while self.history.len() > 2 && self.history.get(1).is_some_and(|(at, _)| now.saturating_duration_since(*at) >= self.motion_span) {
+            self.history.pop_front();
+        }
         self.ready()
     }
 
     /// When the board became still, once it has been for long enough.
     fn ready(&self) -> Option<Instant> {
-        if self.run >= self.stable_frames { self.since } else { None }
+        let long_enough = match (self.since, self.last) {
+            (Some(since), Some(last)) => last.saturating_duration_since(since) >= self.stable_time,
+            _ => false,
+        };
+        if self.run >= self.stable_frames && long_enough { self.since } else { None }
     }
 
     /// The features averaged over the pictures of this run: less noise than a single picture.
@@ -254,11 +313,20 @@ struct View {
     reference: Option<Vec<Features>>,
     /// False while the camera gives no pictures (off, unplugged, too slow): the others do not wait for it.
     active: bool,
+    /// The view only helps: it is the height picture of a depth camera (see `depth`). It says which squares hold a
+    /// piece, not of which colour, and its picture is noisier than a colour one, so it never decides when the board
+    /// is still (the colour cameras do) and what it says is added to what they say (see `Evidence`).
+    advisory: bool,
 }
 
 impl View {
     fn new(cfg: &TrackerConfig) -> View {
-        View { sampler: None, models: None, gate: Gate::new(cfg), reference: None, active: true }
+        View { sampler: None, models: None, gate: Gate::new(cfg), reference: None, active: true, advisory: false }
+    }
+
+    /// An advisory view has seen the board when it has been given a picture; it is not waited for to be still.
+    fn has_seen(&self) -> bool {
+        if self.advisory { self.gate.run > 0 } else { self.gate.ready().is_some() }
     }
 
     /// The camera is calibrated and gives pictures.
@@ -297,6 +365,12 @@ pub struct Tracker {
     doubt: Option<Doubt>,
     /// The person took back a doubtful move and has to say what was played: nothing is decided until then.
     held: bool,
+    /// The last height picture looked at was left out because it contradicted the colour cameras.
+    depth_ignored: bool,
+    /// A move was taken back (see `undo_to`): the board has not shown the position since, so nothing is decided.
+    undone: bool,
+    /// The move that was taken back, which is not offered again.
+    undone_move: Option<String>,
 }
 
 /// What the board should look like for a position.
@@ -322,6 +396,8 @@ struct Evidence {
     /// Square by square, what the picture costs if the square did not change since the last confirmed
     /// picture, and if it did. Absent when there is no such picture.
     change: Option<(Vec<f32>, Vec<f32>)>,
+    /// A height picture was given but contradicts the colour cameras too much, and was left out.
+    ignored: bool,
 }
 
 /// One camera's picture of the still board, with what is known about its squares.
@@ -329,7 +405,19 @@ struct Look<'a> {
     models: &'a Models,
     features: &'a [Features],
     reference: Option<&'a [Features]>,
+    /// From an advisory view: it says whether a square is occupied, and nothing else.
+    advisory: bool,
 }
+
+/// How much what the height picture says about a square counts, compared with what the colour cameras say: the
+/// chance that a square is occupied is shifted by this fraction of what the height picture believes. Below one:
+/// a reading that went wrong must not outvote the colour cameras.
+const DEPTH_WEIGHT: f32 = 0.7;
+/// The most the height picture may add to the cost of a content of one square, in nats.
+const DEPTH_CAP: f32 = 40.0;
+/// The height picture and the colour cameras may differ about whether this many squares are occupied (where both
+/// can be believed); more than that and the height picture is not used.
+const DEPTH_MAX_DISAGREE: usize = 4;
 
 /// What one camera's picture says: the numbers [`Evidence`] is made of.
 struct Part {
@@ -369,10 +457,70 @@ impl Evidence {
     /// camera cannot see well is read from the other, and a square both see badly stays badly seen. The result is
     /// an average, so it is on the scale of one camera and the thresholds mean the same thing.
     fn new(looks: &[Look], base: Grid) -> Evidence {
-        let mut parts: Vec<Part> = looks.iter().map(Part::of).collect();
+        // The cameras that see colour are put together; a height picture then adds what it says about occupied squares.
+        let colour: Vec<&Look> = looks.iter().filter(|l| !l.advisory).collect();
+        let main: Vec<&Look> = if colour.is_empty() { looks.iter().collect() } else { colour };
+        let (mut evidence, colour_trust) = Evidence::of_colour(&main, base);
+        for look in looks.iter().filter(|l| l.advisory && !main.iter().any(|m| std::ptr::eq(*m, *l))) {
+            evidence.add_occupancy(&Part::of(look), &colour_trust);
+        }
+        evidence
+    }
+
+    /// What a height picture says: for each square, how much more each content costs than the one the height picture
+    /// likes best, where white and black are one content ("occupied"), for it cannot tell them apart.
+    ///
+    /// Two things are done with it. It is added to the costs, not averaged with them (averaging would halve the
+    /// difference between white and black that the colour cameras see). And where the colour cameras cannot be
+    /// believed about a square (a hand over it, a glare: no content explains what they see) and the height picture
+    /// can, it stands in for them there: the square costs what it usually costs, plus what the height picture
+    /// holds against each content. A square that neither explains (no reading, a hand in both) is left as it is.
+    fn add_occupancy(&mut self, part: &Part, colour_trust: &[f32]) {
+        // A height picture that contradicts the colour cameras where both can be believed is not looking at this
+        // board (the camera was knocked, or its squares are not where they were thought to be): it is left out
+        // rather than allowed to hold every explanation against the picture.
+        let colour_read = Models::read(&self.costs);
+        let disagree = (0..64)
+            .filter(|&s| {
+                if colour_trust[s] < 0.5 || part.trust(s) < 0.5 {
+                    return false;
+                }
+                let depth_occupied = part.costs[s][1].min(part.costs[s][2]) < part.costs[s][0];
+                depth_occupied != (colour_read[s] != Cell::Empty)
+            })
+            .count();
+        if disagree > DEPTH_MAX_DISAGREE {
+            self.ignored = true;
+            return;
+        }
+        for square in 0..64 {
+            let trust = part.trust(square);
+            let colour = colour_trust[square];
+            let occupied = part.costs[square][1].min(part.costs[square][2]);
+            let own = [part.costs[square][0], occupied, occupied];
+            let lowest = own[0].min(occupied);
+            let stand_in = (1.0 - colour) * trust;
+            // What the colour cameras say about a change on this square is worth what they are worth about the square.
+            if let Some((unchanged, changed)) = self.change.as_mut() {
+                unchanged[square] *= 1.0 - stand_in;
+                changed[square] *= 1.0 - stand_in;
+            }
+            for content in 0..3 {
+                let against = (own[content] - lowest).min(DEPTH_CAP);
+                let replaced = self.typical[square][content] + against;
+                self.costs[square][content] = (1.0 - stand_in) * self.costs[square][content] + stand_in * replaced;
+                self.costs[square][content] += DEPTH_WEIGHT * trust * colour * against;
+            }
+        }
+    }
+
+    /// The colour cameras put together, and how far they can be believed about each square (the best of them).
+    fn of_colour(looks: &[&Look], base: Grid) -> (Evidence, Vec<f32>) {
+        let mut parts: Vec<Part> = looks.iter().map(|l| Part::of(l)).collect();
         if parts.len() == 1 {
             let only = parts.remove(0);
-            return Evidence { costs: only.costs, typical: only.typical, base, change: only.change };
+            let trust = (0..64).map(|s| only.trust(s)).collect();
+            return (Evidence { costs: only.costs, typical: only.typical, base, change: only.change, ignored: false }, trust);
         }
         let trust: Vec<Vec<f32>> = parts.iter().map(|p| (0..64).map(|s| p.trust(s)).collect()).collect();
         let mix = |value: &dyn Fn(&Part, usize) -> Option<f32>, square: usize| -> f32 {
@@ -399,7 +547,8 @@ impl Evidence {
             let changed = (0..64).map(|s| mix(&|p, q| p.change.as_ref().map(|c| c.1[q]), s)).collect();
             (unchanged, changed)
         });
-        Evidence { costs, typical, base, change }
+        let best_trust = (0..64).map(|s| trust.iter().map(|t| t[s]).fold(0.0f32, f32::max)).collect();
+        (Evidence { costs, typical, base, change, ignored: false }, best_trust)
     }
 
     /// How the picture fits a board: the misfit including what changed since the last confirmed picture, how
@@ -555,6 +704,9 @@ impl Tracker {
             candidates: Vec::new(),
             doubt: None,
             held: false,
+            depth_ignored: false,
+            undone: false,
+            undone_move: None,
         }
     }
 
@@ -581,6 +733,16 @@ impl Tracker {
         }
     }
 
+    /// The height picture was left out of the last judgement because it contradicted the colour cameras.
+    pub fn depth_ignored(&self) -> bool {
+        self.depth_ignored
+    }
+
+    /// Says that a view is the height picture of a depth camera: it only helps (see `View::advisory`).
+    pub fn set_view_advisory(&mut self, view: usize, advisory: bool) {
+        self.view_mut(view).advisory = advisory;
+    }
+
     /// The doubt about the moves that were just taken, if there is one. Taken once.
     pub fn take_doubt(&mut self) -> Option<Doubt> {
         self.doubt.take()
@@ -589,6 +751,7 @@ impl Tracker {
     /// The person took back a move the tracker was doubtful about: the tracker offers these moves and decides
     /// nothing, whatever the pictures show, until the person says what was played (`set_position`).
     pub fn hold(&mut self, candidates: Vec<Candidate>) {
+        self.undone = false;
         self.held = true;
         self.unsure = true;
         self.candidates = candidates;
@@ -601,6 +764,8 @@ impl Tracker {
             Status::Learning
         } else if !self.still {
             Status::Moving
+        } else if self.undone {
+            Status::Undone
         } else if self.unsure {
             Status::Unsure
         } else {
@@ -655,9 +820,22 @@ impl Tracker {
         self.relearn();
     }
 
+    /// A move was taken back: the game is in `position` again, but the board still shows the move, until the person puts
+    /// the pieces back, or enters the move that was played. Meanwhile nothing is decided and nothing is learned (the
+    /// move would come back at once, or the squares would learn a look that is not theirs); the moves that the picture
+    /// does suggest, without the one that was taken back, are offered. The tracker goes on by itself as soon as the
+    /// board shows `position`.
+    pub fn undo_to(&mut self, position: Chess, undone: Option<String>) {
+        self.set_position(position);
+        self.undone = true;
+        self.undone_move = undone;
+        self.resync_pending = false;
+    }
+
     /// The position changed outside the tracker (manual move or undo): the person says what the board
     /// shows. The next still picture that fits teaches the models, so that tracking goes on by itself.
     pub fn set_position(&mut self, position: Chess) {
+        self.undone = false;
         self.position = position;
         self.last_eval = None;
         self.unsure = false;
@@ -671,6 +849,7 @@ impl Tracker {
 
     /// Learns the look of the squares again from the current position.
     pub fn relearn(&mut self) {
+        self.undone = false;
         for view in &mut self.views {
             view.models = None;
             view.reference = None;
@@ -710,12 +889,14 @@ impl Tracker {
                     view.gate.push(features, now);
                 }
             }
-            // The squares are learned when every camera that gives pictures has seen the board still.
-            let waiting: Vec<usize> = (0..self.views.len()).filter(|&i| self.views[i].counts()).collect();
+            // The squares are learned when every camera that gives pictures has seen the board still (a height
+            // picture is not waited for: it learns from what it has seen by then).
+            let waiting: Vec<usize> = (0..self.views.len()).filter(|&i| self.views[i].counts() && !self.views[i].advisory).collect();
             if !waiting.is_empty() && waiting.iter().all(|&i| self.views[i].gate.ready().is_some()) {
                 let labels = expected_grid(&self.position);
                 let mut learned_any = false;
-                for &i in &waiting {
+                let learners: Vec<usize> = (0..self.views.len()).filter(|&i| self.views[i].counts() && self.views[i].has_seen()).collect();
+                for i in learners {
                     let learned = self.views[i].gate.average();
                     if let Ok(models) = Models::learn(&learned, &labels) {
                         let view = &mut self.views[i];
@@ -755,9 +936,10 @@ impl Tracker {
             self.judged.clone_from(&judging);
             self.last_eval = None;
         }
+        let deciding: Vec<usize> = judging.iter().copied().filter(|&i| !self.views[i].advisory).collect();
         let mut since: Option<Instant> = None;
-        let mut settled = !judging.is_empty();
-        for &i in &judging {
+        let mut settled = !deciding.is_empty();
+        for &i in &deciding {
             match self.views[i].gate.ready() {
                 Some(at) => since = Some(since.map_or(at, |t| t.max(at))),
                 None => settled = false,
@@ -772,18 +954,49 @@ impl Tracker {
             return Detection::Unsure { candidates: self.candidates.clone() };
         }
         // What the board shows is read from the pictures averaged since it stopped moving: steadier than one.
-        let seen: Seen = judging.iter().map(|&i| (i, self.views[i].gate.average())).collect();
+        // (A height picture that has had no picture since the squares were learned has nothing to say yet.)
+        let seen: Seen = judging
+            .iter()
+            .filter(|&&i| !self.views[i].advisory || self.views[i].gate.run > 0)
+            .map(|&i| (i, self.views[i].gate.average()))
+            .collect();
         let evidence = {
             let looks: Vec<Look> = seen
                 .iter()
                 .filter_map(|(i, features)| {
                     let view = &self.views[*i];
-                    Some(Look { models: view.models.as_ref()?, features, reference: view.reference.as_deref() })
+                    Some(Look { models: view.models.as_ref()?, features, reference: view.reference.as_deref(), advisory: view.advisory })
                 })
                 .collect();
             Evidence::new(&looks, expected)
         };
+        self.depth_ignored = evidence.ignored;
         let grid = Models::read(&evidence.costs);
+        if self.undone {
+            // Is the board showing the position again? It is when "nothing happened" is the best of the explanations,
+            // as it is for any picture (the misfit alone cannot say: two changed squares can stay under any limit).
+            if self.last_eval != Some(grid) {
+                self.last_eval = Some(grid);
+                let mut pool = Pool::new(&self.position, &evidence);
+                pool.expand(1, &evidence);
+                let (best, _) = pool.best_within(1);
+                if pool.hyps[best].plies == 0 {
+                    // The pieces are back: tracking goes on, and what the board shows now is the position as it was.
+                    self.undone = false;
+                    self.resync_pending = true;
+                    self.last_eval = None;
+                } else {
+                    // Not the position: the moves the picture suggests are offered, except the one taken back.
+                    let mut candidates = self.likeliest(&pool, 6, None, pool.hyps[best].score);
+                    candidates.retain(|c| self.undone_move.as_deref() != Some(c.uci.as_str()));
+                    candidates.truncate(4);
+                    self.candidates = candidates;
+                }
+            }
+            if self.undone {
+                return Detection::Unsure { candidates: self.candidates.clone() };
+            }
+        }
         let detection = if self.last_eval == Some(grid) {
             if self.unsure { Detection::Unsure { candidates: self.candidates.clone() } } else { Detection::Nothing }
         } else {
@@ -802,7 +1015,7 @@ impl Tracker {
     fn learn_late_views(&mut self) {
         let labels = expected_grid(&self.position);
         for view in &mut self.views {
-            if !view.counts() || view.models.is_some() || view.gate.ready().is_none() {
+            if !view.counts() || view.models.is_some() || !view.has_seen() {
                 continue;
             }
             let learned = view.gate.average();
@@ -1005,6 +1218,12 @@ impl Tracker {
         (uci.join(" "), san.join(" "))
     }
 }
+
+#[cfg(test)]
+mod depth_tests;
+
+#[cfg(test)]
+mod timing_tests;
 
 #[cfg(test)]
 mod tests {

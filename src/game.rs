@@ -20,11 +20,16 @@ pub struct MoveRecord {
     pub uci: String,
     /// Standard algebraic notation, for example `Nf3` or `Qxf7#`.
     pub san: String,
-    /// Seconds since the start of the game when the board settled after the move.
+    /// Seconds since the first move of the game (the clock starts with it, so the first move is at 0) when the board
+    /// settled after the move.
     pub t: f64,
     /// The promotion piece was assumed (queen) because vision cannot see it.
     #[serde(default)]
     pub promotion_guess: bool,
+    /// The move was seen in the same picture as the one before it (two or three moves played between two pictures):
+    /// the page shows them all as the last move.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub together: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -174,7 +179,7 @@ impl GameRecord {
             bail!("illegal move");
         }
         let t = round_tenths(t.max(self.moves.last().map_or(0.0, |m| m.t)));
-        self.moves.push(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t, promotion_guess });
+        self.moves.push(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t, promotion_guess, together: false });
         Ok(self.moves.last().expect("just pushed"))
     }
 
@@ -212,7 +217,7 @@ impl GameRecord {
             let mut uci = last.uci[..4].to_string();
             uci.push(role.char());
             let mv = parse_move(&pos, &uci)?;
-            Ok(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t: last.t, promotion_guess: false })
+            Ok(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t: last.t, promotion_guess: false, together: last.together })
         })();
         match rebuilt {
             Ok(record) => {

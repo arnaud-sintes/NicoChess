@@ -7,6 +7,8 @@
 //!   GET    /warp.mjpg                  the top-down board as a Motion JPEG stream
 //!   GET    /api/camera/stats           pictures per second and time per picture
 //!   GET    /api/camera/list            the cameras of the computer and the ones in use (Windows)
+//!   GET    /depth.jpg                  what the depth camera sees (the height picture), if the program reads one
+//!   GET    /depth-warp.jpg             the same as a top-down board, once the board was found in it
 //!
 //! Everything that is about one camera (the five pictures and figures above, the calibration, the picture settings
 //! and the choice of the camera below) takes `?cam=2` for the second camera, and the main one without it (or `?cam=1`).
@@ -24,6 +26,10 @@
 //!   POST   /api/calibration/close      camera off again
 //!   POST   /api/calibration            {"corners": [[x,y] x4]}  order a1, h1, h8, a8
 //!   POST   /api/calibration/detect     find the board in the picture and calibrate with it
+//!   POST   /api/camera/rate            {"fps": 25}  pictures per second kept from the camera (1 to 30), at once
+//!   GET    /api/game/legal             {"moves": ["e2e4", ...]}  the legal moves of the game, for dragging a piece
+//!   POST   /api/depth                  {"on": true}  also use the depth of the camera (when it has a depth part)
+//!   POST   /api/depth/align            look for the board in the depth picture now (the pieces in their positions)
 //!   POST   /api/camera/follow          {"on": true}  follow the board if it moves during a game
 //!   POST   /api/camera/select          {"id": "1"}  use that camera (not during a game; forgets the calibration);
 //!                                      with ?cam=2 also {"id": ""}: no second camera
@@ -109,6 +115,10 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
             Err(e) => Reply::text(e.status(), &e.message()),
         },
         ("GET", "/api/camera/list") => Reply::json(200, &engine.cameras()),
+        ("GET", "/depth.jpg" | "/depth-warp.jpg") => match engine.depth_jpeg(path == "/depth-warp.jpg") {
+            Ok(bytes) => Reply::bytes(200, "image/jpeg", bytes),
+            Err(e) => Reply::text(503, &e.message()),
+        },
         ("GET", "/warp.jpg") => {
             let grid = !request.query.split('&').any(|q| q == "grid=0");
             match cam_of(&request).and_then(|cam| engine.warped_jpeg(cam, grid)) {
@@ -123,6 +133,7 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
         }
         ("GET", "/api/events") => events(engine, request.query_param("token").unwrap_or("").to_string(), max_viewers),
 
+        ("GET", "/api/game/legal") => Reply::json(200, &json!({ "moves": engine.legal_moves() })),
         ("GET", "/api/games") => match engine.list_games() {
             Ok(list) => Reply::json(200, &json!({ "games": list })),
             Err(e) => Reply::json(500, &json!({ "ok": false, "error": format!("{e:#}") })),
@@ -160,6 +171,22 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
                 on: bool,
             }
             done(body_json::<Body>(&request).and_then(|b| engine.set_follow(&token, b.on)))
+        }
+
+        ("POST", "/api/depth") => {
+            #[derive(Deserialize)]
+            struct Body {
+                on: bool,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.set_depth(&token, b.on)))
+        }
+        ("POST", "/api/depth/align") => done(engine.align_depth(&token)),
+        ("POST", "/api/camera/rate") => {
+            #[derive(Deserialize)]
+            struct Body {
+                fps: f32,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.set_fps(&token, b.fps)))
         }
 
         ("POST", "/api/camera/select") => {
@@ -371,7 +398,7 @@ fn events(engine: &Arc<Engine>, token: String, max_viewers: usize) -> Reply {
                 match changes.recv_timeout(KEEPALIVE) {
                     Ok(()) => {
                         // Let a burst of changes settle, then send one message.
-                        std::thread::sleep(Duration::from_millis(80));
+                        std::thread::sleep(Duration::from_millis(15));
                         while changes.try_recv().is_ok() {}
                     }
                     Err(RecvTimeoutError::Timeout) => {
@@ -411,8 +438,18 @@ mod tests {
 
     /// The controller must not lose the role to the clock on a slow machine: some tests play a whole game, and
     /// the role is released after a silence (60 seconds by default), which a loaded test machine can exceed.
+    /// The tracker of the tests counts pictures, not time: the demo of a test plays a move every few dozen milliseconds.
+    fn quick_tracker() -> crate::tracker::TrackerConfig {
+        crate::tracker::TrackerConfig { stable_time: 0.0, motion_span: 0.0, ..crate::tracker::TrackerConfig::default() }
+    }
+
     fn patient() -> EngineConfig {
-        EngineConfig { idle_timeout: Duration::from_secs(3600), game_timeout: Duration::from_secs(3600), ..EngineConfig::default() }
+        EngineConfig {
+            idle_timeout: Duration::from_secs(3600),
+            game_timeout: Duration::from_secs(3600),
+            tracker: quick_tracker(),
+            ..EngineConfig::default()
+        }
     }
 
     fn rig(name: &str, source: SourceSpec) -> Rig {
@@ -427,6 +464,7 @@ mod tests {
         // Every picture, and none dropped whatever the load of the machine running the tests.
         let record = record.then(|| crate::record::RecordOptions {
             backlog: 100_000,
+            busy_every: Duration::ZERO,
             ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
         });
         let engine = Engine::new(EngineConfig { record, ..patient() }, store, dir.join("calibration.json"), None);
@@ -455,7 +493,7 @@ mod tests {
     fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
         let started = Instant::now();
         while !condition() {
-            assert!(started.elapsed() < Duration::from_secs(90), "timed out waiting for {what}");
+            assert!(started.elapsed() < Duration::from_secs(180), "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -1132,7 +1170,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::open(&dir.join("games")).unwrap();
-        let tracker = crate::tracker::TrackerConfig { margin: 1000.0, soft_margin: 0.5, ..Default::default() };
+        let tracker = crate::tracker::TrackerConfig { margin: 1000.0, soft_margin: 0.5, ..quick_tracker() };
         let engine = Engine::new(EngineConfig { tracker, ..patient() }, store, dir.join("calibration.json"), None);
         engine
             .spawn_capture(camera::factory(SourceSpec::Demo { move_interval: Duration::from_millis(1500) }, Duration::from_millis(100)))
@@ -1235,6 +1273,7 @@ mod tests {
         let store = Store::open(&dir.join("games")).unwrap();
         let record = record.then(|| crate::record::RecordOptions {
             backlog: 100_000,
+            busy_every: Duration::ZERO,
             ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
         });
         let config = EngineConfig { record, second_fixed: true, track_interval: Duration::from_millis(80), ..patient() };
@@ -1470,6 +1509,152 @@ mod tests {
         assert_eq!(rig.call("GET", "/api/games", "", "").1["games"][0]["result"], "0-1");
         assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"0-1","reason":"resignation"}"#).0, 409);
         assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"2-0","reason":"x"}"#).0, 409, "no game is running");
+    }
+
+    /// A depth camera that sees the start position of the game from a spot of its own.
+    struct FakeDepth {
+        pictures: u32,
+        corners: [[f32; 2]; 4],
+        occupied: [bool; 64],
+        black: [bool; 64],
+    }
+
+    impl crate::depthlink::DepthSource for FakeDepth {
+        fn describe(&self) -> String {
+            "Fake depth (480x360)".into()
+        }
+
+        fn next_frame(&mut self) -> anyhow::Result<crate::depth::DepthFrame> {
+            std::thread::sleep(Duration::from_millis(25));
+            self.pictures += 1;
+            Ok(crate::depth::fake::frame(480, 360, &self.corners, &self.occupied, &self.black, true, 0.03, self.pictures))
+        }
+    }
+
+    #[test]
+    fn a_depth_camera_beside_the_colour_one_is_found_on_the_board_learned_and_used() {
+        let dir = std::env::temp_dir().join(format!("nicochess-depth-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        // The depth camera sees the board where the colour calibration says, taken over by the fields of view, and
+        // then a little elsewhere: the two sensors are some centimetres apart.
+        let guess = crate::depth::guess_corners(&synthetic::corners(), (synthetic::WIDTH, synthetic::HEIGHT), (480, 360), 69.4, 63.4);
+        let truth = guess.map(|c| [c[0] + 12.0, c[1] - 8.0]);
+        let mut occupied = [false; 64];
+        let mut black = [false; 64];
+        for square in 0..64 {
+            occupied[square] = !(16..48).contains(&square);
+            black[square] = square >= 48;
+        }
+        let factory: crate::depthlink::DepthFactory = Box::new(move |_| {
+            Ok(Box::new(FakeDepth { pictures: 0, corners: truth, occupied, black }) as Box<dyn crate::depthlink::DepthSource>)
+        });
+        let link = crate::depthlink::DepthLink::new(factory, Some(dir.join("depth.json")));
+        link.set_offer(Some("Fake Depth".into()));
+        // The tracker looks every so often, not at every picture of a camera that is much faster than it needs to be.
+        let config = EngineConfig { depth: Some(Arc::clone(&link)), track_interval: Duration::from_millis(100), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        engine.spawn_capture(camera::factory(SourceSpec::Synthetic, Duration::from_millis(5))).unwrap();
+        engine.spawn_depth().unwrap();
+        let handler = handler(Arc::clone(&engine), 8);
+        let rig = Rig { engine, handler, dir };
+
+        // The page is told that the camera has a depth part, and not yet used.
+        let state = rig.state(ALICE);
+        assert_eq!(state["depth"]["offered"], true);
+        assert_eq!(state["depth"]["on"], false);
+        assert_eq!(rig.call("POST", "/api/depth", BOB, r#"{"on": true}"#).0, 403, "only the controller");
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": true}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["depth"]["on"], true);
+
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        wait_for("the depth picture", || rig.call("GET", "/depth.jpg", "", "").0 == 200);
+        // Before the board is calibrated there is nothing to look for.
+        assert_eq!(rig.call("POST", "/api/depth/align", ALICE, "").0, 409);
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+
+        // The game starts: the squares are looked for in the depth picture, then learned, and used.
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("the board in the depth picture", || rig.state(ALICE)["depth"]["aligned"] == true);
+        let state = rig.state(ALICE);
+        assert!(state["depth"]["message"].as_str().unwrap().contains("found"), "{}", state["depth"]);
+        wait_for("the depth to be used", || {
+            let state = rig.state(ALICE);
+            state["depth"]["in_use"] == true && state["tracker"]["status"] == "watching"
+        });
+        let state = rig.state(ALICE);
+        assert_eq!(state["depth"]["ignored"], false);
+        assert_eq!(state["tracker"]["views"], json!([true, false]), "the page counts the cameras, not the depth");
+        assert_eq!(rig.call("GET", "/depth-warp.jpg", "", "").0, 200);
+        // Nothing moves on the board, so no move may be invented while the two look at it.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 0);
+
+        // Unticking stops it.
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": false}"#).0, 200);
+        wait_for("the depth to be left out", || rig.state(ALICE)["depth"]["in_use"] == false);
+        assert_eq!(rig.state(ALICE)["tracker"]["status"], "watching");
+    }
+
+    /// The Opera game on the demo board, with a depth camera beside the camera that shows the same moment of it: the
+    /// squares are found in the depth picture while the game is on, learned, and the first moves are followed.
+    #[test]
+    fn the_first_moves_of_a_demo_game_are_followed_with_the_depth_camera_helping() {
+        let dir = std::env::temp_dir().join(format!("nicochess-demodepth-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let options = crate::app::ServerOptions {
+            listen: "127.0.0.1:0".into(),
+            // Fifteen pictures a move, of which the tracker looks at every third: with the depth each look takes long in
+            // a test build.
+            source: SourceSpec::Demo { move_interval: Duration::from_millis(300) },
+            frame_interval: Duration::from_millis(20),
+            data_dir: dir.join("games"),
+            calibration_path: dir.join("calibration.json"),
+            tracker: quick_tracker(),
+            track_interval: Duration::from_millis(60),
+            idle_timeout: Duration::from_secs(3600),
+            game_timeout: Duration::from_secs(3600),
+            max_viewers: 8,
+            record: None,
+            remember_camera: false,
+            second_device: None,
+            second_synthetic: false,
+            depth_synthetic: true,
+        };
+        let built = crate::app::build(options).unwrap();
+        let rig = Rig { engine: built.engine, handler: built.handler, dir };
+
+        assert_eq!(rig.state(ALICE)["depth"]["offered"], true);
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": true}"#).0, 200);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        wait_for("the depth picture", || rig.call("GET", "/depth.jpg", "", "").0 == 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+
+        // The first moves of the game, with captures, are enough to see that the depth is in step with the colour.
+        let mut helped = false;
+        wait_for("fourteen moves", || {
+            let state = rig.state(ALICE);
+            helped |= state["depth"]["in_use"] == true && state["depth"]["ignored"] == false;
+            state["game"]["moves"].as_array().unwrap().len() >= 14
+        });
+        let state = rig.state(ALICE);
+        let played: Vec<String> =
+            state["game"]["moves"].as_array().unwrap().iter().take(14).map(|m| m["san"].as_str().unwrap().to_string()).collect();
+        assert_eq!(played, synthetic::OPERA_GAME[..14].iter().map(|m| m.to_string()).collect::<Vec<_>>());
+        assert!(helped, "the depth took part in the game: {}", state["depth"]);
+        assert!(state["depth"]["aligned"] == true, "{}", state["depth"]);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"*","reason":"abandoned"}"#).0, 200);
+    }
+
+    #[test]
+    fn a_program_without_a_depth_camera_says_so() {
+        let rig = rig("nodepth", SourceSpec::Synthetic);
+        assert!(rig.state(ALICE)["depth"].is_null());
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": true}"#).0, 409);
+        assert_eq!(rig.call("GET", "/depth.jpg", "", "").0, 503);
     }
 
     #[test]

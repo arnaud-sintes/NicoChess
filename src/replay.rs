@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, Default)]
 pub struct TrackerOverrides {
     pub stable_frames: Option<usize>,
+    pub stable_time: Option<f32>,
     pub motion_threshold: Option<f32>,
     pub max_excess: Option<f32>,
     pub margin: Option<f32>,
@@ -38,6 +39,8 @@ impl TrackerOverrides {
     pub fn apply(&self, config: TrackerConfig) -> TrackerConfig {
         TrackerConfig {
             stable_frames: self.stable_frames.unwrap_or(config.stable_frames),
+            stable_time: self.stable_time.unwrap_or(config.stable_time),
+            motion_span: config.motion_span,
             motion_threshold: self.motion_threshold.unwrap_or(config.motion_threshold),
             max_excess: self.max_excess.unwrap_or(config.max_excess),
             margin: self.margin.unwrap_or(config.margin),
@@ -50,6 +53,9 @@ impl TrackerOverrides {
         let mut parts = Vec::new();
         if let Some(v) = self.stable_frames {
             parts.push(format!("stable_frames={v}"));
+        }
+        if let Some(v) = self.stable_time {
+            parts.push(format!("stable_time={v}"));
         }
         if let Some(v) = self.motion_threshold {
             parts.push(format!("motion_threshold={v}"));
@@ -203,8 +209,9 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     );
     let _ = writeln!(
         text,
-        "  tracker: stable_frames={} motion_threshold={} max_excess={} margin={} soft_margin={} max_plies={}{}",
+        "  tracker: stable_frames={} stable_time={} motion_threshold={} max_excess={} margin={} soft_margin={} max_plies={}{}",
         config.stable_frames,
+        config.stable_time,
         config.motion_threshold,
         config.max_excess,
         config.margin,
@@ -235,7 +242,8 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                     .as_array()
                     .map(|a| a.iter().filter_map(|f| Some((f["cam"].as_u64()? as usize, f["file"].as_str()?.to_string()))).collect())
                     .unwrap_or_default();
-                let mut images: Vec<Option<image::RgbImage>> = vec![None; 2];
+                // The two cameras, and the height picture of a depth camera after them.
+                let mut images: Vec<Option<image::RgbImage>> = vec![None; 3];
                 for (camera, file) in &files {
                     let image = image::open(folder.join(file)).with_context(|| format!("cannot read the picture {file}"))?.to_rgb8();
                     if let Some(place) = images.get_mut(*camera) {
@@ -321,7 +329,13 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                 }
                 let _ = writeln!(text, "{:>8.1}s  {} during the game", event.t, event.kind);
                 // These change the position outside the tracker, whatever it believes.
-                tracker.set_position(parse_fen(event.text("fen")).context("a position of the recording")?);
+                let position = parse_fen(event.text("fen")).context("a position of the recording")?;
+                if event.kind == "undo" {
+                    // As live: the board still shows the move until the pieces are put back or the move is entered.
+                    tracker.undo_to(position, None);
+                } else {
+                    tracker.set_position(position);
+                }
             }
             "relearn" => {
                 let _ = writeln!(text, "{:>8.1}s  the squares were learned again during the game", event.t);
@@ -330,6 +344,10 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
             "calibration" => {
                 if let Ok(calibration) = serde_json::from_value::<crate::calibration::Calibration>(event.data["calibration"].clone()) {
                     let camera = event.data["cam"].as_u64().unwrap_or(0) as usize;
+                    // The third view is the height picture of a depth camera: it only helps.
+                    if camera == 2 {
+                        tracker.set_view_advisory(2, true);
+                    }
                     // As the engine does: a board that moved a little keeps what was learned.
                     if event.text("how") == "follow" && tracker.status() != Status::Learning {
                         tracker.move_view_calibration(camera, &calibration);
@@ -397,6 +415,7 @@ fn status_text(status: Status) -> &'static str {
         Status::Watching => "watching",
         Status::Moving => "moving",
         Status::Unsure => "unsure",
+        Status::Undone => "undone",
     }
 }
 

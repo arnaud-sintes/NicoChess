@@ -53,6 +53,12 @@
   .doubt { margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: var(--hl); border: 1px solid var(--line); }
   .doubt .bar { margin: 6px 0 0; }
   svg.board { width: 100%; max-width: 480px; height: auto; display: block; border-radius: 4px; touch-action: manipulation; }
+  svg.board.playable { touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+  svg.board.playable.lifted { cursor: grabbing; }
+  .clocks { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 8px; font-variant-numeric: tabular-nums; }
+  .clocks span { padding: 2px 10px; border-radius: 6px; border: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .clocks span.on { background: var(--hl); font-weight: 600; }
+  .board-tools { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   table.moves { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
   table.moves td, table.moves th { padding: 3px 6px; text-align: left; }
   table.moves th { color: var(--muted); font-weight: 500; font-size: .8rem; }
@@ -105,7 +111,13 @@
   <div class="layout">
     <div class="card">
       <h2 id="live-title">Game</h2>
+      <div class="clocks" id="clocks" hidden title="The time each player has spent thinking, from the first move"><span id="clock-white"></span><span id="clock-black"></span></div>
       <svg class="board" id="live-board" viewBox="0 0 80 80" role="img" aria-label="Chess board"></svg>
+      <div class="board-tools"><button id="turn-live" title="Turn the board a quarter turn">&#x27F3; 90&deg;</button><span class="muted small" id="drag-hint" hidden>Move a piece by dragging it (or tap it, then the square).</span></div>
+      <div id="drag-promo" class="bar" hidden>
+        <span>Promote to:</span>
+        <button data-piece="q">Queen</button><button data-piece="r">Rook</button><button data-piece="b">Bishop</button><button data-piece="n">Knight</button><button data-piece="">Cancel</button>
+      </div>
       <div class="status" id="status"></div>
       <div id="candidates" class="bar" hidden></div>
       <div id="doubt" class="doubt" hidden></div>
@@ -194,7 +206,9 @@
         <button id="r-next" title="Forward">▶</button>
         <button id="r-last" title="End">⏭</button>
         <span class="time" id="r-time"></span>
+        <button id="turn-replay" title="Turn the board a quarter turn">&#x27F3; 90&deg;</button>
       </div>
+      <div class="muted small" id="r-clocks" title="The time each player has spent thinking"></div>
       <div class="bar">
         <button id="r-play" class="primary">Play</button>
         <select id="r-speed">
@@ -225,12 +239,25 @@
         <label class="check" id="cam-choose-row" hidden><span id="cam-choose-label">Camera</span> <select id="cam-select"></select> <button id="cam-refresh" title="Look for the cameras again">Refresh</button></label>
         <label class="check" id="cam2-choose-row" hidden>Camera 2 <select id="cam2-select"></select></label>
         <div class="muted small" id="cam-choose-info"></div>
+        <div id="depth-box" hidden>
+          <label class="check"><input type="checkbox" id="depth-on"> Also use the depth of this camera</label>
+          <div class="bar"><button id="depth-align" hidden title="Look for the board in the depth picture, with the pieces in their starting positions">Find the board in the depth picture</button></div>
+          <div class="muted small" id="depth-info"></div>
+          <div class="bar" id="depth-views" hidden>
+            <img id="depth-img" alt="depth" style="max-width:48%;height:auto" title="What the depth camera sees: brighter is higher above the board">
+            <img id="depth-warp" alt="depth, top-down" style="max-width:48%;height:auto" hidden>
+          </div>
+        </div>
         <div class="bar">
           <button id="cal-open" class="primary">Open the camera</button>
           <button id="cal-detect" class="primary" hidden title="Look for the chessboard in the picture and calibrate with it">Auto-detect the board</button>
           <button id="cal-swap" hidden title="a1 is at the wrong dark corner: swap White and Black sides">Swap sides</button>
           <button id="cal-close" hidden>Close the camera</button>
           <button id="cal-clear" class="danger" hidden>Forget calibration</button>
+        </div>
+        <div id="rate-box" hidden>
+          <label class="check" for="rate">Pictures per second <input type="range" id="rate" min="1" max="30" step="1" style="flex:1 1 140px"> <strong id="rate-val"></strong></label>
+          <div class="muted small">More pictures a second show the camera more smoothly and notice a move sooner, and use more of the computer. The camera itself may give fewer.</div>
         </div>
         <label class="check"><input type="checkbox" id="follow"> Keep the board aligned if the camera moves</label>
         <div class="muted small" id="follow-info"></div>
@@ -363,33 +390,75 @@ function pieceSvg(ch, x, y) {
   const fill = white ? '#fbf7ea' : '#1f1f1f', line = white ? '#151515' : '#fbf7ea';
   return `<g transform="translate(${x + 5} ${y + 5}) scale(1.1) translate(-5 -5)" fill="${fill}" stroke="${line}" stroke-width=".22" stroke-linejoin="round" stroke-linecap="round">${shape}${PLINTH}</g>`;
 }
-function drawBoard(svg, fen, uci) {
+// The board can be turned by quarter turns (the button beside it), to match how the real board is seen. The pieces stay
+// upright. A square is (file, rank) with 0 for a and for rank 1; it is drawn at (column, row) of the picture.
+let boardTurn = (parseInt(stored('nicochess-turn') || '0', 10) || 0) & 3;
+function squarePos(f, r, turn) {
+  switch (turn) { case 1: return [r, f]; case 2: return [7 - f, r]; case 3: return [7 - r, 7 - f]; default: return [f, 7 - r]; }
+}
+function squareAt(col, row, turn) {
+  switch (turn) { case 1: return [row, col]; case 2: return [7 - col, row]; case 3: return [7 - row, 7 - col]; default: return [col, 7 - row]; }
+}
+const squareName = (f, r) => 'abcdefgh'[f] + (r + 1);
+// What `drawBoard` takes besides the position: `marks` squares to highlight (the last move), `hide` a square whose piece is
+// being dragged, `dots` squares a piece may go to, `selected` the square of the piece that was picked up.
+function drawBoard(svg, fen, marks, opts) {
+  opts = opts || {};
   const rows = (fen || '8/8/8/8/8/8/8/8').split(' ')[0].split('/');
-  const marked = new Set();
-  if (uci && uci.length >= 4) { marked.add(uci.slice(0, 2)); marked.add(uci.slice(2, 4)); }
+  const marked = new Set(marks || []);
+  const turn = boardTurn;
   let out = '<rect x="0" y="0" width="80" height="80" fill="var(--sq-dark)"/>';
-  for (let r = 0; r < 8; r++) {
-    for (let f = 0; f < 8; f++) {
-      const name = 'abcdefgh'[f] + (8 - r);
-      // a1 is a dark square: a square is light when its file number and its rank add up to an even number.
-      const light = (f + (8 - r)) % 2 === 0;
-      out += `<rect x="${f * 10}" y="${r * 10}" width="10" height="10" fill="${light ? 'var(--sq-light)' : 'var(--sq-dark)'}"/>`;
-      if (marked.has(name)) out += `<rect x="${f * 10}" y="${r * 10}" width="10" height="10" fill="#f6d84a" opacity=".55"/>`;
+  for (let f = 0; f < 8; f++) {
+    for (let r = 0; r < 8; r++) {
+      const [col, row] = squarePos(f, r, turn);
+      const name = squareName(f, r);
+      // a1 is a dark square: a square is light when its file number and its rank add up to an odd number.
+      const light = (f + r) % 2 === 1;
+      out += `<rect x="${col * 10}" y="${row * 10}" width="10" height="10" fill="${light ? 'var(--sq-light)' : 'var(--sq-dark)'}"/>`;
+      if (marked.has(name)) out += `<rect x="${col * 10}" y="${row * 10}" width="10" height="10" fill="#f6d84a" opacity=".55"/>`;
+      if (opts.selected === name) out += `<rect x="${col * 10}" y="${row * 10}" width="10" height="10" fill="#4aa3f6" opacity=".45"/>`;
     }
   }
-  for (let r = 0; r < 8; r++) {
+  for (let ri = 0; ri < 8; ri++) {
     let f = 0;
-    for (const ch of rows[r] || '') {
+    for (const ch of rows[ri] || '') {
       if (/\d/.test(ch)) { f += +ch; continue; }
-      out += pieceSvg(ch, f * 10, r * 10);
+      const r = 7 - ri;
+      if (squareName(f, r) !== opts.hide) {
+        const [col, row] = squarePos(f, r, turn);
+        out += pieceSvg(ch, col * 10, row * 10);
+      }
       f++;
     }
   }
+  for (const name of opts.dots || []) {
+    const [col, row] = squarePos('abcdefgh'.indexOf(name[0]), +name[1] - 1, turn);
+    out += `<circle cx="${col * 10 + 5}" cy="${row * 10 + 5}" r="1.7" fill="#2b2b2b" opacity=".45" pointer-events="none"/>`;
+  }
   for (let i = 0; i < 8; i++) {
-    out += `<text x="${i * 10 + 9.4}" y="79" font-size="2.4" text-anchor="end" fill="${i % 2 ? 'var(--sq-dark)' : 'var(--sq-light)'}">${'abcdefgh'[i]}</text>`;
-    out += `<text x="0.8" y="${i * 10 + 3}" font-size="2.4" fill="${i % 2 ? 'var(--sq-light)' : 'var(--sq-dark)'}">${8 - i}</text>`;
+    // The coordinates along the bottom and the left edge of the picture, whichever way it is turned.
+    const [bf, br] = squareAt(i, 7, turn), [lf, lr] = squareAt(0, i, turn);
+    const bottomLight = (bf + br) % 2 === 1, leftLight = (lf + lr) % 2 === 1;
+    out += `<text x="${i * 10 + 9.4}" y="79" font-size="2.4" text-anchor="end" fill="${bottomLight ? 'var(--sq-dark)' : 'var(--sq-light)'}">${turn % 2 === 0 ? 'abcdefgh'[bf] : br + 1}</text>`;
+    out += `<text x="0.8" y="${i * 10 + 3}" font-size="2.4" fill="${leftLight ? 'var(--sq-dark)' : 'var(--sq-light)'}">${turn % 2 === 0 ? lr + 1 : 'abcdefgh'[lf]}</text>`;
   }
   svg.innerHTML = out;
+}
+
+// The squares to highlight for the last move shown: where it went from and to, the rook too after castling, and all the
+// moves that were seen in one picture (two or three moves played between two pictures).
+function lastMoveMarks(moves, count) {
+  const marks = [];
+  for (let i = count - 1; i >= 0; i--) {
+    const m = moves[i];
+    marks.push(m.uci.slice(0, 2), m.uci.slice(2, 4));
+    if (/^O-O/.test(m.san)) {
+      const rank = m.uci[1];
+      if (m.uci[2] === 'g') marks.push('h' + rank, 'f' + rank); else if (m.uci[2] === 'c') marks.push('a' + rank, 'd' + rank);
+    }
+    if (!m.together) break;
+  }
+  return marks;
 }
 
 // ---------- move list ----------
@@ -429,12 +498,15 @@ const STATUS = {
   watching: 'Watching the board.',
   moving: 'Something is moving over the board…',
   unsure: 'Not sure which move was played. Pick one below, or enter it.',
+  undone: 'Move taken back. Put the pieces back as they were, or give the move that was played (drag a piece, or pick one below).',
 };
 
 function pct(chance) { return Math.round(100 * chance) + '%'; }
 
+let stateAt = performance.now();
 function apply(state) {
   S = state;
+  stateAt = performance.now();
   render();
 }
 
@@ -451,6 +523,9 @@ function render() {
 
   renderLive(ctl);
   renderCalibrate(ctl);
+  renderDepth(ctl);
+  renderRate(ctl);
+  tickClocks();
   // The list of games is read from the disk: ask for it again only when a game changed.
   const gamesSignature = S.game ? S.game.id + ':' + S.game.moves.length + ':' + (S.game.result || '') : '';
   if (tab === 'games' && gamesSignature !== lastGamesSignature) refreshGamesSoon();
@@ -471,13 +546,12 @@ function renderLive(ctl) {
 
   if (!g) {
     $('live-title').textContent = 'Board';
-    drawBoard($('live-board'), null);
+    redrawLive();
     $('status').textContent = ''; $('candidates').hidden = true; $('doubt').hidden = true; $('promotion').hidden = true;
     return;
   }
-  const last = g.moves.length ? g.moves[g.moves.length - 1] : null;
   $('live-title').textContent = g.white + ' – ' + g.black;
-  drawBoard($('live-board'), g.fen, last && last.uci);
+  redrawLive();
   $('game-names').textContent = dateText(g.started_at) + (g.start_fen ? ' · from a position' : '');
   drawMoves($('live-moves'), g.moves, g.start_fen, g.moves.length, false);
 
@@ -503,15 +577,17 @@ function renderLive(ctl) {
     const turn = g.turn === 'white' ? 'White' : 'Black';
     const twoCameras = !!(S.second && S.second.enabled && S.second.calibration) && st !== 'learning';
     const used = (S.tracker.views || []).filter(Boolean).length;
+    const depthOn = !!(S.depth && S.depth.on && S.depth.offered) && st !== 'learning';
     statusEl.textContent = (STATUS[st] || st) + ' ' + turn + ' to move.'
-      + (twoCameras ? (used >= 2 ? ' Two cameras are watching.' : ' Only one camera is giving a picture.') : '');
+      + (twoCameras ? (used >= 2 ? ' Two cameras are watching.' : ' Only one camera is giving a picture.') : '')
+      + (depthOn ? (S.depth.in_use && !S.depth.ignored ? ' The depth is helping.' : ' The depth is not being used (see the Calibrate tab).') : '');
   } else {
     statusEl.textContent = over ? 'Game over.' : 'The recording is stopped.';
   }
   statusEl.className = 'status' + (playing && st === 'unsure' ? ' unsure' : '');
 
   const cands = $('candidates');
-  const showCands = ctl && playing && st === 'unsure' && S.tracker.candidates.length;
+  const showCands = ctl && playing && (st === 'unsure' || st === 'undone') && S.tracker.candidates.length;
   cands.hidden = !showCands;
   if (showCands) {
     cands.innerHTML = '<span>Which move?</span>' + S.tracker.candidates
@@ -749,6 +825,43 @@ setInterval(async () => {
   } catch (e) { /* the next time */ }
 }, 1500);
 
+// ---------- the depth of a camera that has it (Windows) ----------
+// The box appears when the camera in use has a depth part (S.depth.offered). The depth is read while the cameras are
+// on; the board is looked for in it when a game starts, or with the button (pieces in their starting positions).
+function renderDepth(ctl) {
+  const d = S && S.depth;
+  const box = $('depth-box');
+  box.hidden = !(ctl && d && d.offered);
+  if (box.hidden) return;
+  if (document.activeElement !== $('depth-on')) $('depth-on').checked = d.on;
+  const playing = S.mode === 'playing';
+  $('depth-on').disabled = false;
+  $('depth-align').hidden = !(d.on && S.calibration);
+  $('depth-align').disabled = !d.source;
+  let text = '';
+  if (!d.on) text = 'The depth helps to tell squares with a piece from empty ones, whatever the light. The colour still tells white from black.';
+  else if (d.error) text = 'Depth camera: ' + d.error;
+  else if (!S.calibration) text = 'Calibrate the board on the colour picture first.';
+  else if (d.ignored) text = 'The depth picture does not agree with the colour picture (was the camera moved?): it is not used. Put the pieces in their starting positions and press the button.';
+  else if (d.aligned) text = (d.message || 'The board was found in the depth picture.') + (playing ? (d.in_use ? ' The depth is helping.' : ' The depth is learning the squares.') : ' It is used in the next game.');
+  else text = (d.message || 'The board is looked for in the depth picture when a game starts. To check now, open the camera, set the pieces in their starting positions and press the button.') + (d.source ? '' : ' (The depth camera is not open: it opens with the camera.)');
+  $('depth-info').textContent = text;
+  const showViews = d.on && !!d.source;
+  $('depth-views').hidden = !showViews;
+  $('depth-warp').hidden = !(showViews && d.aligned);
+}
+$('depth-on').onchange = async () => {
+  await api('POST', '/api/depth', { on: $('depth-on').checked });
+  $('depth-on').blur();
+};
+$('depth-align').onclick = () => api('POST', '/api/depth/align');
+// What the depth camera sees, a few times a second while the Calibrate tab shows it.
+setInterval(() => {
+  if (tab !== 'calibrate' || document.hidden || $('depth-views').hidden) return;
+  $('depth-img').src = '/depth.jpg?t=' + Date.now();
+  if (!$('depth-warp').hidden) $('depth-warp').src = '/depth-warp.jpg?t=' + Date.now();
+}, 1000);
+
 // ---------- choosing the camera of this computer (Windows) ----------
 // The server says whether it offers the choice (S.camera.choice) and lists the cameras it finds. The Android app
 // has its own choice, below.
@@ -927,10 +1040,12 @@ function showPly(n) {
   const g = R.game; if (!g) return;
   R.ply = Math.max(0, Math.min(g.moves.length, n));
   const last = R.ply ? g.moves[R.ply - 1] : null;
-  drawBoard($('replay-board'), g.fens[R.ply], last && last.uci);
+  drawBoard($('replay-board'), g.fens[R.ply], lastMoveMarks(g.moves, R.ply));
   drawMoves($('replay-moves'), g.moves, g.start_fen, R.ply, true);
   $('r-time').textContent = mmss(last ? last.t : 0) + ' / ' + mmss(g.moves.length ? g.moves[g.moves.length - 1].t : 0) +
     ' · move ' + R.ply + '/' + g.moves.length;
+  const spent = thinkTimes(g.moves, g.start_fen, R.ply);
+  $('r-clocks').textContent = g.white + ' ' + mmss(spent.white) + ' · ' + g.black + ' ' + mmss(spent.black) + ' thinking time';
   $('r-first').disabled = $('r-prev').disabled = R.ply === 0;
   $('r-next').disabled = $('r-last').disabled = R.ply === g.moves.length;
 }
@@ -959,6 +1074,183 @@ $('r-speed').onchange = () => { if (R.timer) { stopReplay(); playReplay(); } };
 $('replay-moves').addEventListener('click', e => {
   const td = e.target.closest('td[data-ply]'); if (td) { stopReplay(); showPly(+td.dataset.ply); }
 });
+
+// ---------- the clocks: how long each player has been thinking ----------
+// The clock starts with the first move, which is at 0. The time a player took over a move is the time since the move before.
+function sideOfPly(i, startFen) {
+  const blackFirst = !!startFen && startFen.split(' ')[1] === 'b';
+  return (i % 2 === 0) !== blackFirst ? 'white' : 'black';
+}
+function thinkTimes(moves, startFen, count) {
+  const total = { white: 0, black: 0 };
+  for (let i = 1; i < count; i++) total[sideOfPly(i, startFen)] += Math.max(0, moves[i].t - moves[i - 1].t);
+  return total;
+}
+// Between two messages of the server the clock of the player to move goes on by itself.
+function tickClocks() {
+  const g = S && S.game, box = $('clocks');
+  if (!g) { box.hidden = true; return; }
+  box.hidden = false;
+  const total = thinkTimes(g.moves, g.start_fen, g.moves.length);
+  const running = S.mode === 'playing' && !g.over && g.moves.length > 0 && typeof g.elapsed === 'number';
+  if (running) {
+    const now = g.elapsed + (performance.now() - stateAt) / 1000;
+    total[g.turn] += Math.max(0, now - g.moves[g.moves.length - 1].t);
+  }
+  $('clock-white').textContent = g.white + '  ' + mmss(total.white);
+  $('clock-black').textContent = g.black + '  ' + mmss(total.black);
+  $('clock-white').classList.toggle('on', running && g.turn === 'white');
+  $('clock-black').classList.toggle('on', running && g.turn === 'black');
+}
+setInterval(tickClocks, 250);
+
+// ---------- the live board: turning it, and moving a piece by hand ----------
+// A piece is dragged (mouse or finger) to the square it goes to, or tapped and then the square. Where it may go comes from
+// the server (`/api/game/legal`), so a piece cannot be dropped anywhere else. A pawn that reaches the last rank asks which
+// piece it becomes.
+let legal = { fen: null, from: {} };
+let drag = null, selected = null, pendingPromo = null;
+const liveBoard = $('live-board');
+
+function canMovePieces() { return !!(S && S.role === 'controller' && S.mode === 'playing' && S.game && !S.game.over); }
+function legalTargets(sq) { return legal.from[sq] || []; }
+
+function loadLegal(fen) {
+  if (legal.fen === fen) return;
+  legal = { fen, from: {} };
+  selected = null;
+  fetch('/api/game/legal').then(r => r.json()).then(d => {
+    if (legal.fen !== fen) return;
+    const from = {};
+    for (const uci of d.moves || []) (from[uci.slice(0, 2)] = from[uci.slice(0, 2)] || []).push({ to: uci.slice(2, 4), promo: uci[4] || '' });
+    legal.from = from;
+    redrawLive();
+  }).catch(() => {});
+}
+
+function pieceAtSquare(fen, sq) {
+  const row = fen.split(' ')[0].split('/')[8 - +sq[1]] || '';
+  let f = 0;
+  for (const ch of row) {
+    if (/\d/.test(ch)) { f += +ch; continue; }
+    if (f === 'abcdefgh'.indexOf(sq[0])) return ch;
+    f++;
+  }
+  return null;
+}
+
+function squareFromEvent(e) {
+  const rect = liveBoard.getBoundingClientRect();
+  const col = Math.floor((e.clientX - rect.left) / rect.width * 8), row = Math.floor((e.clientY - rect.top) / rect.height * 8);
+  if (col < 0 || col > 7 || row < 0 || row > 7) return null;
+  const [f, r] = squareAt(col, row, boardTurn);
+  return squareName(f, r);
+}
+
+function showGhost() {
+  let ghost = liveBoard.querySelector('#ghost');
+  if (!ghost) {
+    liveBoard.insertAdjacentHTML('beforeend', '<g id="ghost" pointer-events="none">' + pieceSvg(drag.piece, -5, -5) + '</g>');
+    ghost = liveBoard.querySelector('#ghost');
+  }
+  const rect = liveBoard.getBoundingClientRect();
+  ghost.setAttribute('transform', 'translate(' + ((drag.x - rect.left) / rect.width * 80) + ' ' + ((drag.y - rect.top) / rect.height * 80) + ')');
+}
+
+function redrawLive() {
+  const g = S && S.game;
+  if (!g) { drawBoard(liveBoard, null); liveBoard.classList.remove('playable'); $('drag-hint').hidden = true; return; }
+  const movable = canMovePieces();
+  liveBoard.classList.toggle('playable', movable);
+  liveBoard.classList.toggle('lifted', !!drag);
+  $('drag-hint').hidden = !movable;
+  if (movable) loadLegal(g.fen);
+  else { selected = null; drag = null; }
+  const opts = {};
+  if (movable) {
+    if (drag) opts.hide = drag.from;
+    if (selected) { opts.selected = selected; opts.dots = legalTargets(selected).map(t => t.to); }
+  }
+  drawBoard(liveBoard, g.fen, lastMoveMarks(g.moves, g.moves.length), opts);
+  // The piece that is being dragged is drawn on top of the board, which was drawn again.
+  if (drag) showGhost();
+}
+
+async function sendMove(from, to) {
+  const options = legalTargets(from).filter(t => t.to === to);
+  if (!options.length) return;
+  selected = null;
+  if (options.some(t => t.promo)) {
+    pendingPromo = { from, to };
+    $('drag-promo').hidden = false;
+    redrawLive();
+    return;
+  }
+  redrawLive();
+  await api('POST', '/api/game/move', { move: from + to });
+}
+$('drag-promo').addEventListener('click', async e => {
+  const b = e.target.closest('button');
+  if (!b || !pendingPromo) return;
+  const { from, to } = pendingPromo;
+  pendingPromo = null;
+  $('drag-promo').hidden = true;
+  if (b.dataset.piece) await api('POST', '/api/game/move', { move: from + to + b.dataset.piece });
+});
+
+liveBoard.addEventListener('pointerdown', e => {
+  if (!canMovePieces() || (e.pointerType === 'mouse' && e.button !== 0) || pendingPromo) return;
+  const sq = squareFromEvent(e);
+  if (!sq) return;
+  // The second tap of "tap the piece, then the square".
+  if (selected && selected !== sq && legalTargets(selected).some(t => t.to === sq)) { e.preventDefault(); sendMove(selected, sq); return; }
+  const piece = pieceAtSquare(S.game.fen, sq);
+  const mine = piece && (piece === piece.toUpperCase()) === (S.game.turn === 'white');
+  if (!mine || !legalTargets(sq).length) { selected = null; redrawLive(); return; }
+  e.preventDefault();
+  selected = sq;
+  drag = { from: sq, piece, x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: false };
+  try { liveBoard.setPointerCapture(e.pointerId); } catch (err) { /* the drag works without */ }
+  redrawLive();
+});
+liveBoard.addEventListener('pointermove', e => {
+  if (!drag) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) > 6) drag.moved = true;
+  showGhost();
+});
+function endDrag(e, cancelled) {
+  if (!drag) return;
+  const d = drag;
+  drag = null;
+  const sq = cancelled ? null : squareFromEvent(e);
+  if (d.moved && sq && sq !== d.from && legalTargets(d.from).some(t => t.to === sq)) { sendMove(d.from, sq); return; }
+  // Dropped nowhere that is allowed: the piece goes back. A tap (no movement) leaves it picked up, with its squares shown.
+  if (d.moved) { selected = null; if (sq && sq !== d.from) toast('That is not a legal move.'); }
+  redrawLive();
+}
+liveBoard.addEventListener('pointerup', e => endDrag(e, false));
+liveBoard.addEventListener('pointercancel', e => endDrag(e, true));
+
+function turnBoard() {
+  boardTurn = (boardTurn + 1) & 3;
+  remember('nicochess-turn', String(boardTurn));
+  redrawLive();
+  if (R.game) showPly(R.ply);
+}
+$('turn-live').onclick = turnBoard;
+$('turn-replay').onclick = turnBoard;
+
+// ---------- the pictures per second of the camera (a slider on the Calibrate tab) ----------
+function renderRate(ctl) {
+  const r = S && S.rate, box = $('rate-box');
+  box.hidden = !(ctl && r);
+  if (box.hidden) return;
+  if (document.activeElement !== $('rate')) $('rate').value = Math.round(r.fps);
+  $('rate-val').textContent = $('rate').value;
+}
+$('rate').oninput = () => { $('rate-val').textContent = $('rate').value; };
+$('rate').onchange = () => api('POST', '/api/camera/rate', { fps: +$('rate').value });
 
 // ---------- events from the server ----------
 $('white').value = stored('nicochess-white') || '';

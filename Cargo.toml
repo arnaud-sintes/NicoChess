@@ -1,7 +1,7 @@
 # The version of NicoChess: the one place to change it. The program, the page, the Android app
 # (versionName and versionCode, see android/app/build.gradle.kts) and the packages all take it from here.
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 
 [package]
 name = "nicochess"
@@ -33,6 +33,9 @@ v4l = { version = "0.14.0", default-features = false, features = ["v4l2"] }
 [target.'cfg(windows)'.dependencies]
 # Webcam on Windows (Media Foundation). Frames are decoded here, not by nokhwa.
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-msmf"] }
+# The depth stream of a depth camera (16-bit pictures that nokhwa cannot read): Media Foundation directly. Already
+# built for nokhwa, so it adds nothing to the program but the code that uses it.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
 
 [profile.release]
 lto = true

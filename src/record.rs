@@ -57,11 +57,14 @@ pub struct RecordOptions {
     pub every: Duration,
     /// How many pictures may wait for the disk before the next ones are dropped.
     pub backlog: usize,
+    /// The least time between two pictures kept while something is going on (at 25 pictures a second a recording
+    /// would be huge, and a few a second tell the story); zero keeps every picture the detection looks at.
+    pub busy_every: Duration,
 }
 
 impl RecordOptions {
     pub fn new(dir: PathBuf, every: Duration) -> RecordOptions {
-        RecordOptions { dir, every, backlog: DEFAULT_BACKLOG }
+        RecordOptions { dir, every, backlog: DEFAULT_BACKLOG, busy_every: Duration::from_millis(150) }
     }
 }
 

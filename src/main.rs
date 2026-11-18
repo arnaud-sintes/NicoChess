@@ -30,9 +30,12 @@ OPTIONS:
                              program works with one camera
     --second-camera          with --source demo or synthetic: a second camera that shows the board from the other
                              side, to try two cameras without any
+    --depth-camera           with --source demo: a depth camera beside the camera, to try the depth without one (a
+                             camera with a depth part, such as an Intel RealSense, offers it on the page)
     --width <N>              camera width                        [default: 640]
     --height <N>             camera height                       [default: 480]
-    --fps <N>                frames per second kept              [default: 3]
+    --fps <N>                pictures per second kept from the camera (the page has a slider for it)
+                             [default: 25 on Windows, 3 elsewhere]
     --data-dir <DIR>         where games are stored              [default: data]
     --calibration <FILE>     calibration file                    [default: calibration.json]
     --no-lock-controls       do not turn off auto exposure / white balance
@@ -59,7 +62,8 @@ OPTIONS:
     --replay-verbose         with --replay: also list every change of the tracker's status
 
   Tuning the move detection:
-    --stable-frames <N>      frames in a row that must agree     [default: 3]
+    --stable-frames <N>      pictures in a row that must agree   [default: 3]
+    --stable-time <S>        seconds the board must be still     [default: 0.35]
     --motion-threshold <X>   colour change that means 'a hand is there'  [default: 4]
     --max-excess <X>         misfit left unexplained that is still accepted (nats)  [default: 60]
     --margin <X>             how much likelier than the runner-up a move must be (nats)  [default: 6]
@@ -99,9 +103,12 @@ fn run() -> Result<()> {
     let device: String = device_option.unwrap_or_else(|| default_device.into());
     let second_device: Option<String> = args.opt_value_from_str("--device2")?;
     let second_synthetic = args.contains("--second-camera");
+    let depth_synthetic = args.contains("--depth-camera");
     let width: u32 = args.opt_value_from_str("--width")?.unwrap_or(640);
     let height: u32 = args.opt_value_from_str("--height")?.unwrap_or(480);
-    let fps: f32 = args.opt_value_from_str("--fps")?.unwrap_or(3.0);
+    // Pictures a second: what was asked, else what the page set last time, else the default (a small box would
+    // not keep up with 25 a second: the page's slider sets it for that one).
+    let fps_option: Option<f32> = args.opt_value_from_str("--fps")?;
     let data_dir: PathBuf = args.opt_value_from_str("--data-dir")?.unwrap_or_else(|| PathBuf::from("data"));
     let calibration_path: PathBuf = args.opt_value_from_str("--calibration")?.unwrap_or_else(|| PathBuf::from("calibration.json"));
     let lock_controls = !args.contains("--no-lock-controls");
@@ -119,6 +126,7 @@ fn run() -> Result<()> {
     // Only the values that are given: a replay keeps the recorded ones for the others.
     let overrides = TrackerOverrides {
         stable_frames: args.opt_value_from_str("--stable-frames")?,
+        stable_time: args.opt_value_from_str("--stable-time")?,
         motion_threshold: args.opt_value_from_str("--motion-threshold")?,
         max_excess: args.opt_value_from_str("--max-excess")?,
         margin: args.opt_value_from_str("--margin")?,
@@ -150,6 +158,7 @@ fn run() -> Result<()> {
         print!("{}", camera::probe(&device)?);
         return Ok(());
     }
+    let fps = fps_option.or_else(|| nicochess::engine::remembered_fps(&calibration_path)).unwrap_or(if cfg!(windows) { 25.0 } else { 3.0 });
     if !(fps > 0.0 && fps <= 30.0) {
         bail!("--fps must be between 0 and 30");
     }
@@ -163,14 +172,25 @@ fn run() -> Result<()> {
     if second_device.as_deref().is_some_and(|d| d == device) {
         bail!("--device2 is the same camera as --device");
     }
+    if depth_synthetic && source != "demo" {
+        bail!("--depth-camera goes with --source demo (a camera with a depth part offers it on the page)");
+    }
     if second_synthetic && !matches!(source.as_str(), "demo" | "synthetic") {
         bail!("--second-camera goes with --source demo or synthetic (with a camera, use --device2)");
     }
 
     let spec = match source.as_str() {
-        "camera" => {
-            SourceSpec::Camera(CameraSettings { device, width, height, interval, lock_controls, exposure, white_balance, focus, zoom })
-        }
+        "camera" => SourceSpec::Camera(CameraSettings {
+            device,
+            width,
+            height,
+            rate: nicochess::camera::FrameRate::new(fps),
+            lock_controls,
+            exposure,
+            white_balance,
+            focus,
+            zoom,
+        }),
         "demo" => SourceSpec::Demo { move_interval: Duration::from_secs_f32(demo_secs) },
         "synthetic" => SourceSpec::Synthetic,
         path => SourceSpec::Image(path.to_string()),
@@ -221,6 +241,7 @@ fn run() -> Result<()> {
         remember_camera,
         second_device,
         second_synthetic,
+        depth_synthetic,
     };
     app::serve_on(options, listener, on_ready)
 }

@@ -5,7 +5,7 @@ use crate::synthetic;
 use anyhow::{Context, Result, bail};
 use image::RgbImage;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -157,6 +157,56 @@ pub fn nv12_to_rgb(data: &[u8], width: u32, height: u32) -> Result<RgbImage> {
     RgbImage::from_raw(width, height, out).context("bad RGB buffer size")
 }
 
+/// How many pictures a second are kept from a camera, which runs at its own pace (often 30 a second). Shared between
+/// the engine, which the page tells, and the camera thread, which reads it for every picture: it can be changed while
+/// the camera runs.
+#[derive(Debug)]
+pub struct FrameRate(AtomicU32);
+
+impl FrameRate {
+    pub fn new(fps: f32) -> Arc<FrameRate> {
+        Arc::new(FrameRate(AtomicU32::new(fps.to_bits())))
+    }
+
+    pub fn fps(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, fps: f32) {
+        self.0.store(fps.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs_f32(1.0 / self.fps().clamp(0.1, 1000.0))
+    }
+}
+
+/// Chooses which of the pictures a camera delivers are kept, so that on average `interval` goes by between two kept
+/// ones. A picture is kept when it comes at the due time or a little before it: a camera delivers at a steady pace
+/// of its own, and "a picture every 33 ms" asked of a 30 pictures a second camera must keep every one of them. (Keeping
+/// a picture only once a full interval has gone by since the last kept one loses every other picture there, and asking
+/// for 25 or 30 a second gives 15.) The due times follow a schedule, so no error builds up.
+#[derive(Debug, Default)]
+pub struct Decimator {
+    due: Option<Instant>,
+}
+
+impl Decimator {
+    pub fn keep(&mut self, now: Instant, interval: Duration) -> bool {
+        let Some(due) = self.due else {
+            self.due = Some(now + interval);
+            return true;
+        };
+        if now + interval / 4 < due {
+            return false;
+        }
+        let next = due + interval;
+        // After a long pause (a stalled program, a camera that was away) the schedule starts again from now.
+        self.due = Some(if next + interval < now { now + interval } else { next });
+        true
+    }
+}
+
 /// Settings for the real camera.
 #[derive(Clone, Debug)]
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -165,7 +215,8 @@ pub struct CameraSettings {
     pub device: String,
     pub width: u32,
     pub height: u32,
-    pub interval: Duration,
+    /// How many pictures a second are kept. Shared, so that it can be changed while the camera runs.
+    pub rate: Arc<FrameRate>,
     /// Turn off automatic exposure and white balance, which drift and upset detection.
     pub lock_controls: bool,
     /// Manual exposure time in units of 100 microseconds (UVC), if wanted.
@@ -291,8 +342,8 @@ mod windows_camera {
         width: u32,
         height: u32,
         format: FrameFormat,
-        min_interval: Duration,
-        last: Option<Instant>,
+        rate: Arc<FrameRate>,
+        keeper: Decimator,
     }
 
     impl Grabber {
@@ -341,8 +392,8 @@ mod windows_camera {
                 width: format.resolution().width(),
                 height: format.resolution().height(),
                 format: format.format(),
-                min_interval: settings.interval,
-                last: None,
+                rate: Arc::clone(&settings.rate),
+                keeper: Decimator::default(),
             })
         }
     }
@@ -384,8 +435,7 @@ mod windows_camera {
             // that are due get converted.
             loop {
                 let buffer = self.camera.frame().map_err(|e| anyhow::anyhow!("camera read failed: {e}"))?;
-                let due = self.last.is_none_or(|last| last.elapsed() >= self.min_interval);
-                if !due {
+                if !self.keeper.keep(Instant::now(), self.rate.interval()) {
                     continue;
                 }
                 let data = buffer.buffer();
@@ -407,7 +457,6 @@ mod windows_camera {
                         RgbImage::from_raw(w, h, rgb).context("bad gray frame size")?
                     }
                 };
-                self.last = Some(Instant::now());
                 return Ok(image);
             }
         }
@@ -573,8 +622,8 @@ mod v4l_camera {
         width: u32,
         height: u32,
         pixel_format: PixelFormat,
-        min_interval: Duration,
-        last: Option<Instant>,
+        rate: Arc<FrameRate>,
+        keeper: Decimator,
     }
 
     impl V4lCamera {
@@ -613,8 +662,8 @@ mod v4l_camera {
                 width: format.width,
                 height: format.height,
                 pixel_format,
-                min_interval: settings.interval,
-                last: None,
+                rate: Arc::clone(&settings.rate),
+                keeper: Decimator::default(),
             })
         }
     }
@@ -661,8 +710,7 @@ mod v4l_camera {
             loop {
                 let (buffer, meta) =
                     self.stream.next().context("camera read failed (no picture within the time allowed: unplugged or in use?)")?;
-                let due = self.last.is_none_or(|last| last.elapsed() >= self.min_interval);
-                if !due {
+                if !self.keeper.keep(Instant::now(), self.rate.interval()) {
                     continue;
                 }
                 let used = (meta.bytesused as usize).min(buffer.len());
@@ -674,7 +722,6 @@ mod v4l_camera {
                         image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).context("bad MJPEG frame")?.to_rgb8()
                     }
                 };
-                self.last = Some(Instant::now());
                 return Ok(image);
             }
         }
@@ -817,6 +864,12 @@ pub fn factory_with(
 /// second shows the moment of the game that the first shows. (Two clocks of their own would drift apart whenever one
 /// camera's thread was held up, and the cameras would then show different moments, which no real pair does.)
 pub fn demo_pair(frame_interval: Duration, move_interval: Duration) -> (SourceFactory, SourceFactory) {
+    let (first, second, _) = demo_trio(frame_interval, move_interval);
+    (first, second)
+}
+
+/// The same, and a depth camera beside the first that shows the same moment of the game too (`--depth-camera`).
+pub fn demo_trio(frame_interval: Duration, move_interval: Duration) -> (SourceFactory, SourceFactory, crate::depthlink::DepthFactory) {
     let shared = Arc::new(AtomicUsize::new(0));
     let make = |second: bool| -> SourceFactory {
         let shared = Arc::clone(&shared);
@@ -824,7 +877,58 @@ pub fn demo_pair(frame_interval: Duration, move_interval: Duration) -> (SourceFa
             Ok(Box::new(DemoGame::linked(frame_interval, move_interval, Arc::clone(&shared), second)))
         })
     };
-    (make(false), make(true))
+    // The depth pictures of the game are drawn once (there are not many different boards in it), when the camera is
+    // first opened; drawing one takes longer than a frame.
+    let drawn: Arc<std::sync::OnceLock<Arc<Vec<Arc<crate::depth::DepthFrame>>>>> = Arc::new(std::sync::OnceLock::new());
+    let depth_shared = Arc::clone(&shared);
+    let depth: crate::depthlink::DepthFactory = Box::new(move |_| {
+        let pictures = drawn.get_or_init(|| Arc::new(DemoDepth::draw(frame_interval, move_interval))).clone();
+        Ok(Box::new(DemoDepth { pictures, shared: Arc::clone(&depth_shared), pacer: Pacer::new(frame_interval) })
+            as Box<dyn crate::depthlink::DepthSource>)
+    });
+    (make(false), make(true), depth)
+}
+
+/// The depth camera of the demo: what a depth camera beside the first camera would see of the demo game.
+struct DemoDepth {
+    /// The picture for each moment of the game.
+    pictures: Arc<Vec<Arc<crate::depth::DepthFrame>>>,
+    /// Where the game is, said by the first camera.
+    shared: Arc<AtomicUsize>,
+    pacer: Pacer,
+}
+
+impl DemoDepth {
+    fn draw(frame_interval: Duration, move_interval: Duration) -> Vec<Arc<crate::depth::DepthFrame>> {
+        use std::collections::HashMap;
+        let script = DemoGame::new(frame_interval, move_interval).script;
+        let corners = crate::depthlink::demo_depth_corners();
+        let mut known: HashMap<synthetic::PieceGrid, Arc<crate::depth::DepthFrame>> = HashMap::new();
+        script
+            .iter()
+            .enumerate()
+            .map(|(i, grid)| {
+                Arc::clone(known.entry(*grid).or_insert_with(|| {
+                    let occupied = grid.map(|piece| piece.is_some());
+                    let black = grid.map(|piece| piece == Some(shakmaty::Color::Black));
+                    // Dark pieces give no reading on their top, as a dark matte surface may.
+                    Arc::new(crate::depth::fake::frame(320, 240, &corners, &occupied, &black, true, 0.03, i as u32))
+                }))
+            })
+            .collect()
+    }
+}
+
+impl crate::depthlink::DepthSource for DemoDepth {
+    fn describe(&self) -> String {
+        "demo depth camera (320x240, the Opera game)".to_string()
+    }
+
+    fn next_frame(&mut self) -> Result<crate::depth::DepthFrame> {
+        self.pacer.wait();
+        let index = self.shared.load(Ordering::SeqCst).min(self.pictures.len() - 1);
+        Ok((*self.pictures[index]).clone())
+    }
 }
 
 /// The source of the second camera. A real camera is the one `selection` names (none chosen: an error, which the
@@ -928,5 +1032,63 @@ mod tests {
     #[test]
     fn yuyv_rejects_short_buffer() {
         assert!(yuyv_to_rgb(&[0u8; 3], 2, 1).is_err());
+    }
+
+    /// Pictures kept in ten seconds from a camera that delivers 30 a second, with the jitter of a real one.
+    fn kept_from_a_30_fps_camera(fps: f32) -> usize {
+        let start = Instant::now();
+        let period = Duration::from_secs_f32(1.0 / 30.0);
+        let interval = Duration::from_secs_f32(1.0 / fps);
+        let mut decimator = Decimator::default();
+        let mut state = 12345u32;
+        (0..300)
+            .filter(|i| {
+                // Up to +-4 ms of jitter on each arrival.
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let jitter = Duration::from_micros(u64::from((state >> 16) % 8000));
+                let at = start + period * *i + jitter;
+                decimator.keep(at, interval)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_30_picture_camera_gives_the_rate_asked_for_not_half_of_it() {
+        // Asking for as many as the camera makes keeps them all (it once kept every other one: 15 a second).
+        assert!(kept_from_a_30_fps_camera(30.0) >= 295, "{}", kept_from_a_30_fps_camera(30.0));
+        // Asking for more than it can give keeps them all too.
+        assert!(kept_from_a_30_fps_camera(60.0) >= 295);
+        // In between, close to what was asked for.
+        let kept = kept_from_a_30_fps_camera(25.0);
+        assert!((240..=262).contains(&kept), "{kept}");
+        let kept = kept_from_a_30_fps_camera(10.0);
+        assert!((97..=103).contains(&kept), "{kept}");
+        let kept = kept_from_a_30_fps_camera(3.0);
+        assert!((29..=31).contains(&kept), "{kept}");
+        let kept = kept_from_a_30_fps_camera(1.0);
+        assert!((9..=11).contains(&kept), "{kept}");
+    }
+
+    #[test]
+    fn the_schedule_starts_again_after_a_long_pause() {
+        let start = Instant::now();
+        let interval = Duration::from_millis(100);
+        let mut decimator = Decimator::default();
+        assert!(decimator.keep(start, interval));
+        assert!(!decimator.keep(start + Duration::from_millis(40), interval));
+        // The program was stopped for ten seconds: one picture is kept, not a hundred to catch up.
+        let later = start + Duration::from_secs(10);
+        assert!(decimator.keep(later, interval));
+        assert!(!decimator.keep(later + Duration::from_millis(30), interval));
+        assert!(decimator.keep(later + Duration::from_millis(100), interval));
+    }
+
+    #[test]
+    fn the_rate_can_be_changed_while_a_camera_runs() {
+        let rate = FrameRate::new(25.0);
+        assert!((rate.interval().as_secs_f32() - 0.04).abs() < 1e-6);
+        rate.set(5.0);
+        assert!((rate.fps() - 5.0).abs() < 1e-6);
+        assert!((rate.interval().as_secs_f32() - 0.2).abs() < 1e-6);
     }
 }

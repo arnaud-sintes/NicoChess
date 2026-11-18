@@ -5,6 +5,49 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.7.0
+
+**A page that follows the game as it is played, and more pictures a second.**
+
+- **Pictures per second.** Asking the camera for 25 or 30 pictures a second used to give 15: a picture was kept only
+  once a whole interval had passed since the last kept one, so a 30 pictures a second camera lost every other picture.
+  The pictures to keep now follow a schedule, and 25 give 25 (measured on the D415: 3, 10, 25 and 30 asked, 3.0, 10.3,
+  25.1 and 29.4 delivered, at about 18% of one core at 25). The default is 25 on Windows (3 elsewhere, for small boxes),
+  there is a slider on the Calibrate tab (kept in `rate.json`), and `--fps` still sets it.
+- **The board is still for a time, not for a number of pictures.** `stable_time` (`--stable-time`, 0.35 s) says how long
+  the board must have been still, and a picture is compared with the one 0.15 s before it (`motion_span`), so a hand
+  that creeps in is noticed at 25 pictures a second too, and a move is noticed as soon at 25 as at 3. On the demo
+  game, the delay from a move on the board to the page being told went from 1.33 s (3 a second) to 0.74 s (25).
+- **Following a board that moved is off the camera thread.** Looking for the board (which takes a while on a small
+  machine) and writing the moved calibration now happen on a thread of their own, so that the pictures that follow
+  are not late or stale. The tracker itself still runs on the picture thread, under the engine's lock: on a clear game
+  it takes about 0.4 ms a picture (3 ms at the most); the hard case of three moves between two pictures was not timed.
+- **The pages are told first.** The game used to be written to the disk, with a flush, before the pages were told, on
+  the thread that reads the camera: a slow disk (a synchronised or scanned folder) made the page late and the camera
+  thread late. The pages are told at once and a thread of its own writes the game; the pages ask for a change of the
+  event stream 15 ms after the last one instead of 80.
+- **The clock starts with the first move**, which is at 0 (it used to start when the game was started on the page).
+  The page shows how long each player has been thinking, and the clock of the player to move runs; the replay shows the
+  same up to the move shown. In the PGN the first move has `[%emt 0:00:00]`.
+- **Undo.** The board still shows the move that was taken back, so the tracker used to find it again, or to learn the
+  look of the squares from it. After an Undo nothing is decided and nothing is learned until the board shows the
+  position again (the tracker then goes on by itself) or the move that was played is entered; meanwhile the moves the
+  picture suggests, except the one taken back, are offered. New status `undone`.
+- **Moving the pieces by hand on the board.** Drag a piece to its square, or tap it and then the square: the squares it
+  may go to are shown (`GET /api/game/legal`), and a pawn that reaches the last rank asks what it becomes. Typing a move
+  still works.
+- **A button turns the board** a quarter at a time (kept in the browser), on the live board and in the replay.
+- **The highlight of the last move** also shows the rook after castling and all the moves that were seen in one picture
+  (`together` on the move, in the game file).
+- Recordings keep a picture every 150 ms at most while something is going on (`busy_every`), not all of the 25 a
+  second.
+- **Depth camera (Windows, optional).** A camera with a depth part, such as the Intel RealSense D415, shows up as one
+  camera with a box "Also use the depth of this camera". The depth is read through Media Foundation, turned into a
+  picture of how far everything stands above the board, and put together with the colour pictures: it tells squares
+  with a piece from empty ones, whatever the light, and stands in where a hand hides a square from the colour camera.
+  `--source demo --depth-camera` shows it without hardware. Tried on synthetic boards, and on live depth pictures with
+  synthetic pieces added; **not yet on a real board with pieces**.
+
 ## 0.6.0
 
 **Two cameras (optional).** A second camera on the opposite side of the board sees what the first cannot: the squares

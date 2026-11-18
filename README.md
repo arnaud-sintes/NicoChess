@@ -15,6 +15,10 @@ and keeps adapting to the light. The program itself knows the rules and the posi
 After each pause in the movement it scores every way the game may have gone on (no move, any legal move, up to three
 moves played between two pictures) by how well the picture fits, and takes the likeliest one when it is clearly ahead.
 
+- **Quick.** A move is on the page about 0.7 s after it is made (25 pictures a second; the slider on the Calibrate tab
+  sets the rate). The page shows how long each player has been thinking from the first move, can be turned a quarter
+  at a time, and a move can be made on it by dragging a piece (or tapping it and then the square) when the camera
+  missed it.
 - **Not sure?** A move that leads only narrowly is taken anyway and flagged under the board ("Not completely sure about
   d4, 78%"), with the other likely moves and their chances as buttons that replace it, and an Undo. When nothing is
   likely enough the page asks. Moves can always be typed, and tracking resumes by itself afterwards.
