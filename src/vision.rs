@@ -448,7 +448,16 @@ impl Models {
     /// reached). `weight` says how much this picture counts: 1 for an ordinary confirmed move, more for
     /// a position the person has set by hand.
     pub fn update(&mut self, features: &[Features], labels: &Grid, weight: f32) {
+        self.update_except(features, labels, weight, &[]);
+    }
+
+    /// The same, but the squares marked in `skip` (a hand over them, a picture that does not fit what they should
+    /// show) are left as they are: what a hand looks like must not become the look of a square.
+    pub fn update_except(&mut self, features: &[Features], labels: &Grid, weight: f32, skip: &[bool]) {
         for square in 0..64.min(features.len()) {
+            if skip.get(square).copied().unwrap_or(false) {
+                continue;
+            }
             let cell = labels[square];
             let c = cell.index();
             let v = features[square].v;

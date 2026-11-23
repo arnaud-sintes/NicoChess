@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "nicochess"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "httparse",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "nicochess-android"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "jni",
  "libc",

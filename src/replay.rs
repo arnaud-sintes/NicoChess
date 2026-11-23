@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 pub struct TrackerOverrides {
     pub stable_frames: Option<usize>,
     pub stable_time: Option<f32>,
+    pub motion_span: Option<f32>,
     pub motion_threshold: Option<f32>,
     pub max_excess: Option<f32>,
     pub margin: Option<f32>,
@@ -40,7 +41,7 @@ impl TrackerOverrides {
         TrackerConfig {
             stable_frames: self.stable_frames.unwrap_or(config.stable_frames),
             stable_time: self.stable_time.unwrap_or(config.stable_time),
-            motion_span: config.motion_span,
+            motion_span: self.motion_span.unwrap_or(config.motion_span),
             motion_threshold: self.motion_threshold.unwrap_or(config.motion_threshold),
             max_excess: self.max_excess.unwrap_or(config.max_excess),
             margin: self.margin.unwrap_or(config.margin),
@@ -56,6 +57,9 @@ impl TrackerOverrides {
         }
         if let Some(v) = self.stable_time {
             parts.push(format!("stable_time={v}"));
+        }
+        if let Some(v) = self.motion_span {
+            parts.push(format!("motion_span={v}"));
         }
         if let Some(v) = self.motion_threshold {
             parts.push(format!("motion_threshold={v}"));
@@ -209,9 +213,10 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     );
     let _ = writeln!(
         text,
-        "  tracker: stable_frames={} stable_time={} motion_threshold={} max_excess={} margin={} soft_margin={} max_plies={}{}",
+        "  tracker: stable_frames={} stable_time={} motion_span={} motion_threshold={} max_excess={} margin={} soft_margin={} max_plies={}{}",
         config.stable_frames,
         config.stable_time,
+        config.motion_span,
         config.motion_threshold,
         config.max_excess,
         config.margin,

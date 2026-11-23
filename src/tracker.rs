@@ -76,26 +76,34 @@ impl Default for TrackerConfig {
     }
 }
 
-/// How long the board must have been still before the tracker looks at it, in seconds: about as long as the three
-/// pictures in a row of the first versions took at 3 pictures a second, and a little less.
-const STABLE_TIME: f32 = 0.35;
+/// How long the board must have been still before the tracker looks at it, in seconds. It was 0.35, about as long
+/// as the three pictures in a row of the first versions took at 3 pictures a second. That, with `MOTION_SPAN`,
+/// meant half a second without a hand over the board, and in a fast game (a move every second or so) the hands are
+/// hardly ever off it for that long: moves ran together and the tracker was lost for good. A shorter time is safe now
+/// that a square a hand covers is not believed (see `Evidence::hide_covered`) and a picture with one is not learned from.
+const STABLE_TIME: f32 = 0.20;
 
-/// The still time of recordings made before there was one.
+/// The still time of recordings made before there was one (they were made at 3 pictures a second, with the first
+/// versions' 0.35 s, and a replay must judge them as they were played).
 fn default_stable_time() -> f32 {
-    STABLE_TIME
+    0.35
 }
 
 /// How far back the picture is that a new one is compared with, to see whether something moved, in seconds.
-const MOTION_SPAN: f32 = 0.15;
+const MOTION_SPAN: f32 = 0.10;
 
+/// The span of recordings made before it could be set (0.15 s, as it was when it was introduced).
 fn default_motion_span() -> f32 {
-    MOTION_SPAN
+    0.15
 }
 
 /// The soft margin of recordings made before there was one.
 fn default_soft_margin() -> f32 {
     SOFT_MARGIN
 }
+
+/// One move is not taken when two moves explain the picture better than it by this many margins (see `decide`).
+const PAIR_LEAD: f32 = 1.5;
 
 /// A move that leads by at least this much (nats) is taken even though it is not clear, and flagged as doubtful.
 const SOFT_MARGIN: f32 = 2.0;
@@ -123,6 +131,29 @@ const NO_CHANGE_PENALTY: f32 = 14.0;
 /// How much a single square may be unexplained, in nats: a leaning piece or a glare spoils several squares a
 /// little, a piece that was knocked over or a hand left on the board spoils one square a lot.
 const SQUARE_LIMIT: f32 = 45.0;
+/// A square that none of empty, white and black explains by this many nats (beyond what it usually shows) is covered: a
+/// hand, an arm or a sleeve is over it. What it shows says nothing about the game, so it counts the same for every
+/// explanation; the likeliest one is no longer the one that moves a covered piece away because a hand looks more like
+/// an empty square than like a white piece.
+const COVERED: f32 = 12.0;
+/// With more squares covered than this there is an arm over the board: nothing is decided until it has gone.
+const MAX_COVERED: usize = 20;
+/// When the tracker has been unsure for this long, in seconds, with the board still, it looks for a longer way the game
+/// may have gone: more moves than the three that are always tried (the players were faster than the tracker, or it
+/// missed some). Without it, a tracker that is more than three moves behind can never explain the board again.
+const DEEP_AFTER: f32 = 0.5;
+/// The most moves looked for, and how many explanations are kept at each step of the search.
+const DEEP_PLIES: u8 = 8;
+const DEEP_WIDTH: usize = 80;
+/// A square whose picture misfits what the position says it holds by more than this is not learned from by an ordinary
+/// confirmed move (a hand that rests on a piece, and looks somewhat like the other colour, would otherwise become the
+/// look of that piece). When the models are known to be behind (a drifting light, see `ADAPT_FACTOR`) they learn all
+/// that the move was accepted with.
+const TEACH_LIMIT: f32 = 40.0;
+/// A square is covered only if it also differs from the last confirmed picture by this much (half of `difference`, which
+/// is about `DIM` / 2 when nothing changed): a square that is odd but has not changed (a glare, a shadow that stays, the
+/// light that drifts) is the models being behind, and they learn it; it is not a hand.
+const DISTURBED: f32 = 20.0;
 /// Nothing or one move is believed on its own, without looking at several moves, when it leaves at most this
 /// fraction of `max_excess` unexplained.
 const SIMPLE_FRACTION: f32 = 0.5;
@@ -312,6 +343,9 @@ struct View {
     /// What the board looked like in this camera (light corrected) when the position was last confirmed. Absent
     /// after a person set the position by hand, until a picture of it is seen.
     reference: Option<Vec<Features>>,
+    /// The squares of `reference` that showed a hand when it was taken: they say nothing about what the board looked
+    /// like, so what changed there is not known until a picture without the hand has been seen.
+    stale: [bool; 64],
     /// False while the camera gives no pictures (off, unplugged, too slow): the others do not wait for it.
     active: bool,
     /// The view only helps: it is the height picture of a depth camera (see `depth`). It says which squares hold a
@@ -322,7 +356,13 @@ struct View {
 
 impl View {
     fn new(cfg: &TrackerConfig) -> View {
-        View { sampler: None, models: None, gate: Gate::new(cfg), reference: None, active: true, advisory: false }
+        View { sampler: None, models: None, gate: Gate::new(cfg), reference: None, stale: [false; 64], active: true, advisory: false }
+    }
+
+    /// A picture of the board, all of it known, is the reference from now on.
+    fn set_reference(&mut self, features: Vec<Features>) {
+        self.reference = Some(features);
+        self.stale = [false; 64];
     }
 
     /// An advisory view has seen the board when it has been given a picture; it is not waited for to be still.
@@ -372,6 +412,11 @@ pub struct Tracker {
     undone: bool,
     /// The move that was taken back, which is not offered again.
     undone_move: Option<String>,
+    /// The squares that no content explained in the picture last judged (see [`COVERED`]).
+    covered: Vec<bool>,
+    /// When the tracker became unsure (valid while `unsure`), and the picture it last looked for a longer way for.
+    unsure_since: Option<Instant>,
+    deep_tried: Option<Grid>,
 }
 
 /// What the board should look like for a position.
@@ -399,6 +444,10 @@ struct Evidence {
     change: Option<(Vec<f32>, Vec<f32>)>,
     /// A height picture was given but contradicts the colour cameras too much, and was left out.
     ignored: bool,
+    /// The squares that no content explains (see [`COVERED`]): they count the same for every explanation.
+    covered: Vec<bool>,
+    /// The squares whose reference picture showed a hand (see `View::stale`), where nothing is known about a change.
+    unknown: Vec<bool>,
 }
 
 /// One camera's picture of the still board, with what is known about its squares.
@@ -406,6 +455,8 @@ struct Look<'a> {
     models: &'a Models,
     features: &'a [Features],
     reference: Option<&'a [Features]>,
+    /// The squares of the reference that show a hand, not the board: what changed there is not known.
+    stale: &'a [bool],
     /// From an advisory view: it says whether a square is occupied, and nothing else.
     advisory: bool,
 }
@@ -425,6 +476,8 @@ struct Part {
     costs: Vec<[f32; 3]>,
     typical: Vec<[f32; 3]>,
     change: Option<(Vec<f32>, Vec<f32>)>,
+    /// The squares of the reference that showed a hand: nothing is known about whether they changed.
+    unknown: Vec<bool>,
 }
 
 impl Part {
@@ -432,7 +485,13 @@ impl Part {
         let change = look.reference.map(|before| {
             let mut unchanged = Vec::with_capacity(64);
             let mut changed = Vec::with_capacity(64);
-            for (now, then) in look.features.iter().zip(before).take(64) {
+            for (square, (now, then)) in look.features.iter().zip(before).take(64).enumerate() {
+                if look.stale.get(square).copied().unwrap_or(false) {
+                    // The reference showed a hand here: nothing is known about whether the square changed.
+                    unchanged.push(0.0);
+                    changed.push(0.0);
+                    continue;
+                }
                 let d = difference(now, then);
                 // Unchanged: how strange the difference is. Changed: how strange it is that there is none.
                 unchanged.push(0.5 * d);
@@ -440,7 +499,8 @@ impl Part {
             }
             (unchanged, changed)
         });
-        Part { costs: look.models.costs(look.features), typical: look.models.typical().to_vec(), change }
+        let unknown = (0..64).map(|square| look.stale.get(square).copied().unwrap_or(false)).collect();
+        Part { costs: look.models.costs(look.features), typical: look.models.typical().to_vec(), change, unknown }
     }
 
     /// How far a camera can be believed about a square: it can when one of the three contents explains what it
@@ -465,7 +525,33 @@ impl Evidence {
         for look in looks.iter().filter(|l| l.advisory && !main.iter().any(|m| std::ptr::eq(*m, *l))) {
             evidence.add_occupancy(&Part::of(look), &colour_trust);
         }
+        evidence.hide_covered();
         evidence
+    }
+
+    /// Squares that no content explains are made neutral: every content costs the same there, and so does a change.
+    /// (A hand that rests over a white piece fits "empty" better than "white", so without this the likeliest
+    /// explanation is whichever one moves that piece away, and nothing the hand does not cover is believed.)
+    fn hide_covered(&mut self) {
+        for square in 0..64 {
+            let misfit = (0..3).map(|c| (self.costs[square][c] - self.typical[square][c] - SLACK).max(0.0)).fold(f32::MAX, f32::min);
+            if misfit <= COVERED {
+                continue;
+            }
+            // Odd, but the same as when the position was last confirmed: the models are behind (or a glare, a shadow),
+            // not a hand that came. (Where the reference showed a hand, or there is none, nothing says it did not.)
+            let disturbed = self.unknown[square] || self.change.as_ref().is_none_or(|(unchanged, _)| unchanged[square] > DISTURBED);
+            if !disturbed {
+                continue;
+            }
+            self.covered[square] = true;
+            let flat = self.typical[square].iter().copied().fold(f32::MAX, f32::min);
+            self.costs[square] = [flat; 3];
+            if let Some((unchanged, changed)) = self.change.as_mut() {
+                unchanged[square] = 0.0;
+                changed[square] = 0.0;
+            }
+        }
     }
 
     /// What a height picture says: for each square, how much more each content costs than the one the height picture
@@ -521,7 +607,18 @@ impl Evidence {
         if parts.len() == 1 {
             let only = parts.remove(0);
             let trust = (0..64).map(|s| only.trust(s)).collect();
-            return (Evidence { costs: only.costs, typical: only.typical, base, change: only.change, ignored: false }, trust);
+            return (
+                Evidence {
+                    costs: only.costs,
+                    typical: only.typical,
+                    base,
+                    change: only.change,
+                    ignored: false,
+                    covered: vec![false; 64],
+                    unknown: only.unknown,
+                },
+                trust,
+            );
         }
         let trust: Vec<Vec<f32>> = parts.iter().map(|p| (0..64).map(|s| p.trust(s)).collect()).collect();
         let mix = |value: &dyn Fn(&Part, usize) -> Option<f32>, square: usize| -> f32 {
@@ -549,7 +646,8 @@ impl Evidence {
             (unchanged, changed)
         });
         let best_trust = (0..64).map(|s| trust.iter().map(|t| t[s]).fold(0.0f32, f32::max)).collect();
-        (Evidence { costs, typical, base, change, ignored: false }, best_trust)
+        let unknown = (0..64).map(|s| parts.iter().all(|p| p.unknown[s])).collect();
+        (Evidence { costs, typical, base, change, ignored: false, covered: vec![false; 64], unknown }, best_trust)
     }
 
     /// How the picture fits a board: the misfit including what changed since the last confirmed picture, how
@@ -614,8 +712,19 @@ impl Pool {
 
     /// Adds every way to play one more move after the explanations of `depth - 1` moves.
     fn expand(&mut self, depth: u8, evidence: &Evidence) {
-        let parents: Vec<usize> =
+        self.expand_with(depth, evidence, usize::MAX, depth < 3);
+    }
+
+    /// The same, from the `width` likeliest explanations of `depth - 1` moves only (a beam: for a long search, where
+    /// all the ways to play eight moves would be far too many), and with the positions of the new ones kept or not
+    /// (they are not kept for the last depth looked at: nothing is played from them).
+    fn expand_with(&mut self, depth: u8, evidence: &Evidence, width: usize, keep: bool) {
+        let mut parents: Vec<usize> =
             (0..self.hyps.len()).filter(|&i| self.hyps[i].plies + 1 == depth && self.positions[i].is_some()).collect();
+        if parents.len() > width {
+            parents.sort_by(|&a, &b| self.hyps[a].score.total_cmp(&self.hyps[b].score));
+            parents.truncate(width);
+        }
         for parent in parents {
             let Some(position) = self.positions[parent].clone() else { continue };
             for mv in position.legal_moves() {
@@ -626,7 +735,6 @@ impl Pool {
                 let (nll, excess, worst) = evidence.fit(&grid);
                 let score = nll + PLY_PENALTY * f32::from(depth) + EXTRA_PLY_PENALTY * f32::from(depth - 1);
                 let hypothesis = Hypothesis { parent: Some(parent), mv: Some(mv), plies: depth, excess, worst, score };
-                let keep = depth < 3;
                 match self.seen.get(&key) {
                     Some(&i) => {
                         // Promotions to different pieces look the same: keep the queen. Else the shorter way wins.
@@ -708,6 +816,9 @@ impl Tracker {
             depth_ignored: false,
             undone: false,
             undone_move: None,
+            covered: vec![false; 64],
+            unsure_since: None,
+            deep_tried: None,
         }
     }
 
@@ -902,7 +1013,7 @@ impl Tracker {
                     if let Ok(models) = Models::learn(&learned, &labels) {
                         let view = &mut self.views[i];
                         view.models = Some(models);
-                        view.reference = Some(learned);
+                        view.set_reference(learned);
                         learned_any = true;
                     }
                 }
@@ -966,12 +1077,24 @@ impl Tracker {
                 .iter()
                 .filter_map(|(i, features)| {
                     let view = &self.views[*i];
-                    Some(Look { models: view.models.as_ref()?, features, reference: view.reference.as_deref(), advisory: view.advisory })
+                    Some(Look {
+                        models: view.models.as_ref()?,
+                        features,
+                        reference: view.reference.as_deref(),
+                        stale: &view.stale,
+                        advisory: view.advisory,
+                    })
                 })
                 .collect();
             Evidence::new(&looks, expected)
         };
         self.depth_ignored = evidence.ignored;
+        self.covered.clone_from(&evidence.covered);
+        if self.covered.iter().filter(|&&c| c).count() > MAX_COVERED {
+            // An arm over the board, not a hand over a square: wait until it has gone.
+            self.still = false;
+            return Detection::Nothing;
+        }
         let grid = Models::read(&evidence.costs);
         if self.undone {
             // Is the board showing the position again? It is when "nothing happened" is the best of the explanations,
@@ -999,10 +1122,16 @@ impl Tracker {
             }
         }
         let detection = if self.last_eval == Some(grid) {
-            if self.unsure { Detection::Unsure { candidates: self.candidates.clone() } } else { Detection::Nothing }
+            if self.unsure {
+                // The same picture again: it may be time to look for a longer way (see `DEEP_AFTER`).
+                self.try_deeper(grid, &evidence, &seen, since, now)
+                    .unwrap_or_else(|| Detection::Unsure { candidates: self.candidates.clone() })
+            } else {
+                Detection::Nothing
+            }
         } else {
             self.last_eval = Some(grid);
-            self.evaluate(&evidence, &seen, since)
+            self.evaluate(&evidence, &seen, since, now, grid)
         };
         // The position is confirmed: a camera that came late, with nothing learned, learns it now.
         if !self.unsure && !matches!(detection, Detection::Unsure { .. }) {
@@ -1022,14 +1151,14 @@ impl Tracker {
             let learned = view.gate.average();
             if let Ok(models) = Models::learn(&learned, &labels) {
                 view.models = Some(models);
-                view.reference = Some(learned);
+                view.set_reference(learned);
                 view.gate.reset();
             }
         }
     }
 
     /// Which explanation of the still picture is the likeliest, and whether it is clear enough to believe.
-    fn evaluate(&mut self, evidence: &Evidence, seen: &Seen, since: Instant) -> Detection {
+    fn evaluate(&mut self, evidence: &Evidence, seen: &Seen, since: Instant, now: Instant, grid: Grid) -> Detection {
         self.doubt = None;
 
         // Nothing, one move, two moves: always looked at together (a reply played before the picture was
@@ -1051,13 +1180,71 @@ impl Tracker {
             }
         }
 
-        // Nothing is clear: offer the likeliest explanations.
+        // Nothing is clear, because a hand hides a square that one of the likeliest explanations changes (the piece it
+        // holds, or the square it was put on): that is not a board nobody can explain, it is a board that cannot be
+        // seen yet. The tracker waits for the picture to change when the hand goes, and says nothing.
+        if !self.unsure && self.hides_a_change(&pool) {
+            return Detection::Nothing;
+        }
+        // If the tracker has been unsure for a while, a longer way is looked for.
+        if let Some(detection) = self.try_deeper(grid, evidence, seen, since, now) {
+            return detection;
+        }
+        // Else the likeliest explanations are offered.
         let (best, _) = pool.best_within(3);
         let best_score = pool.hyps[best].score;
         let candidates = self.likeliest(&pool, 4, None, best_score);
+        if !self.unsure {
+            self.unsure_since = Some(now);
+        }
         self.unsure = true;
         self.candidates = candidates.clone();
         Detection::Unsure { candidates }
+    }
+
+    /// Whether, among the explanations that are about as likely as the likeliest one, there is one that changes a square
+    /// that a hand covers (see [`COVERED`]): then what is unclear is what the hand hides.
+    fn hides_a_change(&self, pool: &Pool) -> bool {
+        if !self.covered.iter().any(|&c| c) {
+            return false;
+        }
+        let mut order: Vec<usize> = (0..pool.hyps.len()).filter(|&i| pool.hyps[i].plies <= 3).collect();
+        order.sort_by(|&a, &b| pool.hyps[a].score.total_cmp(&pool.hyps[b].score));
+        let Some(&first) = order.first() else { return false };
+        let best = pool.hyps[first].score;
+        let before = expected_grid(&self.position);
+        order.iter().take(6).filter(|&&i| pool.hyps[i].score - best < self.cfg.margin).any(|&i| {
+            let mut position = self.position.clone();
+            for mv in pool.moves(i) {
+                position.play_unchecked(mv);
+            }
+            let after = expected_grid(&position);
+            (0..64).any(|square| before[square] != after[square] && self.covered[square])
+        })
+    }
+
+    /// When the tracker has been unsure for `DEEP_AFTER` and has not looked at this picture yet: looks for four to
+    /// `DEEP_PLIES` moves that explain it, and takes them when they are much clearer than every other explanation
+    /// (more clearly the more moves there are), with a note of doubt, so that the person is told. A beam search: only
+    /// the likeliest explanations at each step are played on.
+    fn try_deeper(&mut self, grid: Grid, evidence: &Evidence, seen: &Seen, since: Instant, now: Instant) -> Option<Detection> {
+        let waited = self.unsure_since.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() >= DEEP_AFTER);
+        if !self.unsure || self.held || self.undone || !waited || self.deep_tried == Some(grid) {
+            return None;
+        }
+        self.deep_tried = Some(grid);
+        let mut pool = Pool::new(&self.position, evidence);
+        for depth in 1..=DEEP_PLIES {
+            pool.expand_with(depth, evidence, DEEP_WIDTH, depth < DEEP_PLIES);
+        }
+        let (best, runner_up) = pool.best_within(DEEP_PLIES);
+        let plies = pool.hyps[best].plies;
+        // Fewer moves were judged already (and found unclear).
+        if plies < 4 || pool.hyps[best].excess > SIMPLE_FRACTION * self.cfg.max_excess {
+            return None;
+        }
+        let scale = 1.0 + 0.5 * f32::from(plies - 1);
+        self.accept_doubtful(&pool, best, runner_up, self.cfg.margin * scale, seen, since)
     }
 
     /// Accepts the likeliest explanation if it is clear, or learns the picture if the board has not
@@ -1081,7 +1268,15 @@ impl Tracker {
             // is adopted and the models learn from it.
             return self.accept(pool, 0, simple_runner_up, seen, since);
         }
-        if pool.hyps[simple].excess <= limit * self.cfg.max_excess {
+        // Two moves that explain the picture clearly better than the best of nothing and one move are not "one move that
+        // fits well enough": the reply was played too, and the one move only looks right because it explains most of what
+        // changed. (Taking it leaves the reply as a change nobody explained, and the next move is then judged from a wrong
+        // position.)
+        let (pair, _) = pool.best_within(2);
+        let pair_is_clearly_better = pool.hyps[pair].plies == 2
+            && pool.hyps[simple].plies >= 1
+            && pool.hyps[simple].score - pool.hyps[pair].score >= PAIR_LEAD * self.cfg.margin;
+        if pool.hyps[simple].excess <= limit * self.cfg.max_excess && !pair_is_clearly_better {
             if simple_runner_up - pool.hyps[simple].score < self.cfg.margin {
                 // Two simple explanations fit nearly alike: more moves would not help. If one leads a little,
                 // it is taken and flagged; else the person is asked.
@@ -1161,6 +1356,7 @@ impl Tracker {
                 self.teach(seen, ADAPT_WEIGHT);
                 self.remember(seen);
             }
+            self.refresh_stale(seen);
             self.resync_pending = false;
             self.unsure = false;
             return Some(Detection::Nothing);
@@ -1190,20 +1386,71 @@ impl Tracker {
         })
     }
 
-    /// The models of every camera learn its picture as the look of the current position.
+    /// The models of every camera learn its picture as the look of the current position, except the squares a hand
+    /// covers, or that do not look like what the position says they hold: those would teach a hand as a piece, and
+    /// every later picture of the square would then misfit once the hand has gone. A picture that a person
+    /// confirmed (the heavy weight) is learned whole.
     fn teach(&mut self, seen: &Seen, weight: f32) {
         let labels = expected_grid(&self.position);
+        // What a person confirmed is learned whole. Else a hand's squares are skipped, and with an ordinary move the
+        // squares that do not look like what they should hold, which a hand that looks like the other colour is.
+        let confirmed = weight >= RESYNC_WEIGHT;
+        let ordinary = weight < ADAPT_WEIGHT;
         for (i, features) in seen {
-            if let Some(models) = self.views[*i].models.as_mut() {
-                models.update(features, &labels, weight);
+            let Some(models) = self.views[*i].models.as_mut() else { continue };
+            let skip: Vec<bool> = if confirmed {
+                Vec::new()
+            } else {
+                let (costs, typical) = (models.costs(features), models.typical());
+                (0..64)
+                    .map(|square| {
+                        let c = labels[square].index();
+                        self.covered[square] || (ordinary && costs[square][c] - typical[square][c] - SLACK > TEACH_LIMIT)
+                    })
+                    .collect()
+            };
+            models.update_except(features, &labels, weight, &skip);
+        }
+    }
+
+    /// What each camera showed is what the board looks like in the position the game is in now. A square that shows a
+    /// hand is kept as it was and marked: the next picture without the hand says what changed there.
+    fn remember(&mut self, seen: &Seen) {
+        for (i, features) in seen {
+            let covered = &self.covered;
+            let view = &mut self.views[*i];
+            match view.reference.as_mut() {
+                Some(reference) if reference.len() == features.len() => {
+                    for square in 0..64.min(features.len()) {
+                        if covered[square] {
+                            view.stale[square] = true;
+                        } else {
+                            reference[square] = features[square];
+                            view.stale[square] = false;
+                        }
+                    }
+                }
+                _ => {
+                    view.set_reference(features.clone());
+                    let n = 64.min(features.len());
+                    view.stale[..n].copy_from_slice(&covered[..n]);
+                }
             }
         }
     }
 
-    /// What each camera showed is what the board looks like in the position the game is in now.
-    fn remember(&mut self, seen: &Seen) {
+    /// The board shows the position, and a square that showed a hand last time does not now: its reference is the
+    /// picture of it that has no hand.
+    fn refresh_stale(&mut self, seen: &Seen) {
         for (i, features) in seen {
-            self.views[*i].reference = Some(features.clone());
+            let view = &mut self.views[*i];
+            let Some(reference) = view.reference.as_mut() else { continue };
+            for square in 0..64.min(features.len()) {
+                if view.stale[square] && !self.covered[square] {
+                    reference[square] = features[square];
+                    view.stale[square] = false;
+                }
+            }
         }
     }
 
@@ -1225,6 +1472,9 @@ mod depth_tests;
 
 #[cfg(test)]
 mod timing_tests;
+
+#[cfg(test)]
+mod blitz_tests;
 
 #[cfg(test)]
 mod tests {

@@ -47,7 +47,8 @@ fn time_to_find_e4(spacing: Duration) -> Duration {
     assert!(rig.show(&synthetic::start_grid(), 3.0).is_empty());
     let mut lifted = steps[0].before;
     lifted[usize::from(steps[0].mv.from().unwrap())] = None;
-    assert!(rig.show(&lifted, 0.4).is_empty());
+    // A piece held in the air for less than the still time is not looked at.
+    assert!(rig.show(&lifted, 0.15).is_empty());
     let found = rig.show(&steps[0].after, 3.0);
     match found.as_slice() {
         [(Detection::Move { mv, .. }, at)] => {

@@ -5,6 +5,38 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.9.0
+
+**Fast games.** A tester reported that the program works at normal speed and "does not work at all" in blitz. Three
+independent audits (Claude Sonnet, Opus and Fable) found the same causes, and a new simulation of whole games with a
+hand that reaches, hovers, rests and leaves (`src/tracker/blitz_tests.rs`, 25 pictures a second on a fake clock)
+reproduced them: at the old settings the tracker was lost at a pause of 0.2 s between the hands, and for good as soon
+as a hand rested on a piece it had moved, even in a slow game. Processing speed was not the cause (0.4 to 0.8 ms per
+picture, 30 to 70 ms for the three-move search).
+
+- **The board is still after 0.2 s, not 0.5 s** (`stable_time` 0.35 to 0.2, `motion_span` 0.15 to 0.1; new option
+  `--motion-span`). Recordings made before keep their own values.
+- **A hand over a square is no longer taken for a piece.** A square that no content explains and that has changed since
+  the last confirmed picture counts the same for every explanation, so that a hand that rests on a white piece (which
+  looks more like an empty square) no longer makes "the piece moved away" the likeliest explanation. Such a square is
+  not learned from, either: before, a move accepted while a hand rested on it taught the models the colour of the hand,
+  and every correct explanation was then rejected for the rest of the game. When the unclear part is a hidden square
+  the tracker waits for the hand to go and says nothing, instead of showing "unsure".
+- **A tracker that is far behind finds its way back.** More than three moves behind used to be final (only a click
+  helped). Now, once the board has been still for half a second while unsure, a beam search of up to eight moves
+  looks for the sequence, and takes it only when it is much clearer than anything else, flagged as doubtful. The order
+  of the moves of one side cannot be known from a board, so it may differ from the order played.
+- **One move is not taken when two were played** and a pair explains the picture clearly better.
+- Measured on the synthetic stress test (`examples/stress.rs`) the numbers do not get worse: better in three of six
+  conditions (hard 96 to 97%, dark 91 to 93%, noisy 96 to 97%), 99 to 98% in drift (4 moves typed, was 2), catch-up
+  unchanged at 94% (2 wrong, was 1).
+
+**Limits.** With no moment at all between two hands (a move every second with the hands never off the board) the board
+is never still, and the tracker only catches up in bursts, with the order of moves wrong. Only simulated hands (discs)
+were tried: no real board, camera, shadow or sleeve. The covered-square threshold (12 nats) and the 0.2 s are untuned on
+real pictures; `--stable-time` and `--motion-span` change the timing, and `--record` then `--replay` shows what a
+change does to a real game.
+
 ## 0.8.0
 
 The first full release since 0.6.0: it holds everything of the test builds 0.7.0 and 0.7.1 (the faster page, the

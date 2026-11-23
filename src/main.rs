@@ -63,7 +63,10 @@ OPTIONS:
 
   Tuning the move detection:
     --stable-frames <N>      pictures in a row that must agree   [default: 3]
-    --stable-time <S>        seconds the board must be still     [default: 0.35]
+    --stable-time <S>        seconds the board must be still     [default: 0.2]
+    --motion-span <S>        a picture is compared with the one taken this many seconds before, to see whether
+                             something moves (a hand that creeps in changes little from one picture to the next)
+                             [default: 0.1]
     --motion-threshold <X>   colour change that means 'a hand is there'  [default: 4]
     --max-excess <X>         misfit left unexplained that is still accepted (nats)  [default: 60]
     --margin <X>             how much likelier than the runner-up a move must be (nats)  [default: 6]
@@ -127,6 +130,7 @@ fn run() -> Result<()> {
     let overrides = TrackerOverrides {
         stable_frames: args.opt_value_from_str("--stable-frames")?,
         stable_time: args.opt_value_from_str("--stable-time")?,
+        motion_span: args.opt_value_from_str("--motion-span")?,
         motion_threshold: args.opt_value_from_str("--motion-threshold")?,
         max_excess: args.opt_value_from_str("--max-excess")?,
         margin: args.opt_value_from_str("--margin")?,
