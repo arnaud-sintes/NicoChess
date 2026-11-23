@@ -19,6 +19,9 @@ moves played between two pictures) by how well the picture fits, and takes the l
   sets the rate). The page shows how long each player has been thinking from the first move, can be turned a quarter
   at a time, and a move can be made on it by dragging a piece (or tapping it and then the square) when the camera
   missed it.
+- **A chess clock, if you want one.** Give each player a time (and an extra time per move) when starting a game: the
+  clocks count down on every page, the space bar (or a big button) hands the time over as you move, there is a pause,
+  and the game ends when a time runs out.
 - **Not sure?** A move that leads only narrowly is taken anyway and flagged under the board ("Not completely sure about
   d4, 78%"), with the other likely moves and their chances as buttons that replace it, and an Undo. When nothing is
   likely enough the page asks. Moves can always be typed, and tracking resumes by itself afterwards.
@@ -155,7 +158,7 @@ The long version, with the threads and the files, is in [ARCHITECTURE.md](ARCHIT
 | `src/camera.rs`, `src/choice.rs`, `src/pushed.rs` | Frame sources (V4L2, Media Foundation, demo, synthetic board, image file); the choice among the cameras; a camera driven from outside (the Android app) |
 | `src/calibration.rs`, `src/boarddetect.rs`, `src/picture.rs` | Corners and the warp to the top-down board; finding the board by itself and following it; turn, brightness, contrast |
 | `src/vision.rs`, `src/tracker.rs` | The per-square models that keep learning; the stability gate, the evidence of one or two cameras and the match to a legal move |
-| `src/game.rs`, `src/store.rs`, `src/fsutil.rs`, `src/roles.rs` | The game record, SAN/UCI and PGN; one JSON file per game; atomic file writes; controller and viewers |
+| `src/game.rs`, `src/clock.rs`, `src/store.rs`, `src/fsutil.rs`, `src/roles.rs` | The game record, SAN/UCI and PGN; the chess clock; one JSON file per game; atomic file writes; controller and viewers |
 | `src/record.rs`, `src/replay.rs` | Recording of games and their replay |
 | `src/synthetic.rs` | A generated chessboard in perspective, for the demo, the tests and the benchmark (`examples/stress.rs`) |
 | `web/index.html` | The page (one file, built into the program) |

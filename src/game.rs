@@ -30,6 +30,44 @@ pub struct MoveRecord {
     /// the page shows them all as the last move.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub together: bool,
+    /// In a game with a clock: the seconds White and Black have left once this move is made (the extra time of the
+    /// move included). Taking a move back goes back to what the move before it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<[f64; 2]>,
+}
+
+/// The longest base time and extra time a clock may be given.
+pub const MAX_BASE_SECS: f64 = 36_000.0;
+pub const MAX_EXTRA_SECS: f64 = 3_600.0;
+
+/// How much time each player has, and how much is added to a player's time after each move. The same for both.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct TimeControl {
+    /// Seconds each player has at the start.
+    pub base: f64,
+    /// Seconds added to the time of a player after each move (0 for none).
+    #[serde(default)]
+    pub increment: f64,
+}
+
+impl TimeControl {
+    /// Checks what came from the page: a time of at least a second, and an extra time that is not negative.
+    pub fn checked(base: f64, increment: f64) -> Result<TimeControl> {
+        if !base.is_finite() || !(1.0..=MAX_BASE_SECS).contains(&base) {
+            bail!("the time of each player must be between 1 second and 10 hours");
+        }
+        if !increment.is_finite() || !(0.0..=MAX_EXTRA_SECS).contains(&increment) {
+            bail!("the extra time per move must be between 0 seconds and 1 hour");
+        }
+        Ok(TimeControl { base: round_tenths(base), increment: round_tenths(increment) })
+    }
+
+    /// The PGN `TimeControl` tag: seconds, then `+` and the extra seconds when there are some (`300+3`).
+    pub fn pgn(&self) -> String {
+        let base = self.base.round() as u64;
+        let extra = self.increment.round() as u64;
+        if extra > 0 { format!("{base}+{extra}") } else { base.to_string() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -45,8 +83,11 @@ pub struct GameRecord {
     pub moves: Vec<MoveRecord>,
     /// `1-0`, `0-1`, `1/2-1/2`, or `None` while the game is not finished.
     pub result: Option<String>,
-    /// How the game ended: checkmate, stalemate, resignation, ...
+    /// How the game ended: checkmate, stalemate, resignation, time forfeit, ...
     pub termination: Option<String>,
+    /// The clock of the game, when it was played against one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_control: Option<TimeControl>,
 }
 
 pub fn parse_fen(fen: &str) -> Result<Chess> {
@@ -137,7 +178,14 @@ impl GameRecord {
             moves: Vec::new(),
             result: None,
             termination: None,
+            time_control: None,
         })
+    }
+
+    /// The colour that makes the move number `index` (0 is the first move of the game).
+    pub fn mover(&self, index: usize) -> Color {
+        let first = self.start_position().map_or(Color::White, |p| p.turn());
+        if index.is_multiple_of(2) { first } else { first.other() }
     }
 
     pub fn start_position(&self) -> Result<Chess> {
@@ -179,7 +227,7 @@ impl GameRecord {
             bail!("illegal move");
         }
         let t = round_tenths(t.max(self.moves.last().map_or(0.0, |m| m.t)));
-        self.moves.push(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t, promotion_guess, together: false });
+        self.moves.push(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t, promotion_guess, together: false, left: None });
         Ok(self.moves.last().expect("just pushed"))
     }
 
@@ -217,7 +265,14 @@ impl GameRecord {
             let mut uci = last.uci[..4].to_string();
             uci.push(role.char());
             let mv = parse_move(&pos, &uci)?;
-            Ok(MoveRecord { uci: uci_of(mv), san: san_of(&pos, mv), t: last.t, promotion_guess: false, together: last.together })
+            Ok(MoveRecord {
+                uci: uci_of(mv),
+                san: san_of(&pos, mv),
+                t: last.t,
+                promotion_guess: false,
+                together: last.together,
+                left: last.left,
+            })
         })();
         match rebuilt {
             Ok(record) => {
@@ -314,6 +369,9 @@ impl GameRecord {
         tag("White", &self.white);
         tag("Black", &self.black);
         tag("Result", result);
+        if let Some(control) = &self.time_control {
+            tag("TimeControl", &control.pgn());
+        }
         if let Some(t) = &time {
             tag("UTCDate", &date);
             tag("UTCTime", t);
@@ -324,7 +382,7 @@ impl GameRecord {
         }
         // PGN only knows a few values; the detail stays in the JSON file.
         if let Some(why) = &self.termination {
-            tag("Termination", if why == "abandoned" { "abandoned" } else { "normal" });
+            tag("Termination", if why == "abandoned" || why == "time forfeit" { why } else { "normal" });
         }
         out.push('\n');
 
@@ -340,7 +398,20 @@ impl GameRecord {
             });
             tokens.push(record.san.clone());
             let spent = (record.t - previous_t).max(0.0).round() as u64;
-            tokens.push(format!("{{[%emt {}:{:02}:{:02}]}}", spent / 3600, spent / 60 % 60, spent % 60));
+            // With a clock, the time the player has left is given too (`[%clk]`, as other chess programs write it).
+            let left = record.left.map(|both| both[if pos.turn() == Color::White { 0 } else { 1 }].max(0.0).round() as u64);
+            tokens.push(match left {
+                Some(s) => format!(
+                    "{{[%emt {}:{:02}:{:02}] [%clk {}:{:02}:{:02}]}}",
+                    spent / 3600,
+                    spent / 60 % 60,
+                    spent % 60,
+                    s / 3600,
+                    s / 60 % 60,
+                    s % 60
+                ),
+                None => format!("{{[%emt {}:{:02}:{:02}]}}", spent / 3600, spent / 60 % 60, spent % 60),
+            });
             previous_t = record.t;
             let mv = parse_move(&pos, &record.uci)?;
             pos.play_unchecked(mv);
@@ -430,6 +501,43 @@ mod tests {
         let mut finished = opera();
         finished.finish("1-0", "checkmate");
         assert!(finished.push_text("a3", 999.0).is_err());
+    }
+
+    #[test]
+    fn a_game_with_a_clock_keeps_the_time_left_and_says_so_in_the_pgn() {
+        let mut game = GameRecord::new("t".into(), None, "A", "B", None).unwrap();
+        game.time_control = Some(TimeControl::checked(300.0, 3.0).unwrap());
+        game.push_text("e4", 0.0).unwrap();
+        game.moves[0].left = Some([303.0, 300.0]);
+        game.push_text("e5", 7.0).unwrap();
+        game.moves[1].left = Some([303.0, 296.0]);
+        assert_eq!(game.mover(0), Color::White);
+        assert_eq!(game.mover(1), Color::Black);
+        game.finish("1-0", "time forfeit");
+        let pgn = game.to_pgn().unwrap();
+        assert!(pgn.contains("[TimeControl \"300+3\"]"), "{pgn}");
+        assert!(pgn.contains("[Termination \"time forfeit\"]"), "{pgn}");
+        assert!(pgn.contains("1. e4 {[%emt 0:00:00] [%clk 0:05:03]}"), "{pgn}");
+        assert!(pgn.contains("1... e5 {[%emt 0:00:07] [%clk 0:04:56]}"), "{pgn}");
+
+        // The clock survives the file, and a game of before the clock existed reads as it did.
+        let again: GameRecord = serde_json::from_str(&serde_json::to_string(&game).unwrap()).unwrap();
+        assert_eq!(again.time_control, game.time_control);
+        assert_eq!(again.moves[1].left, Some([303.0, 296.0]));
+        let plain = opera();
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("time_control") && !json.contains("left"), "no clock, nothing added to the file");
+        assert!(!plain.to_pgn().unwrap().contains("%clk"));
+        let old: GameRecord = serde_json::from_str(&json).unwrap();
+        assert!(old.time_control.is_none() && old.moves.iter().all(|m| m.left.is_none()));
+    }
+
+    #[test]
+    fn a_move_of_a_game_that_starts_with_black_to_move_has_the_right_player() {
+        let fen = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1";
+        let game = GameRecord::new("t".into(), None, "A", "B", Some(fen.into())).unwrap();
+        assert_eq!(game.mover(0), Color::Black);
+        assert_eq!(game.mover(1), Color::White);
     }
 
     #[test]

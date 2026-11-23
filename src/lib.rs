@@ -25,6 +25,7 @@ pub mod boarddetect;
 pub mod calibration;
 pub mod camera;
 pub mod choice;
+pub mod clock;
 pub mod depth;
 pub mod depthcam;
 pub mod depthlink;

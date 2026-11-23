@@ -8,8 +8,9 @@ use crate::boarddetect;
 use crate::calibration::{self, Calibration};
 use crate::camera::{FrameRate, SourceFactory};
 use crate::choice::CameraSelection;
+use crate::clock::Clock;
 use crate::depthlink::{AlignOutcome, AlignRequest, DepthLink};
-use crate::game::{self, GameRecord};
+use crate::game::{self, GameRecord, TimeControl};
 use crate::picture::{self, Picture};
 use crate::record::{RecordOptions, Recorder, SessionMeta};
 use crate::roles::{self, Role, Roles};
@@ -368,6 +369,8 @@ struct Inner {
     /// work for its own thread, so it can be used with `inner` held.
     recorder: Option<Recorder>,
     doubt: Option<DoubtNote>,
+    /// The chess clock of the game being played, when it has one (see the module `clock`).
+    clock: Option<Clock>,
 }
 
 /// Speed figures of the camera pipeline, smoothed.
@@ -431,6 +434,8 @@ pub struct Engine {
     /// thread nor the pages wait for the disk (see `request_save`).
     save_signal: (Mutex<bool>, Condvar),
     saver_started: AtomicBool,
+    /// The thread that ends a game when a player's time runs out is running (see `spawn_clock_watch`).
+    clock_watch_started: AtomicBool,
     /// The way to the thread that keeps the calibration on the board when it moves (see `follow_later`).
     follow_tx: Mutex<Option<SyncSender<FollowJob>>>,
     /// Where games are recorded, and the settings of the tracker (kept in the recording).
@@ -454,6 +459,8 @@ pub struct StartRequest {
     pub black: String,
     pub fen: Option<String>,
     pub started_at: Option<String>,
+    /// The time each player has and the time added after each move; none for a game without a clock.
+    pub time_control: Option<TimeControl>,
 }
 
 /// The pictures a second that the page set last time (`rate.json` next to the calibration), if it was.
@@ -534,6 +541,7 @@ impl Engine {
                 pending_save: None,
                 recorder: None,
                 doubt: None,
+                clock: None,
             }),
             slots: [
                 Slot::new(config.camera, calibration_path, picture_path),
@@ -552,6 +560,7 @@ impl Engine {
             rate_path,
             save_signal: (Mutex::new(false), Condvar::new()),
             saver_started: AtomicBool::new(false),
+            clock_watch_started: AtomicBool::new(false),
             follow_tx: Mutex::new(None),
             record: config.record,
             tracker_config,
@@ -706,6 +715,7 @@ impl Engine {
     fn spawn_capture_of(self: &Arc<Self>, cam: usize, factory: SourceFactory) -> std::io::Result<()> {
         self.spawn_saver();
         self.spawn_follower();
+        self.spawn_clock_watch();
         let engine = Arc::clone(self);
         let name = if cam == 0 { "capture" } else { "capture2" };
         thread::Builder::new().name(name.into()).spawn(move || engine.capture_loop(cam, factory)).map(|_| ())
@@ -895,6 +905,10 @@ impl Engine {
     fn go_idle(&self, inner: &mut Inner) {
         inner.mode = Mode::Idle;
         inner.calibrating_since = None;
+        // No time runs when nothing is played: the game was over, or ended, or is stopped.
+        if let Some(clock) = inner.clock.as_mut() {
+            clock.stop(Instant::now());
+        }
         // An error of a camera that is now off would only confuse.
         for cam in &mut inner.cams {
             cam.camera_error = None;
@@ -1259,7 +1273,89 @@ impl Engine {
                 return;
             }
         }
+        Self::clock_after_moves(inner, 1, since);
         self.after_game_change(inner);
+    }
+
+    /// The clock is told about the moves just added to the game (the last `count`), seen at `at`: the players who made
+    /// them earn the extra time, the player to move is the one whose time runs, and each move keeps what the players
+    /// have left.
+    fn clock_after_moves(inner: &mut Inner, count: usize, at: Instant) {
+        let (Some(game), Some(clock)) = (inner.game.as_mut(), inner.clock.as_mut()) else { return };
+        let first = game.moves.len().saturating_sub(count);
+        let movers: Vec<shakmaty::Color> = (first..game.moves.len()).map(|i| game.mover(i)).collect();
+        let Ok(position) = game.position() else { return };
+        let snapshots = clock.moved(&movers, shakmaty::Position::turn(&position), at);
+        for (record, left) in game.moves[first..].iter_mut().zip(snapshots) {
+            record.left = Some(left);
+        }
+    }
+
+    /// Ends the game if the time of the player whose clock runs has run out: the other player wins, unless that
+    /// player could not checkmate with any moves (the rules of chess call that a draw). Returns true when it did.
+    /// Called by the clock thread, and by tests.
+    fn check_clock(&self) -> bool {
+        {
+            let mut guard = self.inner.grab();
+            let inner = &mut *guard;
+            if inner.mode != Mode::Playing {
+                return false;
+            }
+            let Some(flagged) = inner.clock.as_mut().and_then(|clock| clock.expire(Instant::now())) else { return false };
+            let Some(game) = inner.game.as_mut() else { return false };
+            let winner = flagged.other();
+            let cannot_win = game.position().is_ok_and(|p| shakmaty::Position::has_insufficient_material(&p, winner));
+            let who = if flagged == shakmaty::Color::White { "White" } else { "Black" };
+            if cannot_win {
+                game.finish("1/2-1/2", "insufficient material");
+                inner.notice = Some(format!("{who}'s time ran out, but the other player cannot checkmate: the game is a draw"));
+            } else {
+                game.finish(if winner == shakmaty::Color::White { "1-0" } else { "0-1" }, "time forfeit");
+            }
+            eprintln!("game: over, {who}'s time ran out");
+            self.save(inner);
+            self.go_idle(inner);
+            inner.candidates.clear();
+            inner.doubt = None;
+            self.close_recording_if_idle(inner);
+        }
+        self.hub.notify();
+        // A failure to write the game becomes the notice of the pages, and is tried again (see `flush_save`).
+        let _ = self.flush_save();
+        true
+    }
+
+    /// How long until the time of the player whose clock runs is out, if a clock is running.
+    fn time_to_flag(&self) -> Option<Duration> {
+        let inner = self.inner.grab();
+        if inner.mode != Mode::Playing {
+            return None;
+        }
+        let clock = inner.clock.as_ref()?;
+        let side = clock.running()?;
+        let left = clock.left(Instant::now())[if side == shakmaty::Color::White { 0 } else { 1 }];
+        Some(Duration::try_from_secs_f64(left).unwrap_or_default())
+    }
+
+    /// Starts the thread that ends a game when a player's time runs out. It looks often while a clock runs, and
+    /// about once a second otherwise.
+    fn spawn_clock_watch(self: &Arc<Self>) {
+        if self.clock_watch_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let engine = Arc::clone(self);
+        let _ = thread::Builder::new().name("clock".into()).spawn(move || {
+            loop {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.check_clock())).is_err() {
+                    eprintln!("clock: the time could not be checked (internal error); going on");
+                }
+                let wait = match engine.time_to_flag() {
+                    Some(left) => left.clamp(Duration::from_millis(20), Duration::from_millis(250)),
+                    None => Duration::from_secs(1),
+                };
+                thread::sleep(wait);
+            }
+        });
     }
 
     /// Two or three moves were recognised at once: all are recorded, at the time the board became still.
@@ -1289,6 +1385,7 @@ impl Engine {
                 last.together = true;
             }
         }
+        Self::clock_after_moves(inner, moves.len(), since);
         self.after_game_change(inner);
     }
 
@@ -1439,7 +1536,7 @@ impl Engine {
                 "start_fen": g.start_fen,
                 "fen": position.as_ref().map(game::fen_of),
                 "turn": position.as_ref().map(|p| if shakmaty::Position::turn(p) == shakmaty::Color::White { "white" } else { "black" }),
-                "moves": g.moves.iter().map(|m| json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together})).collect::<Vec<_>>(),
+                "moves": g.moves.iter().map(|m| json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together, "left": m.left})).collect::<Vec<_>>(),
                 // Seconds since the first move while the game is going on: the page runs the clock of the player to move.
                 "elapsed": inner.game_started.filter(|_| playing && !g.moves.is_empty()).map(|s| s.elapsed().as_secs_f64()),
                 "result": g.result,
@@ -1448,6 +1545,13 @@ impl Engine {
                 "draw_claim": g.claimable_draw().ok().flatten(),
             })
         });
+        // The clock of the game: the one that was played (stopped once the game is over, with the times it ended on),
+        // or, for a game found at start that was not played yet, what the moves of the game say.
+        let clock = match (&inner.clock, &inner.game) {
+            (Some(clock), Some(_)) => Some(clock.to_json(now)),
+            (None, Some(g)) => Clock::from_game(g, now, false, false).map(|c| c.to_json(now)),
+            _ => None,
+        };
         let promotion_pending = inner.game.as_ref().and_then(|g| g.moves.last()).is_some_and(|m| m.promotion_guess);
         // The cameras the tracker uses (the depth view is told apart, after them).
         let views = inner.tracker.views_in_use();
@@ -1519,6 +1623,7 @@ impl Engine {
                 "promotion_pending": promotion_pending,
             },
             "game": game,
+            "clock": clock,
             "notice": inner.notice,
             "clients": self.clients.load(Ordering::SeqCst),
         })
@@ -1994,7 +2099,8 @@ impl Engine {
             return Err(ApiError::Conflict("calibrate the board first".into()));
         }
         let id = self.store.new_id(request.started_at.as_deref());
-        let game = GameRecord::new(id, request.started_at, &request.white, &request.black, request.fen)?;
+        let mut game = GameRecord::new(id, request.started_at, &request.white, &request.black, request.fen)?;
+        game.time_control = request.time_control;
         let position = game.start_position()?;
         inner.game = Some(game);
         self.begin_playing(&mut inner, position, 0.0);
@@ -2077,6 +2183,9 @@ impl Engine {
         let played = Duration::try_from_secs_f64(resume_at.max(0.0)).unwrap_or_default();
         inner.game_started = Some(Instant::now().checked_sub(played).unwrap_or_else(Instant::now));
         inner.mode = Mode::Playing;
+        // The clock of a game that has one: a new game has all its time, a game that goes on has what its moves say,
+        // and the time of the player to move runs from now.
+        inner.clock = inner.game.as_ref().and_then(|g| Clock::from_game(g, Instant::now(), false, true));
         inner.calibrating_since = None;
         inner.candidates.clear();
         inner.notice = None;
@@ -2195,9 +2304,11 @@ impl Engine {
             }
         }
         let position = game.position().map_err(ApiError::internal)?;
+        let entered = game.moves.len() - before;
         Self::record(inner, "manual", json!({"text": text.trim(), "fen": game::fen_of(&position)}));
         inner.tracker.set_position(position);
         inner.candidates.clear();
+        Self::clock_after_moves(inner, entered, Instant::now());
         self.after_game_change(inner);
         self.close_recording_if_idle(inner);
         drop(guard);
@@ -2214,7 +2325,7 @@ impl Engine {
             && inner.game.as_ref().is_some_and(|g| {
                 matches!(
                     g.termination.as_deref(),
-                    Some("checkmate" | "stalemate" | "insufficient material" | "fivefold repetition" | "75-move rule")
+                    Some("checkmate" | "stalemate" | "insufficient material" | "fivefold repetition" | "75-move rule" | "time forfeit")
                 )
             });
         if inner.mode != Mode::Playing && !reopenable {
@@ -2235,6 +2346,9 @@ impl Engine {
             // The board still shows the move that was taken back: nothing is decided, and nothing is learned from it,
             // until it shows the position again (the pieces put back) or the move that was played is entered.
             inner.tracker.undo_to(position, Some(undone.uci));
+            // The clock goes back to what the move before says (a pause stays), and the player to move is running.
+            let paused = inner.clock.as_ref().is_some_and(Clock::paused);
+            inner.clock = inner.game.as_ref().and_then(|g| Clock::from_game(g, Instant::now(), paused, true));
         }
         inner.doubt = None;
         inner.candidates.clear();
@@ -2242,6 +2356,42 @@ impl Engine {
         drop(guard);
         self.hub.notify();
         self.flush_save()
+    }
+
+    /// The clock of the game: "switch" is the button or the space bar (it starts the clock, goes on after a pause, or
+    /// hands the time over to the other player), "pause" stops both times and "resume" goes on.
+    pub fn clock_action(&self, token: &str, action: &str) -> ApiResult {
+        let mut guard = self.controlled(token)?;
+        let inner = &mut *guard;
+        if inner.mode != Mode::Playing {
+            return Err(ApiError::Conflict("no game is running".into()));
+        }
+        let turn = inner
+            .game
+            .as_ref()
+            .and_then(|g| g.position().ok())
+            .map(|p| shakmaty::Position::turn(&p))
+            .ok_or_else(|| ApiError::Conflict("no game".into()))?;
+        let clock = inner.clock.as_mut().ok_or_else(|| ApiError::Conflict("this game has no clock".into()))?;
+        let now = Instant::now();
+        match action {
+            "switch" => clock.press(turn, now),
+            "pause" => {
+                if !clock.pause(now) {
+                    return Err(ApiError::Conflict("the clock is not running".into()));
+                }
+            }
+            "resume" => {
+                if !clock.resume(turn, now) {
+                    return Err(ApiError::Conflict("the clock is not paused".into()));
+                }
+            }
+            _ => return Err(ApiError::BadRequest("the clock action is switch, pause or resume".into())),
+        }
+        Self::record(inner, "clock", json!({"action": action}));
+        drop(guard);
+        self.hub.notify();
+        Ok(())
     }
 
     /// Changes the piece chosen for the last promotion.
@@ -2294,6 +2444,7 @@ impl Engine {
         let first = note.after - note.count;
         let t = game.moves[first].t;
         let taken: Vec<(String, String)> = game.moves[first..].iter().map(|m| (m.uci.clone(), m.san.clone())).collect();
+        let clock_was: Vec<Option<[f64; 2]>> = game.moves[first..].iter().map(|m| m.left).collect();
         for _ in 0..note.count {
             game.undo();
         }
@@ -2304,14 +2455,33 @@ impl Engine {
                     while game.moves.len() > first {
                         game.undo();
                     }
-                    for (uci, _) in &taken {
+                    for (i, (uci, _)) in taken.iter().enumerate() {
                         let _ = game.push_text(uci, t);
+                        if let Some(record) = game.moves.last_mut() {
+                            record.left = clock_was.get(i).copied().flatten();
+                        }
                     }
                     return Err(ApiError::internal(e));
                 }
             }
+            // The moves that replace the others keep what the players had left after them: the same moves in the same
+            // places keep each their own, and a different number of moves all take what the last one had.
+            let last_was = clock_was.last().copied().flatten();
+            let count = game.moves.len() - first;
+            for (i, record) in game.moves[first..].iter_mut().enumerate() {
+                record.left = if count == clock_was.len() { clock_was[i] } else { last_was };
+            }
         }
         let position = game.position().map_err(ApiError::internal)?;
+        if let Some(clock) = inner.clock.as_mut() {
+            if replacement.is_some() {
+                // The time went on meanwhile; only the player to move may be another one.
+                clock.follow_turn(shakmaty::Position::turn(&position), Instant::now());
+            } else {
+                let paused = clock.paused();
+                inner.clock = inner.game.as_ref().and_then(|g| Clock::from_game(g, Instant::now(), paused, true));
+            }
+        }
         Self::record(inner, "doubt", json!({"choice": choice, "fen": game::fen_of(&position)}));
         inner.tracker.set_position(position);
         inner.candidates.clear();
@@ -2370,7 +2540,8 @@ impl Engine {
             "start_fen": game.start_fen,
             "result": game.result,
             "termination": game.termination,
-            "moves": game.moves.iter().map(|m| json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together})).collect::<Vec<_>>(),
+            "moves": game.moves.iter().map(|m| json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together, "left": m.left})).collect::<Vec<_>>(),
+            "time_control": game.time_control,
             "fens": fens,
         })))
     }
@@ -2528,6 +2699,98 @@ mod tests {
         // In the PGN, the first move took no time.
         let pgn = engine.game_pgn("pair").unwrap_or(None);
         assert!(pgn.is_none() || pgn.unwrap().contains("[%emt 0:00:00]"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A game with a clock of `base` seconds in which `side` has been thinking for `ago` seconds already.
+    fn engine_with_clock_running(name: &str, fen: Option<&str>, base: f64, side: shakmaty::Color, ago: u64) -> (Arc<Engine>, PathBuf) {
+        let (engine, dir) = engine_playing(name);
+        {
+            let mut inner = engine.inner.grab();
+            let mut game = GameRecord::new("clock".into(), None, "A", "B", fen.map(str::to_string)).unwrap();
+            game.time_control = Some(TimeControl::checked(base, 0.0).unwrap());
+            let past = Instant::now().checked_sub(Duration::from_secs(ago)).unwrap();
+            let mut clock = Clock::new(game.time_control.unwrap(), past);
+            // The clock is started for the player to move; hand the time over once if it is the other one.
+            clock.press(shakmaty::Color::White, past);
+            if side == shakmaty::Color::Black {
+                clock.press(shakmaty::Color::White, past);
+            }
+            inner.game = Some(game);
+            inner.clock = Some(clock);
+        }
+        (engine, dir)
+    }
+
+    #[test]
+    fn a_player_whose_time_runs_out_loses_the_game_and_the_clock_stops() {
+        use shakmaty::Color;
+        let (engine, dir) = engine_with_clock_running("flag", None, 20.0, Color::White, 5);
+        assert!(!engine.check_clock(), "15 seconds are left");
+        assert!(engine.time_to_flag().is_some_and(|left| left > Duration::from_secs(10)));
+        assert_eq!(engine.inner.grab().mode, Mode::Playing);
+
+        let (engine, dir2) = engine_with_clock_running("flag2", None, 20.0, Color::White, 30);
+        assert!(engine.check_clock(), "White has been thinking for 30 seconds of 20");
+        {
+            let inner = engine.inner.grab();
+            let game = inner.game.as_ref().unwrap();
+            assert_eq!((game.result.as_deref(), game.termination.as_deref()), (Some("0-1"), Some("time forfeit")));
+            assert_eq!(inner.mode, Mode::Idle, "the game is over");
+            assert!(inner.clock.as_ref().unwrap().running().is_none());
+        }
+        // The page is shown the time that ran out, not the time at the last move.
+        let state = engine.snapshot("");
+        assert_eq!(state["clock"]["left"], json!([0.0, 20.0]));
+        assert_eq!(state["clock"]["running"], Value::Null);
+        assert!(!engine.check_clock(), "once");
+        assert_eq!(engine.list_games().unwrap()[0].result.as_deref(), Some("0-1"));
+
+        // The same for Black.
+        let (engine, dir3) = engine_with_clock_running("flag3", None, 20.0, Color::Black, 30);
+        assert!(engine.check_clock());
+        assert_eq!(engine.inner.grab().game.as_ref().unwrap().result.as_deref(), Some("1-0"));
+        for d in [dir, dir2, dir3] {
+            std::fs::remove_dir_all(&d).ok();
+        }
+    }
+
+    #[test]
+    fn running_out_of_time_against_a_player_who_cannot_checkmate_is_a_draw() {
+        use shakmaty::Color;
+        // White has a rook, Black only the king: Black cannot win, so White's time running out is no loss.
+        let (engine, dir) = engine_with_clock_running("flag-draw", Some("4k3/8/8/8/8/8/8/R3K3 w - - 0 1"), 20.0, Color::White, 30);
+        assert!(engine.check_clock());
+        let inner = engine.inner.grab();
+        let game = inner.game.as_ref().unwrap();
+        assert_eq!((game.result.as_deref(), game.termination.as_deref()), (Some("1/2-1/2"), Some("insufficient material")));
+        assert!(inner.notice.as_deref().is_some_and(|n| n.contains("time ran out")));
+        drop(inner);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_game_without_a_clock_never_runs_out_of_time() {
+        let (engine, dir) = engine_playing("no-clock");
+        assert!(!engine.check_clock());
+        assert!(engine.time_to_flag().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn moves_that_are_seen_keep_the_time_the_players_have_left() {
+        use shakmaty::Color;
+        let (engine, dir) = engine_with_clock_running("moves-clock", None, 300.0, Color::White, 12);
+        let start = shakmaty::Chess::default();
+        let e4 = crate::game::parse_move(&start, "e2e4").unwrap();
+        {
+            let mut inner = engine.inner.grab();
+            engine.apply_detected_move(&mut inner, e4, Instant::now(), false);
+            let left = inner.game.as_ref().unwrap().moves[0].left.expect("the move keeps the time left");
+            assert!((left[0] - 288.0).abs() < 0.5, "300 seconds, 12 of them used: {left:?}");
+            assert_eq!(left[1], 300.0);
+            assert_eq!(inner.clock.as_ref().unwrap().running(), Some(Color::Black));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

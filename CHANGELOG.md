@@ -5,6 +5,36 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.10.0
+
+**A chess clock, if you want one.** A tester asked for an integrated timer with a time limit per player, an extra
+time, a button or the space bar to switch, and a pause.
+
+- **New game**: the time for each player (minutes) and the extra time added after each move (seconds), with presets
+  (1+0, 3+2, 5+0, 10+0, 15+10). Leave the minutes empty for a game without a clock, which works as before. The choice
+  is remembered by the page. API: `minutes` and `extra_seconds` in `POST /api/game/start`.
+- **The clocks count down on every page** (the player whose time runs is highlighted, red when little is left, tenths
+  of a second below ten seconds). The controller has a big button and the space bar (`POST /api/game/clock`,
+  `switch`): the first press starts the clock for the player to move, the next ones hand the time over at once, and
+  after a pause it goes on. There is a pause button (`pause`, `resume`).
+- **The camera and the clock agree.** A move that is seen adds the extra time to the player who made it and gives the
+  time to the other one, whatever was pressed: so a clock that nobody presses follows the game by itself (a move seen
+  before the first press starts the clock and costs no time), a press before the move is seen changes nothing more, and
+  a press by mistake is mended by the next move. Moves seen during a pause change no time.
+- **A time that runs out ends the game** (a thread, `clock`, looks about four times a second): the other player wins,
+  "time forfeit", or the game is a draw when that player could not checkmate with any moves. Undo reopens such a
+  game, like a game ended by checkmate.
+- **Kept with the game**: each move keeps the time both players had left (`left` in the game file; old files and games
+  without a clock are unchanged), so taking a move back, resuming a game after a restart and the replay all have the
+  times. The PGN gets a `TimeControl` tag and `[%clk h:mm:ss]` next to the time spent on each move, and the
+  termination "time forfeit".
+- Tested with a new module of clock rules (`src/clock.rs`, 13 tests with made-up times), the engine (a time running out,
+  a draw instead of a loss, moves keeping the time left), the API, and the demo source through the real server.
+
+**Limits.** The time of a move that the camera sees is the time the board became still, a little after the move, and two
+or three moves seen together are charged to the time before them: press the clock (or the space bar) when moving to avoid
+both. Only tried with the demo source and in tests; no players at a real board yet.
+
 ## 0.9.0
 
 **Fast games.** A tester reported that the program works at normal speed and "does not work at all" in blitz. Three

@@ -40,8 +40,12 @@
 //!   POST   /api/camera/picture         {"brightness": 0, "contrast": 1}
 //!   POST   /api/camera/auto-contrast   stretch the picture of the board over the whole range
 //!   POST   /api/camera/picture/reset   brightness and contrast back to neutral
-//!   POST   /api/game/start             {"white","black","fen"?,"started_at"?}
-//!   POST   /api/game/resume            go on with the unfinished game found at start (the board must show its position)
+//!   POST   /api/game/start             {"white","black","fen"?,"started_at"?,"minutes"?,"extra_seconds"?}  with minutes, a
+//!                                      game with a clock: that many minutes for each player, and the extra seconds
+//!                                      added after each move
+//!   POST   /api/game/clock             {"action": "switch"|"pause"|"resume"}  the button or space bar of the clock (starts
+//!                                      it, goes on after a pause, or hands the time over), a pause, going on
+//!   POST   /api/game/resume           go on with the unfinished game found at start (the board must show its position)
 //!   POST   /api/game/end               {"result","reason"}  (also closes an unfinished game that is not running)
 //!   POST   /api/game/move              {"move": "e2e4" or "Nf3"}
 //!   POST   /api/game/undo              take back the last move
@@ -50,6 +54,7 @@
 //!   POST   /api/game/doubt             {"move": "d2d4"} put a doubtful move right with another likely one; {} takes it back and asks
 
 use crate::engine::{ApiError, ApiResult, Engine, StartRequest};
+use crate::game::TimeControl;
 use crate::http::{Handler, Reply, Request};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -232,10 +237,31 @@ fn route(engine: &Arc<Engine>, max_viewers: usize, request: Request) -> Reply {
                 black: String,
                 fen: Option<String>,
                 started_at: Option<String>,
+                /// Minutes each player has; none (or 0) for a game without a clock.
+                #[serde(default)]
+                minutes: Option<f64>,
+                /// Seconds added to the time of a player after each move.
+                #[serde(default)]
+                extra_seconds: Option<f64>,
             }
             done(body_json::<Body>(&request).and_then(|b| {
-                engine.start_game(&token, StartRequest { white: b.white, black: b.black, fen: b.fen, started_at: b.started_at })
+                let time_control = match b.minutes.filter(|m| *m != 0.0) {
+                    Some(minutes) => Some(
+                        TimeControl::checked(minutes * 60.0, b.extra_seconds.unwrap_or(0.0))
+                            .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+                    ),
+                    None => None,
+                };
+                engine
+                    .start_game(&token, StartRequest { white: b.white, black: b.black, fen: b.fen, started_at: b.started_at, time_control })
             }))
+        }
+        ("POST", "/api/game/clock") => {
+            #[derive(Deserialize)]
+            struct Body {
+                action: String,
+            }
+            done(body_json::<Body>(&request).and_then(|b| engine.clock_action(&token, &b.action)))
         }
         ("POST", "/api/game/resume") => done(engine.resume_game(&token)),
         ("POST", "/api/game/end") => {
@@ -1535,6 +1561,88 @@ mod tests {
         assert_eq!(rig.call("GET", "/api/games", "", "").1["games"][0]["result"], "0-1");
         assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"0-1","reason":"resignation"}"#).0, 409);
         assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"2-0","reason":"x"}"#).0, 409, "no game is running");
+    }
+
+    #[test]
+    fn a_game_with_a_clock_starts_it_hands_the_time_over_pauses_and_goes_back_with_undo() {
+        let rig = rig("clock", SourceSpec::Synthetic);
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        rig.call("POST", "/api/calibration", ALICE, &corners_json());
+
+        // The time of each player and the extra time are checked.
+        for bad in [
+            r#"{"minutes": 100000}"#,
+            r#"{"minutes": -5}"#,
+            r#"{"minutes": 5, "extra_seconds": -1}"#,
+            r#"{"minutes": 5, "extra_seconds": 99999}"#,
+        ] {
+            assert_eq!(rig.call("POST", "/api/game/start", ALICE, bad).0, 400, "{bad}");
+        }
+        // No clock asked for: a game without one, and no clock to press.
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B","minutes":0}"#).0, 200);
+        assert!(rig.state(ALICE)["clock"].is_null());
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"switch"}"#).0, 409);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"*","reason":"abandoned"}"#).0, 200);
+
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B","minutes":5,"extra_seconds":3}"#).0, 200);
+        let clock = rig.state(ALICE)["clock"].clone();
+        assert_eq!((clock["base"].clone(), clock["increment"].clone()), (json!(300.0), json!(3.0)));
+        assert_eq!(
+            (clock["started"].clone(), clock["paused"].clone(), clock["running"].clone()),
+            (json!(false), json!(false), Value::Null)
+        );
+        assert_eq!(clock["left"], json!([300.0, 300.0]), "nothing runs before the start");
+
+        // Only the controller presses the clock, and only with a known action.
+        assert_eq!(rig.call("POST", "/api/game/clock", BOB, r#"{"action":"switch"}"#).0, 403);
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"nonsense"}"#).0, 400);
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"pause"}"#).0, 409, "not started");
+
+        // The first press starts the player to move; the next hands the time over.
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"switch"}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["clock"]["running"], "white");
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"switch"}"#).0, 200);
+        assert_eq!(rig.state(ALICE)["clock"]["running"], "black");
+
+        // A pause stops both; going on gives the time to the player to move (White, nothing was played).
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"pause"}"#).0, 200);
+        let paused = rig.state(ALICE)["clock"].clone();
+        assert_eq!((paused["paused"].clone(), paused["running"].clone()), (json!(true), Value::Null));
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"pause"}"#).0, 409);
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"resume"}"#).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"resume"}"#).0, 409);
+        assert_eq!(rig.state(ALICE)["clock"]["running"], "white");
+
+        // A move earns the extra time, keeps what the players have left, and gives the time to the other player.
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move":"e2e4"}"#).0, 200);
+        let state = rig.state(ALICE);
+        assert_eq!(state["clock"]["running"], "black");
+        let left = state["game"]["moves"][0]["left"].clone();
+        assert!(left[0].as_f64().unwrap() > 302.0 && left[0].as_f64().unwrap() <= 303.0, "{left}");
+        assert_eq!(left[1], json!(300.0));
+
+        // Taking the move back takes the clock back to the start.
+        assert_eq!(rig.call("POST", "/api/game/undo", ALICE, "").0, 200);
+        let back = rig.state(ALICE)["clock"].clone();
+        assert_eq!(back["left"], json!([300.0, 300.0]));
+        assert_eq!(back["started"], false);
+
+        // The end of the game stops the clock, and what the game says stays for the page.
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move":"e2e4"}"#).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"1-0","reason":"resignation"}"#).0, 200);
+        let over = rig.state(ALICE);
+        assert_eq!(over["clock"]["running"], Value::Null);
+        assert_eq!(over["clock"]["base"], json!(300.0));
+        assert_eq!(rig.call("POST", "/api/game/clock", ALICE, r#"{"action":"switch"}"#).0, 409, "no game is running");
+        // The stored game has the clock, and the PGN says so.
+        let id = over["game"]["id"].as_str().unwrap().to_string();
+        let detail = rig.call("GET", &format!("/api/games/{id}"), "", "").1;
+        assert_eq!(detail["time_control"], json!({"base": 300.0, "increment": 3.0}));
+        let pgn = rig.engine.game_pgn(&id).unwrap().unwrap();
+        assert!(pgn.contains("[TimeControl \"300+3\"]"), "{pgn}");
+        assert!(pgn.contains("[%clk 0:05:0"), "{pgn}");
     }
 
     /// A depth camera that sees the start position of the game from a spot of its own.

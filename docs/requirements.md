@@ -81,7 +81,7 @@ records the game, and shows it live and in replay on a phone or tablet.
 
 ## Out of scope for now
 
-- A chess clock, saving camera snapshots per move, streaming video. (Engine analysis is under study, see below.)
+- Saving camera snapshots per move, streaming video. (Engine analysis is under study, see below. The optional chess clock is described in PURPOSE.md.)
 - Recognising piece types by vision. Types come from the game state.
 - Seeing captured pieces beside the board: possible later, so the warp keeps a margin around the board.
 - A tournament feature that counts points automatically (the data to support it is stored).
