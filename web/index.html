@@ -395,7 +395,7 @@ try { var t0 = localStorage.getItem('nicochess-theme'); if (t0 === 'light' || t0
       grid-template-areas: "ptop side" "board side" "pbot side" "below side" ". side"; grid-template-rows: auto auto auto auto 1fr;
     }
     .live > .side { width: auto; margin-top: 0; }
-    .live .scroll { max-height: max(190px, calc(var(--vh) - 600px)); }
+    .live .scroll { max-height: max(150px, calc(var(--vh) - 650px)); }
     .games-view { grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); justify-items: stretch; max-width: 1400px; margin: 0 auto; column-gap: var(--s4); align-items: start; }
     .games-view > * { width: auto; }
     .games-view.open #games-card { display: block; }
@@ -453,6 +453,18 @@ try { var t0 = localStorage.getItem('nicochess-theme'); if (t0 === 'light' || t0
       .player.paused .time::before { content: ""; display: inline-block; width: .3em; height: .62em; margin-right: .35em; border: solid; border-width: 0 .13em; opacity: .7; }
     }
     .timed .player .time { font-size: 1.4rem; }
+    /* The smallest phones held sideways (320 to 360 px high): every pixel of height goes to the board and the buttons. */
+    @media (max-height: 360px) {
+      :root { --pad: 6px; }
+      .top { min-height: 38px; }
+      .logo { width: 22px; height: 22px; }
+      .brand h1 { font-size: var(--fs-m); }
+      .live { --chrome: 58px; }
+      .player { min-height: 36px; padding-top: 2px; padding-bottom: 2px; }
+      .timed .player .time { font-size: 1.2rem; }
+      .status { padding: 5px 10px; font-size: var(--fs-s); line-height: 1.25; }
+      .tabs button { min-height: 48px; }
+    }
     .side { margin-top: 0; }
     .replay-head { margin-bottom: var(--s2); }
     .cal > * { width: 100%; }

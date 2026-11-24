@@ -42,7 +42,7 @@ moves played between two pictures) by how well the picture fits, and takes the l
 
 | | |
 |---|---|
-| **Windows PC** | The main target. `NicoChess-windows.zip`: unzip and double-click, nothing to install (under 1 MB). Webcams through Media Foundation; the page lets you choose among the cameras of the computer |
+| **Windows PC** | The main target. `NicoChess-windows.zip`: unzip and double-click, nothing to install (about 1.2 MB). Webcams through Media Foundation; the page lets you choose among the cameras of the computer |
 | **Android phone or tablet** | An app that is both camera and screen: the server runs inside it and the page is shown in it. It keeps recording with the screen off, and can let other devices connect |
 | **Linux** | The same program as a service on a headless box (32-bit i386 build for small machines), reached from a phone or a tablet; V4L2 cameras ([PLAN.md](PLAN.md)) |
 
@@ -140,6 +140,12 @@ with a real camera.
 
 Under study: a laptop as the target (own screen, faster) and engine analysis with Stockfish
 ([docs/requirements.md](docs/requirements.md), "Under study").
+
+## Licence
+
+GNU General Public License, version 3 or (at your option) any later version: see [LICENSE](LICENSE). The chess rules
+come from the `shakmaty` crate, which is under that licence, so the program as a whole has to be. The other
+Rust dependencies are under MIT, Apache-2.0, BSD, ISC, Zlib or Unlicense terms, which are compatible with it. Every package of a release carries the licence text.
 
 ## Documents
 

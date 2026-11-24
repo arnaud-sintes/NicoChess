@@ -56,8 +56,10 @@ one, it was signed with another key: uninstall the old NicoChess once, then inst
 The debug key is kept in the Docker volume nicochess-android-keystore on the build machine.
 "@ | Set-Content -Path $readme -Encoding ASCII
 if (Test-Path $zip) { Remove-Item -Force $zip }
-Compress-Archive -Path (Join-Path $dist 'nicochess-debug.apk'), $readme -DestinationPath $zip
-Remove-Item -Force $readme
+$license = Join-Path $dist 'LICENSE.txt'
+Copy-Item (Join-Path $PSScriptRoot '..\LICENSE') $license -Force
+Compress-Archive -Path (Join-Path $dist 'nicochess-debug.apk'), $readme, $license -DestinationPath $zip
+Remove-Item -Force $readme, $license
 
 Write-Host "Built: $dist\nicochess-debug.apk (version $version, commit $commit)"
 Write-Host "Zip:   $zip"

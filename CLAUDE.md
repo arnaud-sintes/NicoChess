@@ -42,7 +42,7 @@ The page is one HTML file built into the program. Everything works offline.
 6. Calibration corner order is a1, h1, h8, a8, counter-clockwise on screen, in the pixels of the rotated picture. Do not change it.
 7. Kotlin: camera state is touched only on the main thread (Camera2 callbacks are given the main handler; only the pictures arrive on the image-reader thread); bridge methods run on a WebView thread.
 8. Tests drive the engine through `server::tests::rig` with the synthetic or demo source. No real camera in tests.
-9. Add a dependency only with a good reason (the target is a 32-bit Atom, and the Windows package is under 1 MB).
+9. Add a dependency only with a good reason (the target is a 32-bit Atom, and the Windows package is about 1.2 MB).
 10. Never commit unless asked. Scratch files go in the session scratchpad, never in the repository.
 
 ## Environment gotchas learned the hard way

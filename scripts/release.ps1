@@ -54,7 +54,7 @@ try {
     $tarball = Join-Path $dist 'nicochess-linux-i386.tar.gz'
     if (Test-Path $tarball) { Remove-Item -Force $tarball }
     # Windows' own tar: a tar found first on the PATH (Git's) takes "C:" for a remote host.
-    & (Join-Path $env:SystemRoot 'System32\tar.exe') -czf $tarball -C $dist nicochess
+    & (Join-Path $env:SystemRoot 'System32\tar.exe') -czf $tarball -C $dist nicochess -C $root LICENSE
     if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
     $assets = @(
         (Join-Path $dist 'NicoChess-windows.zip'),

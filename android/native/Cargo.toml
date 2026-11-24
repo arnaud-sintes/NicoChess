@@ -2,6 +2,7 @@
 name = "nicochess-android"
 version.workspace = true
 edition = "2024"
+license = "GPL-3.0-or-later"
 rust-version = "1.88"
 description = "NicoChess for Android: the core library behind a JNI entry point"
 

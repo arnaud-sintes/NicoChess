@@ -5,7 +5,12 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
-## Unreleased
+## 0.11.0
+
+**Licence.** NicoChess is under the GNU General Public License, version 3 or later (file `LICENSE`, `license` in both
+`Cargo.toml` files). The chess rules come from the `shakmaty` crate, which has that licence, so the program has to have
+it too. Every package of a release (the Windows zip, the Android zip, the Linux tarball) now carries the licence text.
+The statements that the Windows package is under 1 MB were out of date (it is about 1.2 MB) and are corrected.
 
 **Pieces taken, and promotion by drag and drop.** Both are on the page only; the detection is not changed.
 
@@ -63,7 +68,11 @@ everything it did, and the server is not changed.
   control and shows where it is, colours keep a contrast of 4.5 to 1 in both themes, switches replace tick boxes,
   movement is short and stops for people who asked their device for less of it, and the notch and the home bar of a
   phone are left free.
-- The page is 144 KB (87 KB before), about 14 KB more in the Windows package.
+- On a computer screen of 1280x800 the whole Controls card now fits beside the board of a clocked game (the list of
+  moves is shorter there), and on the smallest phones held sideways (320 to 360 px high) the board, the clocks and the
+  clock button fit on the screen with the header and the players made lower.
+- The page is 144 KB (87 KB before), about 14 KB more in the Windows package. It was not made smaller: what could be
+  taken out without cutting comments or features is under 2 KB.
 - Not tried on a real phone or tablet, nor with a real camera: checked in a desktop browser made to behave as a phone
   (sizes from 320 px, touch and mouse events, both themes), on the demo and on staged states.
 

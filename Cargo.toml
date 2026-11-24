@@ -1,12 +1,14 @@
 # The version of NicoChess: the one place to change it. The program, the page, the Android app
 # (versionName and versionCode, see android/app/build.gradle.kts) and the packages all take it from here.
 [workspace.package]
-version = "0.10.1"
+version = "0.11.0"
 
 [package]
 name = "nicochess"
 version.workspace = true
 edition = "2024"
+# GPL because shakmaty (the chess rules) is GPL-3.0-or-later; see LICENSE.
+license = "GPL-3.0-or-later"
 # The oldest compiler that builds it (let-chains, slice::as_chunks). The Docker images pin an exact one.
 rust-version = "1.88"
 

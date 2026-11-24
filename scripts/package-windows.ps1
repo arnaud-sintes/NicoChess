@@ -49,6 +49,8 @@ $out = Join-Path $root 'dist\NicoChess-windows'
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item $exe (Join-Path $out 'nicochess.exe')
+# The program is under the GPL, which asks for the licence text to travel with every copy.
+Copy-Item (Join-Path $root 'LICENSE') (Join-Path $out 'LICENSE.txt')
 
 # Plain text files for Windows: ASCII with CRLF line ends.
 foreach ($file in Get-ChildItem (Join-Path $root 'scripts\windows') -File) {
