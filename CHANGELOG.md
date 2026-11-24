@@ -19,6 +19,54 @@ minor number may change behaviour, a patch number only fixes things.
   dropped anywhere else chooses nothing.
 - Not tried with a real board or on a phone: checked in a browser on a staged game and on pointer events only.
 
+**Times of moves seen together, and a recording of every picture.**
+
+- When two or three moves are seen in one picture (fast play), their times were all the moment the board became still,
+  so the time the players took went to the last move and the others got none. They are now spread evenly between the
+  move before them and that moment (an estimate: the camera cannot see more). At the very start of a game, where the
+  clock starts with the first move, they are all at 0 as before. The move list, the thinking times and the PGN take
+  the new times.
+- `--record-all` (instead of `--record`) keeps every picture the detection looks at, also while the board is quiet and
+  not only a few a second while something happens, with a longer queue for the disk. The Windows package has
+  "Start NicoChess (record all).bat" for it (25 pictures a second). It takes several megabytes a second: for a blitz
+  game that has to be replayed picture by picture. `--record-all` with `--record-every` is refused.
+
+**A new look for the page, made for the screen it is on.** The page was drawn again from the ground up; it does
+everything it did, and the server is not changed.
+
+- **Three layouts.** On a phone held upright the board takes the width, with a player and a clock above and below it,
+  the status under it, and the three sections on a bar at the bottom. On a phone held sideways the board is as high as
+  the screen, the sections are on a rail at the left and everything else is beside the board. On a tablet or a computer
+  that is wider than high the board is on the left, as large as the height allows (and no larger than is sensible on a
+  very large screen), with the clock button, the moves and the controls beside it. Nothing scrolls sideways from
+  320 px wide.
+- **The players and their clocks** are two lines, above and below the board as the players sit (they change places when
+  the board is turned). The clock whose time runs is filled in, and goes red when little time is left.
+- **The status** ("Watching the board", "Something is moving", "Not sure which move was played") has a colour for each
+  state, and the header says whether the program is recording, calibrating, idle, or cannot be reached. The questions
+  of the program (which move, a doubtful move, the piece of a promotion) come at the top of the panel, so they are on
+  the screen without scrolling.
+- **The moves** are a table with the times, and on a phone one line that scrolls sideways until "All moves" is pressed.
+  A time that is an estimate (moves seen in one picture) is written with a "~" and says why.
+- **Calibrate** shows the camera picture first, with the buttons and the next step above it (the four corners are
+  ticked off as they are marked), and one folding section for each group of settings: Picture, Cameras, Depth camera,
+  Speed and alignment, This phone. Each says its state in its title line. On a phone only Picture starts open.
+- **Games** on a phone shows the list, then the game in its place (a Games button goes back); on a wide screen both.
+  The replay has the same board, strips and clocks as the live game; the arrow keys, Home and End step through it.
+- **Small things.** The role (Controller, Viewer) is a button: it opens a panel with what the role means, Release
+  control, the theme (as the device is set, light, dark; kept on the device) and the version. "Take control" is a line
+  across the top when nobody controls. A button beside the status shows only the board and the clocks (Escape, or the
+  button again, brings the rest back), for a screen propped up beside the board. A piece that has just moved slides to
+  its square. Errors of a command show for a few seconds at the bottom instead of replacing the notice at the top.
+  Squares a piece may go to are dots, pieces it may take have a ring.
+- **For every hand and eye.** Anything pressed is at least 44 px high on a touch screen, the keyboard reaches every
+  control and shows where it is, colours keep a contrast of 4.5 to 1 in both themes, switches replace tick boxes,
+  movement is short and stops for people who asked their device for less of it, and the notch and the home bar of a
+  phone are left free.
+- The page is 144 KB (87 KB before), about 14 KB more in the Windows package.
+- Not tried on a real phone or tablet, nor with a real camera: checked in a desktop browser made to behave as a phone
+  (sizes from 320 px, touch and mouse events, both themes), on the demo and on staged states.
+
 ## 0.10.1
 
 **Leaning pieces no longer block the game.** Four recordings of real games (three blitz, one slow) showed the tracker

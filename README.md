@@ -24,9 +24,13 @@ moves played between two pictures) by how well the picture fits, and takes the l
 - **A chess clock, if you want one.** Give each player a time (and an extra time per move) when starting a game: the
   clocks count down on every page, the space bar (or a big button) hands the time over as you move, there is a pause,
   and the game ends when a time runs out.
-- **Not sure?** A move that leads only narrowly is taken anyway and flagged under the board ("Not completely sure about
-  d4, 78%"), with the other likely moves and their chances as buttons that replace it, and an Undo. When nothing is
-  likely enough the page asks. Moves can always be typed, and tracking resumes by itself afterwards.
+- **Not sure?** A move that leads only narrowly is taken anyway and flagged next to the board ("Not completely sure
+  about d4, 78%"), with the other likely moves and their chances as buttons that replace it, and an Undo. When nothing
+  is likely enough the page asks. Moves can always be typed, and tracking resumes by itself afterwards.
+- **Made for the screen it is on.** A phone held upright has the board across the screen with the clocks above and below
+  it; held sideways, the board as high as the screen and the rest beside it; a tablet or a computer, the board on the
+  left and the moves and controls on the right. Light or dark as the device is set (or as chosen behind the role button
+  at the top right, where Release control is too), and a button beside the status shows only the board and the clocks.
 - **One camera or two.** A second camera on the opposite side sees what the first cannot: the squares hidden by a hand,
   an arm or a tall piece. With one camera nothing changes ([Two cameras](#two-cameras)).
 - **Follows a board that moves.** During a game the calibration follows the board if the camera or the board shifts a

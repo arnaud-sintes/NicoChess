@@ -2,349 +2,843 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff">
 <title>NicoChess</title>
+<script>
+// The theme chosen on this device, put in place before the first paint. Without a choice the system decides.
+try { var t0 = localStorage.getItem('nicochess-theme'); if (t0 === 'light' || t0 === 'dark') document.documentElement.dataset.theme = t0; } catch (e) { /* no storage: the system's theme */ }
+</script>
 <style>
+  /* ---------- tokens: colours (light, then dark), sizes, motion ---------- */
   :root {
     color-scheme: light dark;
-    --bg: #f4f4f2; --fg: #1d1d1b; --muted: #6b6b66; --card: #ffffff; --line: #d6d6d0;
-    --accent: #0a7d4f; --accent-fg: #ffffff; --warn: #b3261e; --note: #8a5a00; --hl: #ffe9a8;
-    --sq-light: #f0d9b5; --sq-dark: #b58863;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+    --bg: #f2f1ec; --surface: #ffffff; --inset: #eeede7; --line: #dedcd3; --edge: #bfbcb0; --track: #8d8a80;
+    --fg: #1b1a17; --muted: #5c5a53;
+    --accent: #0a6c53; --accent-2: #085743; --accent-fg: #ffffff; --accent-soft: #d9eee6; --accent-ink: #07513f;
+    --danger: #b3261e; --danger-fg: #ffffff; --danger-soft: #fbe4e1; --danger-ink: #8c1d18;
+    --note: #7a5200; --note-soft: #fbeecb; --note-ink: #5f4000;
+    --info: #1b5fae; --info-soft: #dfebfa; --info-ink: #164a86;
+    --hl: #ffe49a; --hl-ink: #3d2f00; --focus: #1a66d0; --toast: #26251f; --toast-fg: #ffffff;
+    /* The board: ivory and a soft sage, the same in both themes but dimmer in the dark one. */
+    --sq-light: #ebe7d9; --sq-dark: #86a08c; --mark: rgba(250, 214, 60, .55); --pick: rgba(52, 134, 235, .55);
+    --pw: #fdfaf0; --pwl: #27241f; --pb: #2a2826; --pbl: #f3eedf;
+    --shadow-1: 0 1px 2px rgba(20, 18, 10, .06); --shadow-2: 0 10px 30px rgba(20, 18, 10, .18), 0 2px 6px rgba(20, 18, 10, .08);
+    --shadow-b: 0 2px 10px rgba(20, 18, 10, .16);
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px;
+    --r1: 6px; --r2: 10px; --r3: 14px;
+    --fs-xs: .75rem; --fs-s: .875rem; --fs-m: 1rem; --fs-l: 1.125rem;
+    --t1: .12s; --t2: .18s; --t3: .24s;
+    /* --tap is the least height of anything pressed; --navb the room the navigation takes at the bottom of a phone. */
+    --tap: 40px; --pad: 10px; --nav-h: 58px; --rail: 60px; --navb: calc(var(--nav-h) + env(safe-area-inset-bottom, 0px));
+    --gl: calc(var(--pad) + env(safe-area-inset-left, 0px)); --gr: calc(var(--pad) + env(safe-area-inset-right, 0px));
+    --vh: 100vh;
   }
+  @supports (height: 100dvh) { :root { --vh: 100dvh; } }
+  @media (pointer: coarse) { :root { --tap: 44px; } }
+  @media (min-width: 720px) { :root { --pad: 16px; --navb: 0px; } }
   @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #161616; --fg: #ececea; --muted: #9a9a94; --card: #222222; --line: #3a3a36;
-      --accent: #3ecf8e; --accent-fg: #06281a; --warn: #ff8a80; --note: #f0c36a; --hl: #5a4a14;
+    :root:not([data-theme=light]) {
+      --bg: #131312; --surface: #1d1d1b; --inset: #272724; --line: #34332f; --edge: #55534c; --track: #77756c;
+      --fg: #eceae4; --muted: #a6a39a;
+      --accent: #46c79b; --accent-2: #5ad6ab; --accent-fg: #04261b; --accent-soft: #163a2e; --accent-ink: #8fe3c3;
+      --danger: #ff8a80; --danger-fg: #3b0a06; --danger-soft: #4a1d19; --danger-ink: #ffb4ab;
+      --note: #f0c36a; --note-soft: #40300c; --note-ink: #f6d58f;
+      --info: #8ab4f8; --info-soft: #172f4e; --info-ink: #b3cffb;
+      --hl: #5c4a12; --hl-ink: #ffe9a8; --focus: #8ab4f8; --toast: #eceae4; --toast-fg: #1b1a17;
+      --sq-light: #cfcbbb; --sq-dark: #6f8a76;
+      --shadow-1: 0 1px 2px rgba(0, 0, 0, .4); --shadow-2: 0 12px 32px rgba(0, 0, 0, .6); --shadow-b: 0 2px 12px rgba(0, 0, 0, .5);
     }
   }
-  * { box-sizing: border-box; }
-  html { -webkit-text-size-adjust: 100%; }
-  body { margin: 0; padding: 12px 16px 40px; background: var(--bg); color: var(--fg); font: 16px/1.4 system-ui, sans-serif; }
-  [hidden] { display: none !important; }
-  header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 8px; }
-  h1 { font-size: 1.25rem; margin: 0; }
-  h2 { font-size: 1rem; margin: 0 0 8px; }
-  .chip { font-size: .8rem; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); }
-  .chip.ctl { border-color: var(--accent); color: var(--accent); }
-  .spacer { flex: 1; }
-  nav { display: flex; gap: 6px; margin: 8px 0 12px; flex-wrap: wrap; }
-  nav button.on, .bar button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-  button, select, input[type=text], input[type=number] {
-    font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line);
-    background: var(--card); color: var(--fg);
+  :root[data-theme=dark] {
+    color-scheme: dark;
+    --bg: #131312; --surface: #1d1d1b; --inset: #272724; --line: #34332f; --edge: #55534c; --track: #77756c;
+    --fg: #eceae4; --muted: #a6a39a;
+    --accent: #46c79b; --accent-2: #5ad6ab; --accent-fg: #04261b; --accent-soft: #163a2e; --accent-ink: #8fe3c3;
+    --danger: #ff8a80; --danger-fg: #3b0a06; --danger-soft: #4a1d19; --danger-ink: #ffb4ab;
+    --note: #f0c36a; --note-soft: #40300c; --note-ink: #f6d58f;
+    --info: #8ab4f8; --info-soft: #172f4e; --info-ink: #b3cffb;
+    --hl: #5c4a12; --hl-ink: #ffe9a8; --focus: #8ab4f8; --toast: #eceae4; --toast-fg: #1b1a17;
+    --sq-light: #cfcbbb; --sq-dark: #6f8a76;
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, .4); --shadow-2: 0 12px 32px rgba(0, 0, 0, .6); --shadow-b: 0 2px 12px rgba(0, 0, 0, .5);
   }
-  button { cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
-  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
-  button.danger { color: var(--warn); }
-  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
-  .notice { padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; border: 1px solid var(--note); color: var(--note); }
-  .notice.err { border-color: var(--warn); color: var(--warn); }
-  .layout { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); max-width: 1100px; align-items: start; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  :root[data-theme=light] { color-scheme: light; }
+
+  /* ---------- base ---------- */
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  body { margin: 0; min-height: var(--vh); padding-bottom: var(--navb); background: var(--bg); color: var(--fg); font: 400 var(--fs-m)/1.45 var(--font); }
+  [hidden] { display: none !important; }
+  h1, h2, p { margin: 0; }
+  a { color: var(--accent); }
   .muted { color: var(--muted); }
-  .small { font-size: .85rem; }
-  footer { text-align: center; margin: 28px 0 10px; }
-  select { max-width: 100%; }
-  label.check { display: flex; gap: 8px; align-items: center; color: var(--fg); margin: 6px 0 2px; }
-  .status { margin: 8px 0; min-height: 1.4em; }
-  .status.unsure { color: var(--warn); }
-  /* The tracker took a move although it was not sure: a hint, with the way to put it right. */
-  .doubt { margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: var(--hl); border: 1px solid var(--line); }
-  .doubt .bar { margin: 6px 0 0; }
-  svg.board { width: 100%; max-width: 480px; height: auto; display: block; border-radius: 4px; touch-action: manipulation; }
-  /* The board with what each player has taken on its two sides: White's on the left, Black's on the right. A strip is as
-     high as the board (6 by 80 against the 80 by 80 of the board, so about a thirteenth of the board wide, and a little less). */
-  .board-row { display: flex; gap: 6px; align-items: flex-start; max-width: 560px; }
-  .board-row svg.board { flex: 1 1 auto; min-width: 0; max-width: none; }
-  svg.taken { flex: 0 0 6.4%; width: 6.4%; height: auto; display: block; }
-  /* The pieces to choose from when a pawn is promoted: tapped, or dragged onto the square. */
-  .tray { display: inline-flex; flex-wrap: wrap; gap: 6px; }
-  button.piece-btn { width: 3rem; height: 3rem; padding: 2px; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
-  button.piece-btn svg { width: 100%; height: 100%; display: block; pointer-events: none; }
+  .small { font-size: var(--fs-s); }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .i { width: 1.25em; height: 1.25em; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .flip { transform: scaleX(-1); }
+  :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+  /* ---------- buttons and fields ---------- */
+  button, select, input { font: inherit; color: inherit; }
+  button, a.btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: var(--tap); padding: 0 14px;
+    border-radius: var(--r2); border: 1px solid var(--edge); background: var(--surface); color: var(--fg); font-weight: 600;
+    text-decoration: none; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+    transition: background var(--t1), border-color var(--t1), color var(--t1), transform var(--t1);
+  }
+  button:active:not(:disabled), a.btn:active { transform: scale(.97); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  button.danger { color: var(--danger); border-color: var(--danger); }
+  button.icon { width: var(--tap); padding: 0; }
+  button.ghost { border-color: transparent; background: none; color: var(--muted); padding: 0 8px; }
+  button.big { width: 100%; min-height: 52px; font-size: var(--fs-l); border-radius: var(--r3); }
+  @media (hover: hover) {
+    button:hover:not(:disabled), a.btn:hover { background: var(--inset); }
+    button.primary:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); }
+  }
+  input[type=text], input[type=number], select {
+    width: 100%; min-height: var(--tap); padding: 0 12px; border-radius: var(--r2); border: 1px solid var(--track);
+    background: var(--surface); color: var(--fg);
+  }
+  input::placeholder { color: var(--muted); opacity: 1; }
+  select { max-width: 100%; cursor: pointer; }
+  label { display: block; font-size: var(--fs-s); font-weight: 600; margin: 0 0 4px; }
+  /* A box to tick is drawn as a switch: big enough for a finger, and its state is plain to see. */
+  input[type=checkbox] {
+    -webkit-appearance: none; appearance: none; flex: none; position: relative; width: 46px; height: 28px; margin: 0;
+    border-radius: 999px; background: var(--track); cursor: pointer; transition: background var(--t2);
+  }
+  input[type=checkbox]::before {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .35); transition: transform var(--t2);
+  }
+  input[type=checkbox]:checked { background: var(--accent); }
+  input[type=checkbox]:checked::before { transform: translateX(18px); }
+  input[type=checkbox]:disabled { opacity: .45; cursor: not-allowed; }
+  input[type=range] { width: 100%; margin: 0; min-height: var(--tap); accent-color: var(--accent); cursor: pointer; }
+  label.check { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: var(--tap); margin: var(--s2) 0 2px; font-size: var(--fs-m); cursor: pointer; }
+  .field { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 0 12px; margin: var(--s3) 0 var(--s1); }
+  .field > label { margin: 0; }
+  .field > output, .field > strong { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .field > input, .field > select, .field > .pair { grid-column: 1 / -1; }
+  .pair { display: flex; gap: 8px; margin-top: 4px; }
+  .pair select { flex: 1 1 0; min-width: 0; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); margin: var(--s3) 0; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: var(--s3) 0 0; }
+  .seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: var(--r2); background: var(--inset); border: 1px solid var(--line); }
+  .seg button { border: 0; background: none; min-height: var(--tap); padding: 0 12px; border-radius: 7px; color: var(--muted); }
+  .seg button[aria-pressed=true] { background: var(--surface); color: var(--fg); box-shadow: var(--shadow-1); }
+  kbd { font: inherit; font-size: var(--fs-xs); padding: 1px 7px; border-radius: 5px; border: 1px solid currentColor; opacity: .85; white-space: nowrap; }
+  @media (pointer: coarse) { kbd { display: none; } }
+
+  /* ---------- the frame: header, navigation, banners, toasts ---------- */
+  .top {
+    position: relative; z-index: 40; display: flex; align-items: center; gap: var(--s2); min-height: 52px;
+    padding: calc(6px + env(safe-area-inset-top, 0px)) var(--gr) 6px var(--gl); background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 8px; min-width: 0; margin-right: auto; }
+  .logo { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 9px; background: var(--accent); color: var(--accent-fg); flex: none; }
+  .brand h1 { font-size: 1.05rem; line-height: 1.15; letter-spacing: -.01em; }
+  .brand small { display: block; font-size: .68rem; line-height: 1.1; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .top-state { display: flex; align-items: center; gap: var(--s2); }
+  .chip { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface); font-size: var(--fs-s); font-weight: 600; white-space: nowrap; }
+  button.chip { min-height: var(--tap); border-color: var(--edge); }
+  button.chip.ctl { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-soft); }
+  button.chip .chev { width: 14px; height: 14px; transform: rotate(90deg); }
+  #mode::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  #mode[data-mode=idle]::before { background: var(--accent); }
+  #mode[data-mode=calibrating]::before { background: var(--note); }
+  #mode[data-mode=playing]::before { background: var(--danger); animation: pulse 2s ease-in-out infinite; }
+  #mode[data-mode=offline] { color: var(--danger-ink); border-color: var(--danger); background: var(--danger-soft); }
+  #mode[data-mode=offline]::before { background: var(--danger); }
+  @media (max-width: 359.98px) { .brand h1, .brand small { display: none; } }
+
+  /* The three sections: a bar at the bottom of a phone, in the header from a tablet on, a rail on the left of a phone
+     held sideways (further down). */
+  .tabs {
+    position: fixed; z-index: 30; left: 0; right: 0; bottom: 0; display: flex; height: var(--navb);
+    padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+    background: var(--surface); border-top: 1px solid var(--line);
+  }
+  .tabs button {
+    position: relative; flex: 1; flex-direction: column; gap: 2px; min-height: var(--nav-h); padding: 0; border: 0; border-radius: 0;
+    background: none; color: var(--muted); font-size: var(--fs-xs);
+  }
+  .tabs .i { width: 24px; height: 24px; }
+  .tabs button[aria-current] { color: var(--accent); }
+  .tabs button[aria-current]::before { content: ""; position: absolute; top: 0; left: 28%; right: 28%; height: 3px; border-radius: 0 0 3px 3px; background: var(--accent); }
+  @media (min-width: 720px) {
+    .top { min-height: 58px; }
+    .brand { margin-right: 0; }
+    .tabs { position: static; height: auto; padding: 0; margin: 0 auto 0 var(--s4); gap: 4px; background: none; border: 0; }
+    .tabs button { flex: none; flex-direction: row; gap: 8px; min-height: var(--tap); padding: 0 14px; border-radius: 999px; font-size: var(--fs-m); }
+    .tabs .i { width: 20px; height: 20px; }
+    .tabs button[aria-current] { background: var(--accent-soft); color: var(--accent-ink); }
+    .tabs button[aria-current]::before { content: none; }
+  }
+
+  .pop {
+    position: absolute; z-index: 50; top: calc(100% + 6px); right: var(--gr); width: min(330px, calc(100vw - 20px)); padding: var(--s4);
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--r3); box-shadow: var(--shadow-2); animation: rise var(--t2) ease-out;
+  }
+  .pop > * + * { margin-top: var(--s3); }
+  .pop-row { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); font-weight: 600; }
+
+  main { max-width: 1560px; margin: 0 auto; padding: var(--pad) var(--gr) var(--s5) var(--gl); }
+  footer { text-align: center; padding: 0 var(--pad) var(--s4); }
+  .banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 14px; margin-bottom: var(--s3); border-radius: var(--r2); border: 1px solid var(--note); background: var(--note-soft); color: var(--note-ink); font-weight: 500; }
+  .banner.err { border-color: var(--danger); background: var(--danger-soft); color: var(--danger-ink); }
+  .banner.info { border-color: var(--info); background: var(--info-soft); color: var(--info-ink); }
+  .banner > span { flex: 1 1 12rem; }
+  #toasts { position: fixed; z-index: 60; left: 50%; bottom: calc(var(--navb) + 14px); transform: translateX(-50%); display: grid; gap: 8px; width: min(430px, calc(100vw - 24px)); pointer-events: none; }
+  .toast { padding: 12px 16px; border-radius: var(--r2); background: var(--toast); color: var(--toast-fg); font-weight: 500; box-shadow: var(--shadow-2); pointer-events: auto; cursor: pointer; animation: rise var(--t2) ease-out; }
+
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r3); padding: var(--s4); box-shadow: var(--shadow-1); min-width: 0; }
+  .card h2, summary .ttl { font-size: var(--fs-s); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  .card > h2 { margin-bottom: var(--s2); }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); min-height: 32px; margin-bottom: var(--s2); }
+  .empty { display: grid; justify-items: center; gap: var(--s2); padding: var(--s5) var(--s4); text-align: center; color: var(--muted); }
+  .empty .i { width: 36px; height: 36px; stroke-width: 1.5; opacity: .7; }
+
+  /* ---------- the board, the pieces taken beside it, the players and their clocks ---------- */
+  /* The strips are 6 units wide and 80 high against the 80 by 80 of the board, so the three are exactly as high. */
+  .board-row { display: grid; grid-template-columns: 6fr 80fr 6fr; gap: 6px; align-items: start; }
+  svg.board { display: block; width: 100%; height: auto; aspect-ratio: 1; border-radius: 8px; box-shadow: var(--shadow-b); touch-action: manipulation; }
+  svg.taken { display: block; width: 100%; height: auto; aspect-ratio: 6 / 80; border-radius: 6px; background: var(--inset); }
   svg.board.playable { touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
   svg.board.playable.lifted { cursor: grabbing; }
-  .clocks { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 8px; font-variant-numeric: tabular-nums; }
-  .clocks span { padding: 2px 10px; border-radius: 6px; border: 1px solid var(--line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-  .clocks span.on { background: var(--hl); font-weight: 600; }
-  /* A game with a time limit: the clocks count down, and go red when little is left. */
-  .clocks.limited span { font-size: 1.25rem; padding: 4px 12px; }
-  .clocks span.low { color: var(--warn); }
-  .clocks span.out { color: var(--warn); border-color: var(--warn); font-weight: 600; }
-  button.big { flex: 1 1 220px; padding: 14px 12px; font-size: 1.1rem; }
-  .board-tools { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
-  table.moves { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
-  table.moves td, table.moves th { padding: 3px 6px; text-align: left; }
-  table.moves th { color: var(--muted); font-weight: 500; font-size: .8rem; }
-  table.moves td.n { color: var(--muted); width: 2.2em; }
-  table.moves td.m { cursor: pointer; border-radius: 4px; }
-  table.moves td.m.on { background: var(--hl); }
-  table.moves small { color: var(--muted); margin-left: 4px; }
-  .scroll { max-height: 320px; overflow: auto; }
-  label { display: block; font-size: .85rem; color: var(--muted); margin: 8px 0 2px; }
-  input[type=text], input[type=number] { width: 100%; }
-  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .slider { display: grid; grid-template-columns: 6.5rem 1fr 3rem; align-items: center; gap: 8px; color: var(--fg); margin: 6px 0; }
-  .slider output { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .slider input[type=range] { width: 100%; margin: 0; }
-  .stage { position: relative; line-height: 0; }
-  .stage img { width: 100%; height: auto; border-radius: 6px; background: #000; }
+  .sqd { fill: var(--sq-dark); } .sql { fill: var(--sq-light); } .mk { fill: var(--mark); } .pk { fill: var(--pick); }
+  .co { font: 700 2.3px var(--font); } .co.l { fill: var(--sq-dark); } .co.d { fill: var(--sq-light); }
+  .dot { fill: #1d1c19; opacity: .32; } .ring { fill: none; stroke: #1d1c19; stroke-width: .9; opacity: .32; }
+  .pc { stroke-linejoin: round; stroke-linecap: round; }
+  .pc.w { fill: var(--pw); stroke: var(--pwl); } .pc.b { fill: var(--pb); stroke: var(--pbl); }
+  .lead { font: 700 3.1px var(--font); fill: var(--fg); text-anchor: middle; }
+  /* A move that has just been made: the piece slides from its square, and the marks fade in. */
+  .slide { animation: slide var(--t3) cubic-bezier(.2, .7, .2, 1); }
+  .mk.new { animation: fade var(--t3) ease-out; }
+  #ghost { filter: drop-shadow(0 .4px .5px rgba(0, 0, 0, .4)); }
+  @keyframes slide { from { transform: translate(var(--dx), var(--dy)); } }
+  @keyframes fade { from { opacity: 0; } }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+
+  .player { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 5px 5px 5px 12px; border-radius: var(--r2); background: var(--surface); border: 1px solid var(--line); transition: border-color var(--t2), box-shadow var(--t2); }
+  .player .who { flex: none; width: 14px; height: 14px; border-radius: 50%; background: var(--pw); border: 2px solid var(--track); }
+  .player.black .who { background: var(--pb); }
+  .player .name { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .player .tag { font-size: var(--fs-xs); font-weight: 600; padding: 2px 8px; border-radius: 999px; background: var(--note-soft); color: var(--note-ink); }
+  .player .time { min-width: 3.4em; padding: 2px 10px; border-radius: 7px; background: var(--inset); font-size: 1.15rem; font-weight: 650; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; transition: background var(--t2), color var(--t2); }
+  .timed .player .time { font-size: clamp(1.35rem, 6vw, 1.75rem); line-height: 1.25; letter-spacing: -.01em; }
+  .player .time:empty { display: none; }
+  .player.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .player.on .time { background: var(--accent); color: var(--accent-fg); }
+  .player.low .time { background: var(--danger-soft); color: var(--danger-ink); }
+  .player.on.low .time, .player.out .time { background: var(--danger); color: var(--danger-fg); }
+
+  /* What the tracker is doing, in a colour for each state, so that a glance is enough. */
+  .status { display: flex; align-items: flex-start; gap: 10px; min-height: var(--tap); padding: 9px 12px; border-radius: var(--r2); background: var(--inset); font-weight: 500; line-height: 1.35; transition: background var(--t2), color var(--t2); }
+  .status::before { content: ""; flex: none; width: 10px; height: 10px; margin-top: .35em; border-radius: 50%; background: var(--track); }
+  .status:empty { display: none; }
+  .status[data-state=watching] { background: var(--accent-soft); color: var(--accent-ink); }
+  .status[data-state=watching]::before { background: var(--accent); }
+  .status[data-state=moving], .status[data-state=info] { background: var(--info-soft); color: var(--info-ink); }
+  .status[data-state=moving]::before, .status[data-state=info]::before { background: var(--info); }
+  .status[data-state=moving]::before { animation: pulse 1s ease-in-out infinite; }
+  .status[data-state=learning], .status[data-state=undone] { background: var(--note-soft); color: var(--note-ink); }
+  .status[data-state=learning]::before, .status[data-state=undone]::before { background: var(--note); }
+  .status[data-state=unsure], .status[data-state=no_calibration] { background: var(--danger-soft); color: var(--danger-ink); font-weight: 600; }
+  .status[data-state=unsure]::before, .status[data-state=no_calibration]::before { background: var(--danger); }
+  body.offline #status { opacity: .55; }
+  .status-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; justify-content: flex-end; }
+  .status-row .status { flex: 1 1 11rem; }
+  .below { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s2); }
+  .callout { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border-radius: var(--r2); border: 1px solid var(--info); background: var(--info-soft); color: var(--info-ink); animation: rise var(--t2) ease-out; }
+  .callout > :first-child { flex: 1 1 100%; }
+  .callout.ask { border-color: var(--danger); background: var(--danger-soft); color: var(--danger-ink); font-weight: 600; }
+  .callout.doubt, .callout.note { border-color: var(--note); background: var(--note-soft); color: var(--note-ink); }
+  .callout .bar { margin: 0; flex: 1 1 100%; }
+  .callout button small { font-weight: 500; color: var(--muted); }
+  /* The pieces to choose from when a pawn is promoted: tapped, or dragged onto the square. */
+  .tray { display: inline-flex; flex-wrap: wrap; gap: 8px; flex: 0 1 auto !important; }
+  button.piece-btn { width: 54px; height: 54px; min-height: 0; padding: 3px; border-color: transparent; background: var(--sq-dark); touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+  button.piece-btn:hover:not(:disabled) { background: var(--sq-light); }
+  button.piece-btn svg { width: 100%; height: 100%; display: block; pointer-events: none; }
+
+  /* ---------- Live: the board with a player above and below, then the panel (moves, controls, new game) ---------- */
+  /* --bw is the width of the board with its two strips. It is the room there is, and no more than what the height of
+     the screen leaves once the rest (--chrome) is counted, so that the clocks and the board are seen without scrolling. */
+  .live, .rp { display: grid; gap: var(--s2); grid-template-columns: minmax(0, 1fr); justify-items: center; grid-template-areas: "ptop" "board" "pbot" "below" "side"; }
+  .live { --cap: 900px; --chrome: calc(248px + var(--navb)); --bw: min(100%, var(--cap), max(220px, calc((var(--vh) - var(--chrome)) * 1.15 + 12px))); }
+  .live > .board-row, .rp > .board-row { grid-area: board; }
+  .below { grid-area: below; }
+  .side { grid-area: side; }
+  [data-top=black] > .player.black, [data-top=white] > .player.white { grid-area: ptop; }
+  [data-top=black] > .player.white, [data-top=white] > .player.black { grid-area: pbot; }
+  .live > .player, .live > .board-row, .live > .below, .rp > .player, .rp > .board-row { width: var(--bw); }
+  .side { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s3); width: min(100%, 900px); margin-top: var(--s2); align-content: start; }
+  #game-panel { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: flex-start; }
+  #game-panel > * { flex: 1 1 300px; min-width: 0; margin: 0; }
+  #game-panel > .span { flex-basis: 100%; }
+  .result { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px 14px; border-radius: var(--r3); border: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
+  .result strong { flex: 1 1 auto; font-size: var(--fs-l); }
+  .clock-bar { display: flex; flex-wrap: wrap; gap: 8px; }
+  #clock-switch { flex: 1 1 150px; flex-direction: column; gap: 3px; min-height: 68px; font-size: var(--fs-l); border-radius: var(--r3); }
+  #clock-pause { flex: 0 1 auto; min-height: 68px; border-radius: var(--r3); }
+  .entry { display: flex; gap: 8px; }
+  .entry input { flex: 1; min-width: 0; }
+  #end-bar { padding-top: var(--s3); border-top: 1px solid var(--line); flex-wrap: nowrap; }
+  #end-bar select { flex: 1; min-width: 0; }
+  #tc-presets button { min-width: 3.6rem; padding: 0 10px; border-radius: 999px; }
+  #tc-presets button[aria-pressed=true] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-ink); }
+  fieldset { border: 0; padding: 0; margin: var(--s4) 0 0; min-width: 0; }
+  legend { padding: 0; font-size: var(--fs-s); font-weight: 600; }
+  fieldset .bar { margin-top: 6px; }
+  details.plain { margin: var(--s3) 0; }
+  details.plain > summary { min-height: var(--tap); display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--accent); font-weight: 600; }
+  #start-form > button.big { margin-top: var(--s3); }
+
+  /* The moves: a table with the times, or on a phone one line that scrolls sideways until it is opened. */
+  .scroll { max-height: min(46vh, 430px); overflow: auto; overscroll-behavior: contain; }
+  .moves { font-variant-numeric: tabular-nums; }
+  .mv-head, .mv-row { display: grid; grid-template-columns: 2.6em 1fr 1fr; align-items: center; gap: 0 4px; }
+  .mv-head { position: sticky; top: 0; z-index: 1; padding-bottom: 2px; background: var(--surface); color: var(--muted); font-size: var(--fs-xs); font-weight: 600; }
+  .mv-head span + span { padding-left: 8px; }
+  .mv-row .n { color: var(--muted); font-size: var(--fs-s); }
+  .m { display: flex; align-items: baseline; justify-content: flex-start; gap: 6px; width: 100%; min-height: 32px; padding: 5px 8px; border: 0; border-radius: var(--r1); background: none; font-weight: 600; text-align: left; }
+  .m b { font-weight: 650; }
+  .m i { font-style: normal; color: var(--note); }
+  .m small { color: var(--muted); font-size: var(--fs-xs); font-weight: 500; }
+  .m.on { background: var(--hl); color: var(--hl-ink); }
+  .m.on small { color: inherit; }
+  @media (pointer: coarse) { button.m { min-height: 44px; } }
+  .mv-note { margin-top: var(--s2); }
+  .moves-toggle { display: none; font-size: var(--fs-s); }
+  @media (max-width: 719.98px) {
+    #clock-hint { order: 9; }
+    .moves-toggle { display: inline-flex; }
+    .moves-box:not(.open) .scroll { overflow: auto hidden; scrollbar-width: none; }
+    .moves-box:not(.open) .moves { display: flex; width: max-content; gap: 10px; }
+    .moves-box:not(.open) .mv-row { display: flex; gap: 0; }
+    .moves-box:not(.open) :is(.mv-head, .mv-note, .m small) { display: none; }
+    .moves-box:not(.open) .m { width: auto; padding: 5px 6px; min-height: var(--tap); align-items: center; }
+    .moves-box.open .scroll { max-height: 52vh; }
+  }
+
+  /* ---------- Games: the list, and one game replayed ---------- */
+  .games-view { display: grid; gap: var(--s3); grid-template-columns: minmax(0, 1fr); justify-items: center; }
+  .games-view > * { width: min(100%, 900px); }
+  ul.games { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  button.game { justify-content: space-between; gap: 12px; width: 100%; min-height: 58px; padding: 8px 12px; text-align: left; border-color: var(--line); }
+  .game > span:first-child { display: grid; min-width: 0; }
+  .game strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .game .muted { font-size: var(--fs-s); font-weight: 400; }
+  .game .res { flex: none; padding: 2px 10px; border-radius: 999px; background: var(--inset); font-size: var(--fs-s); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .game .res.now { background: var(--accent-soft); color: var(--accent-ink); }
+  button.game[aria-current] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .skel { height: 58px; border-radius: var(--r2); background: linear-gradient(90deg, var(--inset) 25%, var(--line) 50%, var(--inset) 75%) 0 0 / 200% 100%; animation: shimmer 1.4s linear infinite; }
+  #replay-empty { display: none; }
+  .games-view.open #games-card { display: none; }
+  .replay-head { display: flex; align-items: center; gap: var(--s2); margin-bottom: var(--s3); }
+  .replay-head h2 { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-m); text-transform: none; letter-spacing: 0; color: var(--fg); }
+  .rp { --chrome: calc(330px + var(--navb)); --bw: min(100%, 900px, max(220px, calc((var(--vh) - var(--chrome)) * 1.15 + 12px))); grid-template-areas: "ptop" "board" "pbot" "side"; }
+  .rp .side { margin-top: 0; }
+  .transport { display: flex; gap: 6px; justify-content: center; }
+  .transport button { flex: 1 1 0; max-width: 72px; padding: 0; }
+  .transport #r-play { flex: 1.6 1 0; max-width: 130px; }
+  .progress { height: 4px; border-radius: 2px; background: var(--inset); overflow: hidden; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width var(--t2); }
+  .rp-info { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; font-size: var(--fs-s); font-variant-numeric: tabular-nums; }
+  .rp-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .rp-tools select { flex: 1 1 9rem; width: auto; }
+
+  /* ---------- Calibrate: the camera picture first, then one folding section for each group of settings ---------- */
+  .cal { display: grid; gap: var(--s3); grid-template-columns: minmax(0, 1fr); justify-items: center; align-items: start; }
+  .cal > * { width: min(100%, 900px); min-width: 0; }
+  .cal-side { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
+  .stage { position: relative; line-height: 0; border-radius: var(--r2); overflow: hidden; background: #000; }
+  .stage img { display: block; width: 100%; height: auto; }
   .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-  #live { cursor: crosshair; }
-  ul.games { list-style: none; margin: 0; padding: 0; }
-  ul.games li { padding: 10px 6px; border-bottom: 1px solid var(--line); cursor: pointer; display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; }
-  ul.games li:hover { background: var(--hl); }
-  .result { font-weight: 600; }
-  details { margin: 8px 0; }
-  .time { font-variant-numeric: tabular-nums; }
-  a { color: var(--accent); }
+  #cal-stage { margin: var(--s2) auto 0; max-width: calc((var(--vh) - 150px) * var(--ar, 1.34)); }
+  #live { cursor: crosshair; aspect-ratio: auto 4 / 3; touch-action: manipulation; }
+  #warp { aspect-ratio: auto 1; }
+  #warp-card .stage { max-width: 420px; margin: 0 auto var(--s2); }
+  .steps { display: flex; gap: 6px; list-style: none; margin: var(--s3) 0 var(--s2); padding: 0; }
+  #cal-actions { margin-top: 0; }
+  #cal-msg { margin-top: var(--s2); }
+  .steps li { min-width: 2.8rem; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--inset); color: var(--muted); font-size: var(--fs-s); font-weight: 600; text-align: center; }
+  .steps li.done { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-ink); }
+  .steps li.next { border-color: var(--info); background: var(--info); color: var(--surface); }
+  .views { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: start; margin-top: var(--s3); }
+  .views img { width: 100%; height: auto; border-radius: var(--r1); }
+  details.acc { padding: 0; }
+  details > summary { list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  details.acc > summary { display: flex; align-items: center; gap: 10px; min-height: 52px; padding: 0 var(--s4); border-radius: var(--r3); cursor: pointer; }
+  summary .sum { flex: 1; min-width: 0; text-align: right; color: var(--muted); font-size: var(--fs-s); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  summary .chev { width: 18px; height: 18px; color: var(--muted); transition: transform var(--t2); }
+  details[open] > summary .chev { transform: rotate(90deg); }
+  .acc-body { padding: 0 var(--s4) var(--s4); }
+  .acc-body > :first-child { margin-top: 0; }
+  .acc-body p + p { margin-top: 6px; }
+  details.sub { margin-top: var(--s3); border-top: 1px solid var(--line); }
+  details.sub > summary { display: flex; align-items: center; gap: 8px; min-height: var(--tap); cursor: pointer; font-weight: 600; }
+
+  /* ---------- a tablet or a computer screen that is wider than high: the board on the left, the panel beside it ---------- */
+  @media (min-width: 880px) and (min-aspect-ratio: 6/5) and (min-height: 521px) {
+    .live {
+      --chrome: 262px; --bw: min(900px, max(300px, calc((var(--vh) - var(--chrome)) * 1.15 + 12px)), calc(100vw - 400px));
+      grid-template-columns: var(--bw) minmax(300px, 420px); justify-content: center; justify-items: stretch; column-gap: var(--s5);
+      grid-template-areas: "ptop side" "board side" "pbot side" "below side" ". side"; grid-template-rows: auto auto auto auto 1fr;
+    }
+    .live > .side { width: auto; margin-top: 0; }
+    .live .scroll { max-height: max(190px, calc(var(--vh) - 600px)); }
+    .games-view { grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); justify-items: stretch; max-width: 1400px; margin: 0 auto; column-gap: var(--s4); align-items: start; }
+    .games-view > * { width: auto; }
+    .games-view.open #games-card { display: block; }
+    #games-card { max-height: calc(var(--vh) - 100px); overflow: auto; overscroll-behavior: contain; }
+    #replay-empty { display: grid; align-content: center; min-height: 300px; }
+    #r-back { display: none; }
+    .rp { --chrome: 350px; }
+    .cal { grid-template-columns: minmax(0, 1fr) minmax(320px, 400px); justify-items: stretch; column-gap: var(--s4); max-width: 1400px; margin: 0 auto; }
+    .cal > * { width: auto; }
+    #cal-stage { max-width: calc((var(--vh) - 330px) * var(--ar, 1.34)); }
+  }
+  @media (min-width: 1240px) and (min-aspect-ratio: 6/5) and (min-height: 521px) {
+    .rp {
+      --chrome: 262px; --bw: min(900px, max(300px, calc((var(--vh) - var(--chrome)) * 1.15 + 12px)), calc(100vw - 800px));
+      grid-template-columns: var(--bw) minmax(280px, 400px); justify-content: center; justify-items: stretch; column-gap: var(--s5);
+      grid-template-areas: "ptop side" "board side" "pbot side" ". side"; grid-template-rows: auto auto auto 1fr;
+    }
+    .rp > .side { width: auto; }
+  }
+
+  @media (min-width: 1600px) and (min-height: 900px) {
+    html { font-size: 112.5%; }
+    .live { --chrome: 290px; }
+  }
+
+  /* ---------- a phone held sideways: the sections on a rail, the board as high as the screen, the rest beside it ---------- */
+  @media (max-height: 520px) and (min-width: 560px) and (orientation: landscape) {
+    :root { --pad: 8px; --navb: 0px; --gl: var(--pad); }
+    body { padding-left: calc(var(--rail) + env(safe-area-inset-left, 0px)); }
+    .top { min-height: 46px; padding-top: calc(1px + env(safe-area-inset-top, 0px)); padding-bottom: 1px; }
+    .brand { margin-right: auto; }
+    .brand small { display: none; }
+    .logo { width: 26px; height: 26px; }
+    .tabs {
+      position: fixed; top: 0; bottom: 0; left: 0; right: auto; width: calc(var(--rail) + env(safe-area-inset-left, 0px)); height: auto; margin: 0;
+      flex-direction: column; justify-content: center; gap: 4px; padding: 0 0 0 env(safe-area-inset-left, 0px);
+      background: var(--surface); border: 0; border-right: 1px solid var(--line);
+    }
+    .tabs button { flex: none; flex-direction: column; gap: 2px; width: 100%; min-height: 56px; padding: 0; border-radius: 0; font-size: var(--fs-xs); }
+    .tabs .i { width: 22px; height: 22px; }
+    .tabs button[aria-current] { background: var(--accent-soft); color: var(--accent-ink); }
+    .tabs button[aria-current]::before { content: none; }
+    main { padding-bottom: var(--pad); }
+    .live, .rp {
+      --bw: min(58vw, max(200px, calc((var(--vh) - var(--chrome)) * 1.15 + 12px)));
+      grid-template-columns: var(--bw) minmax(0, 1fr); justify-items: stretch; column-gap: var(--s3); grid-template-rows: auto auto auto 1fr;
+    }
+    .live { --chrome: 64px; grid-template-areas: "board ptop" "board pbot" "board below" "board side"; }
+    .rp { --chrome: 118px; grid-template-areas: "board ptop" "board pbot" "board side" "board side"; }
+    .live > .board-row, .rp > .board-row { position: sticky; top: var(--pad); }
+    .live > .player, .live > .below, .rp > .player, .side { width: auto; }
+    .player { min-height: 42px; }
+    @media (max-width: 700px) {
+      .player .tag { display: none; }
+      .player.paused .time::before { content: ""; display: inline-block; width: .3em; height: .62em; margin-right: .35em; border: solid; border-width: 0 .13em; opacity: .7; }
+    }
+    .timed .player .time { font-size: 1.4rem; }
+    .side { margin-top: 0; }
+    .replay-head { margin-bottom: var(--s2); }
+    .cal > * { width: 100%; }
+    .cal-side { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); align-items: start; }
+    #cal-controls { display: grid; grid-template-columns: auto minmax(170px, 1fr); column-gap: var(--s3); align-content: start; }
+    #cal-controls > * { grid-column: 2; }
+    #cal-controls > #cal-stage { grid-column: 1; grid-row: 1 / span 8; align-self: start; margin: 0; max-width: none; width: min(56vw, calc((var(--vh) - 130px) * var(--ar, 1.34))); }
+    #cal-controls > #cal-idle { grid-column: 1 / -1; }
+  }
+
+  /* ---------- the board alone with the clocks (the button beside the status), for a screen propped up by the board ---------- */
+  body.focus { padding: 0; }
+  body.focus :is(.top, .tabs, footer, #claim-bar, #notice, #start-form, #start-viewer, #live-moves-box, #controls, #clock-hint, #unfinished, #draw-claim) { display: none; }
+  body.focus main { padding-top: calc(var(--pad) + env(safe-area-inset-top, 0px)); }
+  body.focus .live { --chrome: 200px; --cap: 1200px; }
+  body.focus .live.clocked { --chrome: 290px; }
+  body.focus .player { min-height: 58px; }
+  body.focus .player .name { font-size: var(--fs-l); }
+  body.focus .timed .player .time { font-size: clamp(1.6rem, 7vw, 2.4rem); }
+  @media (min-width: 880px) and (min-aspect-ratio: 6/5) and (min-height: 521px) {
+    body.focus .live {
+      --bw: min(100%, 1200px, max(300px, calc((var(--vh) - var(--chrome)) * 1.15 + 12px)));
+      grid-template-columns: minmax(0, 1fr); justify-items: center; grid-template-areas: "ptop" "board" "pbot" "below" "side"; grid-template-rows: none;
+    }
+    body.focus .live > :is(.player, .board-row, .below, .side) { width: var(--bw); }
+  }
+  @media (max-height: 520px) and (min-width: 560px) and (orientation: landscape) {
+    body.focus { padding: 0; }
+    body.focus .live, body.focus .live.clocked { --chrome: 20px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  }
 </style>
 </head>
 <body>
 
-<header>
-  <h1>NicoChess</h1>
-  <span class="chip" id="role">…</span>
-  <span class="chip" id="mode"></span>
-  <span class="spacer"></span>
-  <button id="claim" hidden>Take control</button>
-  <button id="release" hidden>Release control</button>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <symbol id="i-live" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 3h6a3 3 0 0 1 3 3v6h-9zM3 12h9v9H6a3 3 0 0 1-3-3z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-games" viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01" stroke-width="3"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M4 7h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/></symbol>
+  <symbol id="i-turn" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 3v5h-5"/></symbol>
+  <symbol id="i-focus" viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></symbol>
+  <symbol id="i-unfocus" viewBox="0 0 24 24"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M8 5 3 10l5 5"/><path d="M3 10h11a6 6 0 0 1 0 12h-3"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z" fill="currentColor"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14" stroke-width="3"/></symbol>
+  <symbol id="i-first" viewBox="0 0 24 24"><path d="M19 5v14l-10-7z" fill="currentColor"/><path d="M5 5v14"/></symbol>
+  <symbol id="i-last" viewBox="0 0 24 24"><path d="M5 5v14l10-7z" fill="currentColor"/><path d="M19 5v14"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><path d="M15 5 8 12l7 7"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M11 6 5 12l6 6M5 12h14"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path d="M7 4 3 8l4 4M3 8h14M17 12l4 4-4 4M21 16H7"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="m20 20-4.5-4.5"/></symbol>
+</defs></svg>
+
+<header class="top">
+  <div class="brand">
+    <span class="logo"><svg class="i" aria-hidden="true"><use href="#i-live"/></svg></span>
+    <div><h1>NicoChess</h1><small id="version-top"></small></div>
+  </div>
+  <nav class="tabs" id="nav" aria-label="Sections">
+    <button type="button" data-tab="live" aria-current="page"><svg class="i" aria-hidden="true"><use href="#i-live"/></svg><span>Live</span></button>
+    <button type="button" data-tab="games"><svg class="i" aria-hidden="true"><use href="#i-games"/></svg><span>Games</span></button>
+    <button type="button" data-tab="calibrate"><svg class="i" aria-hidden="true"><use href="#i-cam"/></svg><span>Calibrate</span></button>
+  </nav>
+  <div class="top-state">
+    <span class="chip" id="mode" data-mode="" title="What the program is doing, and whether this page hears from it">Connecting…</span>
+    <button type="button" class="chip" id="role" aria-haspopup="true" aria-expanded="false" aria-controls="session" title="Your role, the theme and the version">
+      <svg class="i" aria-hidden="true"><use id="role-icon" href="#i-eye"/></svg><span id="role-text">…</span><svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg>
+    </button>
+  </div>
+  <div class="pop" id="session" hidden>
+    <p id="role-info"></p>
+    <button type="button" id="release" hidden>Release control</button>
+    <p class="muted small" id="viewers"></p>
+    <div class="pop-row"><span id="theme-label">Theme</span>
+      <div class="seg" id="theme" role="group" aria-labelledby="theme-label">
+        <button type="button" data-theme="auto" aria-pressed="true" title="As the device is set">Auto</button>
+        <button type="button" data-theme="light" aria-pressed="false">Light</button>
+        <button type="button" data-theme="dark" aria-pressed="false">Dark</button>
+      </div>
+    </div>
+  </div>
 </header>
 
-<div id="notice" class="notice" hidden></div>
-<div id="offline" class="notice err" hidden>Connection lost. Reconnecting…</div>
-
-<nav>
-  <button data-tab="live" class="on">Live</button>
-  <button data-tab="games">Games</button>
-  <button data-tab="calibrate">Calibrate</button>
-</nav>
+<main id="main">
+<div id="offline" class="banner err" role="alert" hidden>Connection lost. Reconnecting…</div>
+<div id="notice" class="banner" role="status" hidden></div>
+<div id="claim-bar" class="banner info" hidden><span>Nobody is controlling the board.</span><button type="button" id="claim" class="primary">Take control</button></div>
 
 <!-- LIVE -->
-<section id="tab-live">
-  <div class="layout">
-    <div class="card">
-      <h2 id="live-title">Game</h2>
-      <div class="clocks" id="clocks" hidden title="The time each player has spent thinking, from the first move"><span id="clock-white"></span><span id="clock-black"></span></div>
-      <div class="board-row">
-        <svg class="taken" id="taken-live-white" viewBox="0 0 6 80" role="img" aria-label="Taken by White"></svg>
-        <svg class="board" id="live-board" viewBox="0 0 80 80" role="img" aria-label="Chess board"></svg>
-        <svg class="taken" id="taken-live-black" viewBox="0 0 6 80" role="img" aria-label="Taken by Black"></svg>
+<section id="tab-live" class="live" data-top="black" aria-labelledby="live-title">
+  <h2 id="live-title" class="sr-only">Board</h2>
+  <div class="player black" id="player-black"><span class="who" aria-hidden="true"></span><span class="name" id="name-black">Black</span><span class="tag" id="tag-black" hidden>paused</span><span class="time" id="clock-black"></span></div>
+  <div class="board-row">
+    <svg class="taken" id="taken-live-white" viewBox="0 0 6 80" role="img" aria-label="Taken by White"></svg>
+    <svg class="board" id="live-board" viewBox="0 0 80 80" role="img" aria-label="Chess board"></svg>
+    <svg class="taken" id="taken-live-black" viewBox="0 0 6 80" role="img" aria-label="Taken by Black"></svg>
+  </div>
+  <div class="player white" id="player-white"><span class="who" aria-hidden="true"></span><span class="name" id="name-white">White</span><span class="tag" id="tag-white" hidden>paused</span><span class="time" id="clock-white"></span></div>
+
+  <div class="below">
+    <div class="status-row">
+      <div class="status" id="status">Connecting to the board…</div>
+      <button type="button" class="icon" id="turn-live" title="Turn the board a quarter turn" aria-label="Turn the board a quarter turn"><svg class="i" aria-hidden="true"><use href="#i-turn"/></svg></button>
+      <button type="button" class="icon" id="focus-live" aria-pressed="false" title="Show only the board and the clocks" aria-label="Show only the board and the clocks"><svg class="i" aria-hidden="true"><use id="focus-icon" href="#i-focus"/></svg></button>
+    </div>
+  </div>
+
+  <div class="side">
+    <div id="drag-promo" class="callout" hidden>
+      <span>Promote to (tap a piece, or drag it onto the blue square):</span>
+      <span class="tray"></span>
+      <button type="button" id="promo-cancel">Cancel</button>
+    </div>
+    <div id="candidates" class="callout ask" role="status" hidden></div>
+    <div id="doubt" class="callout doubt" role="status" hidden></div>
+    <div id="promotion" class="callout" hidden>
+      <span>Promoted to a queen? Change it (tap a piece, or drag it onto the blue square):</span>
+      <span class="tray"></span>
+    </div>
+    <div id="start-viewer" class="card empty" hidden>
+      <svg class="i" aria-hidden="true"><use href="#i-eye"/></svg>
+      <p>No game is being recorded.</p>
+      <p class="small">When the controller starts one, the board, the clocks and the moves show here by themselves.</p>
+    </div>
+
+    <!-- a game -->
+    <div id="game-panel" hidden>
+      <div class="banner span" id="unfinished" hidden>
+        <span>An unfinished game was found.</span>
+        <button type="button" class="primary" id="resume" title="Set the pieces as in the position shown, then press">Resume</button>
+        <button type="button" id="close-unfinished" title="End the game as it is, without a result (*)">Close it</button>
       </div>
-      <div class="board-tools"><button id="turn-live" title="Turn the board a quarter turn">&#x27F3; 90&deg;</button><span class="muted small" id="drag-hint" hidden>Move a piece by dragging it (or tap it, then the square).</span></div>
-      <div id="drag-promo" class="bar" hidden>
-        <span>Promote to (tap a piece, or drag it onto the blue square):</span>
-        <span class="tray"></span>
-        <button type="button" id="promo-cancel">Cancel</button>
+      <div class="result span" id="game-over" hidden>
+        <strong id="game-result"></strong><a class="btn" id="game-pgn" href="#" download><svg class="i" aria-hidden="true"><use href="#i-down"/></svg>Download PGN</a>
       </div>
-      <div class="status" id="status"></div>
-      <div id="candidates" class="bar" hidden></div>
-      <div id="doubt" class="doubt" hidden></div>
-      <div id="promotion" class="bar" hidden>
-        <span>Promoted to a queen? Change it (tap a piece, or drag it onto the blue square):</span>
-        <span class="tray"></span>
+      <div class="clock-bar span" id="clock-bar" hidden>
+        <button type="button" class="primary" id="clock-switch"><span id="clock-switch-text"></span><kbd>space bar</kbd></button>
+        <button type="button" id="clock-pause" title="Stop both clocks until it is resumed"><svg class="i" aria-hidden="true"><use href="#i-pause"/></svg>Pause</button>
+      </div>
+      <p class="muted small span" id="clock-hint" hidden>The clock also follows the moves the camera sees. Pressing it (the button, or the space bar) as you make your move hands the time over at once.</p>
+      <div class="banner span" id="draw-claim" hidden>
+        <span id="draw-claim-text"></span>
+        <button type="button" id="claim-draw" title="End the game as a draw">Claim the draw</button>
+      </div>
+      <div class="card moves-box" id="live-moves-box">
+        <div class="card-head"><h2>Moves</h2><button type="button" class="ghost moves-toggle" aria-expanded="false">All moves</button></div>
+        <div class="scroll"><div class="moves" id="live-moves"></div></div>
+        <p class="muted small" id="game-names" style="margin-top:8px"></p>
+      </div>
+      <div class="card" id="controls" hidden>
+        <h2>Controls</h2>
+        <div class="entry">
+          <input type="text" id="move" placeholder="Enter a move, e.g. Nf3 or e2e4" aria-label="A move to play, for example Nf3 or e2e4" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go">
+          <button type="button" id="send-move">Play</button>
+        </div>
+        <p class="muted small" id="drag-hint" style="margin-top:6px" hidden>Move a piece by dragging it (or tap it, then the square).</p>
+        <div class="bar">
+          <button type="button" id="undo"><svg class="i" aria-hidden="true"><use href="#i-undo"/></svg>Undo last move</button>
+          <button type="button" id="relearn" title="Use when the light changed">Re-learn squares</button>
+        </div>
+        <div class="bar" id="end-bar">
+          <select id="end-choice" aria-label="How the game ends">
+            <option value="">End the game…</option>
+            <option value="0-1|resignation">White resigns</option>
+            <option value="1-0|resignation">Black resigns</option>
+            <option value="1/2-1/2|agreement">Draw agreed</option>
+            <option value="*|abandoned">Abort the game</option>
+          </select>
+          <button type="button" class="danger" id="end">End</button>
+        </div>
       </div>
     </div>
 
-    <div class="card">
-      <!-- no game: start form -->
-      <div id="start-form" hidden>
-        <h2>New game</h2>
-        <p class="muted">Set up the pieces first, then press Start. The camera learns how the squares look from that position.</p>
-        <div class="row2">
-          <div><label for="white">White</label><input type="text" id="white" placeholder="White" maxlength="40"></div>
-          <div><label for="black">Black</label><input type="text" id="black" placeholder="Black" maxlength="40"></div>
+    <!-- no game: start form -->
+    <div class="card" id="start-form" hidden>
+      <h2>New game</h2>
+      <p class="muted">Set up the pieces first, then press Start. The camera learns how the squares look from that position.</p>
+      <div class="row2">
+        <div><label for="white">White</label><input type="text" id="white" placeholder="White" maxlength="40" autocomplete="off"></div>
+        <div><label for="black">Black</label><input type="text" id="black" placeholder="Black" maxlength="40" autocomplete="off"></div>
+      </div>
+      <fieldset>
+        <legend>Chess clock</legend>
+        <div class="bar" id="tc-presets" title="Time for each player, plus the extra seconds after each move">
+          <button type="button" data-minutes="" data-extra="" aria-pressed="false">No clock</button>
+          <button type="button" data-minutes="1" data-extra="0" aria-pressed="false">1+0</button>
+          <button type="button" data-minutes="3" data-extra="2" aria-pressed="false">3+2</button>
+          <button type="button" data-minutes="5" data-extra="0" aria-pressed="false">5+0</button>
+          <button type="button" data-minutes="10" data-extra="0" aria-pressed="false">10+0</button>
+          <button type="button" data-minutes="15" data-extra="10" aria-pressed="false">15+10</button>
         </div>
         <div class="row2">
           <div><label for="tc-minutes">Time for each player (minutes)</label><input type="number" id="tc-minutes" min="0" max="600" step="any" inputmode="decimal" placeholder="no clock"></div>
           <div><label for="tc-extra">Extra time per move (seconds)</label><input type="number" id="tc-extra" min="0" max="3600" step="1" inputmode="numeric" placeholder="0"></div>
         </div>
-        <div class="bar" id="tc-presets" title="Time for each player, plus the extra seconds after each move">
-          <button type="button" data-minutes="" data-extra="">No clock</button>
-          <button type="button" data-minutes="1" data-extra="0">1+0</button>
-          <button type="button" data-minutes="3" data-extra="2">3+2</button>
-          <button type="button" data-minutes="5" data-extra="0">5+0</button>
-          <button type="button" data-minutes="10" data-extra="0">10+0</button>
-          <button type="button" data-minutes="15" data-extra="10">15+10</button>
-        </div>
-        <details><summary>Start from a position (FEN)</summary>
-          <input type="text" id="fen" placeholder="empty = standard starting position">
-        </details>
-        <div class="bar">
-          <button class="primary" id="start">Start game</button>
-          <button id="to-calibrate" hidden>Calibrate first</button>
-        </div>
-        <p class="muted small" id="second-hint" hidden></p>
+      </fieldset>
+      <details class="plain"><summary>Start from a position (FEN)<svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+        <input type="text" id="fen" placeholder="empty = standard starting position" aria-label="The position to start from, in FEN" autocapitalize="off" autocomplete="off" spellcheck="false">
+      </details>
+      <div class="callout note" id="cal-first" hidden>
+        <span>The board is not calibrated yet: the camera must be told where the board is before a game can start.</span>
+        <button type="button" id="to-calibrate">Calibrate first</button>
       </div>
-      <div id="start-viewer" class="muted" hidden>No game is being recorded.</div>
-
-      <!-- a game -->
-      <div id="game-panel" hidden>
-        <h2>Moves</h2>
-        <div class="muted" id="game-names"></div>
-        <div class="scroll"><table class="moves" id="live-moves"></table></div>
-        <div class="bar" id="unfinished" hidden>
-          <span>An unfinished game was found.</span>
-          <button class="primary" id="resume" title="Set the pieces as in the position shown, then press">Resume</button>
-          <button id="close-unfinished" title="End the game as it is, without a result (*)">Close it</button>
-        </div>
-        <div class="bar" id="game-over" hidden>
-          <strong id="game-result"></strong><a id="game-pgn" href="#" download>Download PGN</a>
-        </div>
-        <div id="controls" hidden>
-          <div class="bar" id="clock-bar" hidden>
-            <button class="primary big" id="clock-switch"></button>
-            <button id="clock-pause" title="Stop both clocks until it is resumed">Pause</button>
-          </div>
-          <div class="muted small" id="clock-hint" hidden>The clock also follows the moves the camera sees. Pressing it (the button, or the space bar) as you make your move hands the time over at once.</div>
-          <div class="bar" id="draw-claim" hidden>
-            <span id="draw-claim-text"></span>
-            <button id="claim-draw" title="End the game as a draw">Claim the draw</button>
-          </div>
-          <div class="bar">
-            <input type="text" id="move" placeholder="Enter a move, e.g. Nf3 or e2e4" autocapitalize="off" autocomplete="off" style="flex:1 1 180px">
-            <button id="send-move">Play</button>
-          </div>
-          <div class="bar">
-            <button id="undo">Undo last move</button>
-            <button id="relearn" title="Use when the light changed">Re-learn squares</button>
-          </div>
-          <div class="bar" id="end-bar">
-            <select id="end-choice">
-              <option value="">End the game…</option>
-              <option value="0-1|resignation">White resigns</option>
-              <option value="1-0|resignation">Black resigns</option>
-              <option value="1/2-1/2|agreement">Draw agreed</option>
-              <option value="*|abandoned">Abort the game</option>
-            </select>
-            <button class="danger" id="end">End</button>
-          </div>
-        </div>
-      </div>
+      <button type="button" class="primary big" id="start">Start game</button>
+      <p class="muted small" id="second-hint" style="margin-top:8px" hidden></p>
     </div>
   </div>
 </section>
 
 <!-- GAMES -->
-<section id="tab-games" hidden>
-  <div class="layout">
-    <div class="card" id="games-card">
-      <h2>Past games</h2>
-      <ul class="games" id="games-list"></ul>
-      <p class="muted" id="games-empty" hidden>No games yet.</p>
+<section id="tab-games" class="games-view" aria-label="Games" hidden>
+  <div class="card" id="games-card">
+    <h2>Past games</h2>
+    <ul class="games" id="games-list"><li class="skel"></li><li class="skel"></li><li class="skel"></li></ul>
+    <div class="empty" id="games-empty" hidden>
+      <svg class="i" aria-hidden="true"><use href="#i-games"/></svg>
+      <p>No games yet.</p>
+      <p class="small">A game that is recorded is kept here, to be replayed move by move and downloaded as PGN.</p>
     </div>
-    <div class="card" id="replay" hidden>
+  </div>
+  <div class="card empty" id="replay-empty"><svg class="i" aria-hidden="true"><use href="#i-play"/></svg><p>Choose a game to replay it.</p></div>
+  <div class="card" id="replay" hidden>
+    <div class="replay-head">
+      <button type="button" class="ghost" id="r-back" title="Back to the list of games"><svg class="i" aria-hidden="true"><use href="#i-back"/></svg>Games</button>
       <h2 id="replay-title"></h2>
+    </div>
+    <div class="rp" id="rp" data-top="black">
+      <div class="player black" id="r-player-black"><span class="who" aria-hidden="true"></span><span class="name" id="r-name-black"></span><span class="tag" id="r-tag-black" hidden></span><span class="time" id="r-clock-black"></span></div>
       <div class="board-row">
         <svg class="taken" id="taken-replay-white" viewBox="0 0 6 80" role="img" aria-label="Taken by White"></svg>
         <svg class="board" id="replay-board" viewBox="0 0 80 80" role="img" aria-label="Replay board"></svg>
         <svg class="taken" id="taken-replay-black" viewBox="0 0 6 80" role="img" aria-label="Taken by Black"></svg>
       </div>
-      <div class="bar">
-        <button id="r-first" title="Start">⏮</button>
-        <button id="r-prev" title="Back">◀</button>
-        <button id="r-next" title="Forward">▶</button>
-        <button id="r-last" title="End">⏭</button>
-        <span class="time" id="r-time"></span>
-        <button id="turn-replay" title="Turn the board a quarter turn">&#x27F3; 90&deg;</button>
+      <div class="player white" id="r-player-white"><span class="who" aria-hidden="true"></span><span class="name" id="r-name-white"></span><span class="tag" id="r-tag-white" hidden></span><span class="time" id="r-clock-white"></span></div>
+      <div class="side">
+        <div class="transport">
+          <button type="button" id="r-first" title="Start" aria-label="To the start"><svg class="i" aria-hidden="true"><use href="#i-first"/></svg></button>
+          <button type="button" id="r-prev" title="Back" aria-label="One move back"><svg class="i" aria-hidden="true"><use href="#i-prev"/></svg></button>
+          <button type="button" id="r-play" class="primary">Play</button>
+          <button type="button" id="r-next" title="Forward" aria-label="One move forward"><svg class="i flip" aria-hidden="true"><use href="#i-prev"/></svg></button>
+          <button type="button" id="r-last" title="End" aria-label="To the end"><svg class="i" aria-hidden="true"><use href="#i-last"/></svg></button>
+        </div>
+        <div class="progress" aria-hidden="true"><i id="r-bar"></i></div>
+        <div class="rp-info"><span id="r-time"></span><span class="muted" id="r-clocks" title="What the times beside the players are"></span></div>
+        <div class="rp-tools">
+          <select id="r-speed" aria-label="Speed of the replay">
+            <option value="1">Real time</option>
+            <option value="2">Real time ×2</option>
+            <option value="5">Real time ×5</option>
+            <option value="0" selected>As fast as possible</option>
+          </select>
+          <button type="button" class="icon" id="turn-replay" title="Turn the board a quarter turn" aria-label="Turn the board a quarter turn"><svg class="i" aria-hidden="true"><use href="#i-turn"/></svg></button>
+          <a class="btn" id="r-pgn" href="#" download><svg class="i" aria-hidden="true"><use href="#i-down"/></svg>PGN</a>
+        </div>
+        <div class="moves-box" id="replay-moves-box">
+          <div class="card-head"><h2>Moves</h2><button type="button" class="ghost moves-toggle" aria-expanded="false">All moves</button></div>
+          <div class="scroll"><div class="moves" id="replay-moves"></div></div>
+        </div>
       </div>
-      <div class="muted small" id="r-clocks" title="The time each player has spent thinking"></div>
-      <div class="bar">
-        <button id="r-play" class="primary">Play</button>
-        <select id="r-speed">
-          <option value="1">Real time</option>
-          <option value="2">Real time ×2</option>
-          <option value="5">Real time ×5</option>
-          <option value="0" selected>As fast as possible</option>
-        </select>
-        <a id="r-pgn" href="#" download>PGN</a>
-      </div>
-      <div class="scroll"><table class="moves" id="replay-moves"></table></div>
     </div>
   </div>
 </section>
 
 <!-- CALIBRATE -->
-<section id="tab-calibrate" hidden>
-  <div class="layout">
-    <div class="card">
+<section id="tab-calibrate" class="cal" aria-label="Calibrate" hidden>
+  <div class="card">
+    <div class="card-head">
       <h2 id="camera-title">Camera</h2>
-      <div id="cal-viewer" class="muted" hidden>Only the controller can calibrate.</div>
-      <div id="cal-controls">
-        <div class="bar" id="cam-tabs" hidden title="The picture, the calibration and the picture settings below are those of the camera chosen here">
-          <button data-cam="0" class="on">Camera 1</button>
-          <button data-cam="1">Camera 2</button>
-        </div>
-        <div class="muted small" id="cam2-info"></div>
-        <label class="check" id="cam-choose-row" hidden><span id="cam-choose-label">Camera</span> <select id="cam-select"></select> <button id="cam-refresh" title="Look for the cameras again">Refresh</button></label>
-        <label class="check" id="cam2-choose-row" hidden>Camera 2 <select id="cam2-select"></select></label>
-        <div class="muted small" id="cam-choose-info"></div>
-        <div id="depth-box" hidden>
-          <label class="check"><input type="checkbox" id="depth-on"> Also use the depth of this camera</label>
-          <div class="bar"><button id="depth-align" hidden title="Look for the board in the depth picture, with the pieces in their starting positions">Find the board in the depth picture</button></div>
-          <div class="muted small" id="depth-info"></div>
-          <details id="depth-settings">
-            <summary>Depth settings</summary>
-            <label class="check" for="depth-near">Nearest <input type="range" id="depth-near" min="10" max="300" step="5" style="flex:1 1 140px"> <strong id="depth-near-val"></strong></label>
-            <label class="check" for="depth-far">Farthest <input type="range" id="depth-far" min="30" max="400" step="10" style="flex:1 1 140px"> <strong id="depth-far-val"></strong></label>
-            <div class="muted small">Only what is between these two distances from the camera is used. Set them just around the board: what is beyond it (screens, walls) only confuses the search for the board. The picture below shows what is kept; black is not used.</div>
-            <label class="check" id="depth-mode-row" for="depth-size">Picture <select id="depth-size"></select> <select id="depth-fps" title="Pictures a second from the depth camera"></select></label>
-            <div class="muted small" id="depth-mode-info">A larger picture shows more detail; a smaller one, or fewer pictures a second, takes less of the cable and of the computer. Changing it means finding the board in the depth picture again.</div>
-            <div class="muted small" id="depth-valid"></div>
-          </details>
-          <div class="bar" id="depth-views" hidden>
-            <img id="depth-img" alt="depth" style="max-width:48%;height:auto" title="What the depth camera sees: brighter is higher above the board">
-            <img id="depth-warp" alt="depth, top-down" style="max-width:48%;height:auto" hidden>
-          </div>
-        </div>
-        <div class="bar">
-          <button id="cal-open" class="primary">Open the camera</button>
-          <button id="cal-detect" class="primary" hidden title="Look for the chessboard in the picture and calibrate with it">Auto-detect the board</button>
-          <button id="cal-swap" hidden title="a1 is at the wrong dark corner: swap White and Black sides">Swap sides</button>
-          <button id="cal-close" hidden>Close the camera</button>
-          <button id="cal-clear" class="danger" hidden>Forget calibration</button>
-        </div>
-        <div id="rate-box" hidden>
-          <label class="check" for="rate">Pictures per second <input type="range" id="rate" min="1" max="30" step="1" style="flex:1 1 140px"> <strong id="rate-val"></strong></label>
-          <div class="muted small">More pictures a second show the camera more smoothly and notice a move sooner, and use more of the computer. The camera itself may give fewer.</div>
-        </div>
-        <label class="check"><input type="checkbox" id="follow"> Keep the board aligned if the camera moves</label>
-        <div class="muted small" id="follow-info"></div>
+      <div class="seg" id="cam-tabs" hidden title="The picture, the calibration and the picture settings are those of the camera chosen here">
+        <button type="button" data-cam="0" aria-pressed="true">Camera 1</button>
+        <button type="button" data-cam="1" aria-pressed="false">Camera 2</button>
       </div>
-      <div class="stage" id="cal-stage" hidden><img id="live" alt="camera"><canvas id="overlay"></canvas></div>
-      <div class="muted small" id="cam-stats"></div>
+    </div>
+    <div id="cal-viewer" class="empty" hidden><svg class="i" aria-hidden="true"><use href="#i-eye"/></svg><p>Only the controller can calibrate.</p></div>
+    <div id="cal-controls">
+      <div class="empty" id="cal-idle"><svg class="i" aria-hidden="true"><use href="#i-cam"/></svg><p>The camera is off.</p><p class="small">Open it to see the picture. Then let the program find the board, or mark its four corners yourself.</p></div>
+      <div class="bar" id="cal-actions">
+        <button type="button" id="cal-open" class="primary"><svg class="i" aria-hidden="true"><use href="#i-cam"/></svg>Open the camera</button>
+        <button type="button" id="cal-detect" class="primary" hidden title="Look for the chessboard in the picture and calibrate with it"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><span>Auto-detect the board</span></button>
+        <button type="button" id="cal-swap" hidden title="a1 is at the wrong dark corner: swap White and Black sides"><svg class="i" aria-hidden="true"><use href="#i-swap"/></svg>Swap sides</button>
+        <button type="button" id="cal-close" hidden>Close the camera</button>
+        <button type="button" id="cal-clear" class="danger" hidden>Forget calibration</button>
+      </div>
+      <ol class="steps" id="corner-steps" aria-label="The corners to mark, in this order" hidden><li>a1</li><li>h1</li><li>h8</li><li>a8</li></ol>
       <div class="status" id="cal-msg"></div>
-    </div>
-    <div class="card" id="android-card" hidden>
-      <h2>This phone</h2>
-      <label class="check"><input type="checkbox" id="and-remote"> Let other devices connect (remote server)</label>
-      <div class="muted small" id="and-remote-info"></div>
-      <label class="check"><input type="checkbox" id="and-external"> Use an external camera (USB)</label>
-      <div class="muted small" id="and-external-info"></div>
-      <label class="check" id="and-camera-row">Camera <select id="and-camera"></select></label>
-      <div class="muted small" id="and-camera-info"></div>
-    </div>
-    <div class="card" id="picture-card" hidden>
-      <h2 id="picture-title">Picture</h2>
-      <div class="bar">
-        <button id="rot-ccw" title="Turn the picture a quarter turn counter-clockwise">&#x27F2; 90&deg;</button>
-        <button id="rot-cw" title="Turn the picture a quarter turn clockwise">&#x27F3; 90&deg;</button>
-        <button id="auto-contrast" class="primary" title="Stretch the board's lightest and darkest parts over the whole range">Auto contrast</button>
-        <button id="pic-reset" title="Brightness and contrast back to neutral">Reset</button>
-      </div>
-      <label class="slider">Brightness <input type="range" id="bright" min="-255" max="255" step="5"><output id="bright-val"></output></label>
-      <label class="slider">Contrast <input type="range" id="contrast" min="0.25" max="4" step="0.05"><output id="contrast-val"></output></label>
-      <p class="muted">Turning the picture turns the calibration with it. Auto contrast measures the board once it is calibrated (otherwise the whole picture). Both are kept for the next time. They cannot be changed during a game.</p>
-    </div>
-    <div class="card" id="warp-card" hidden>
-      <h2 id="warp-title">Board, top-down</h2>
-      <div class="stage"><img id="warp" alt="warped board"></div>
-      <p class="muted">White at the bottom, the a-file on the left. The green grid must follow the squares.</p>
+      <div class="stage" id="cal-stage" hidden><img id="live" alt="The picture of the camera: mark the four corners of the board on it"><canvas id="overlay"></canvas></div>
+      <p class="muted small" id="cam-stats" style="margin-top:8px"></p>
+      <p class="muted small" style="margin-top:8px" id="cam2-info"></p>
     </div>
   </div>
+
+  <div class="cal-side">
+    <div class="card" id="warp-card" hidden>
+      <h2 id="warp-title">Board, top-down</h2>
+      <div class="stage"><img id="warp" alt="The board as the program sees it from above"></div>
+      <p class="muted small">White at the bottom, the a-file on the left. The green grid must follow the squares.</p>
+    </div>
+
+    <details class="card acc" id="picture-card" open hidden>
+      <summary><span class="ttl" id="picture-title">Picture</span><span class="sum" id="sum-picture"></span><svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+      <div class="acc-body">
+        <div class="bar">
+          <button type="button" id="rot-ccw" title="Turn the picture a quarter turn counter-clockwise" aria-label="Turn the picture a quarter turn counter-clockwise"><svg class="i flip" aria-hidden="true"><use href="#i-turn"/></svg>90&deg;</button>
+          <button type="button" id="rot-cw" title="Turn the picture a quarter turn clockwise" aria-label="Turn the picture a quarter turn clockwise"><svg class="i" aria-hidden="true"><use href="#i-turn"/></svg>90&deg;</button>
+          <button type="button" id="auto-contrast" class="primary" title="Stretch the board's lightest and darkest parts over the whole range">Auto contrast</button>
+          <button type="button" id="pic-reset" title="Brightness and contrast back to neutral">Reset</button>
+        </div>
+        <div class="field"><label for="bright">Brightness</label><output id="bright-val" for="bright"></output><input type="range" id="bright" min="-255" max="255" step="5"></div>
+        <div class="field"><label for="contrast">Contrast</label><output id="contrast-val" for="contrast"></output><input type="range" id="contrast" min="0.25" max="4" step="0.05"></div>
+        <p class="muted small">Turning the picture turns the calibration with it. Auto contrast measures the board once it is calibrated (otherwise the whole picture). Both are kept for the next time. They cannot be changed during a game.</p>
+      </div>
+    </details>
+
+    <details class="card acc" id="cam-choice-box" hidden>
+      <summary><span class="ttl">Cameras</span><span class="sum" id="sum-cameras"></span><svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+      <div class="acc-body">
+        <div class="field" id="cam-choose-row" hidden>
+          <label for="cam-select" id="cam-choose-label">Camera</label><span></span>
+          <div class="pair"><select id="cam-select"></select><button type="button" id="cam-refresh" title="Look for the cameras again">Refresh</button></div>
+        </div>
+        <div class="field" id="cam2-choose-row" hidden><label for="cam2-select">Camera 2</label><span></span><select id="cam2-select"></select></div>
+        <p class="muted small" id="cam-choose-info"></p>
+      </div>
+    </details>
+
+    <details class="card acc" id="depth-box" hidden>
+      <summary><span class="ttl">Depth camera</span><span class="sum" id="sum-depth"></span><svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+      <div class="acc-body">
+        <label class="check"><span>Also use the depth of this camera</span><input type="checkbox" id="depth-on"></label>
+        <p class="muted small" id="depth-info"></p>
+        <div class="bar"><button type="button" id="depth-align" hidden title="Look for the board in the depth picture, with the pieces in their starting positions">Find the board in the depth picture</button></div>
+        <details class="sub" id="depth-settings">
+          <summary>Depth settings<svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+          <div class="field"><label for="depth-near">Nearest</label><strong id="depth-near-val"></strong><input type="range" id="depth-near" min="10" max="300" step="5"></div>
+          <div class="field"><label for="depth-far">Farthest</label><strong id="depth-far-val"></strong><input type="range" id="depth-far" min="30" max="400" step="10"></div>
+          <p class="muted small">Only what is between these two distances from the camera is used. Set them just around the board: what is beyond it (screens, walls) only confuses the search for the board. The picture below shows what is kept; black is not used.</p>
+          <div class="field" id="depth-mode-row">
+            <label for="depth-size">Picture</label><span></span>
+            <div class="pair"><select id="depth-size" aria-label="Size of the depth picture"></select><select id="depth-fps" title="Pictures a second from the depth camera" aria-label="Pictures a second from the depth camera"></select></div>
+          </div>
+          <p class="muted small" id="depth-mode-info">A larger picture shows more detail; a smaller one, or fewer pictures a second, takes less of the cable and of the computer. Changing it means finding the board in the depth picture again.</p>
+          <p class="muted small" id="depth-valid"></p>
+        </details>
+        <div class="views" id="depth-views" hidden>
+          <img id="depth-img" alt="What the depth camera sees" title="What the depth camera sees: brighter is higher above the board">
+          <img id="depth-warp" alt="The depth picture as a top-down board" hidden>
+        </div>
+      </div>
+    </details>
+
+    <details class="card acc" id="tracking-box" hidden>
+      <summary><span class="ttl">Speed and alignment</span><span class="sum" id="sum-tracking"></span><svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+      <div class="acc-body">
+        <div id="rate-box" hidden>
+          <div class="field"><label for="rate">Pictures per second</label><strong id="rate-val"></strong><input type="range" id="rate" min="1" max="30" step="1"></div>
+          <p class="muted small">More pictures a second show the camera more smoothly and notice a move sooner, and use more of the computer. The camera itself may give fewer.</p>
+        </div>
+        <label class="check"><span>Keep the board aligned if the camera moves</span><input type="checkbox" id="follow"></label>
+        <p class="muted small" id="follow-info"></p>
+      </div>
+    </details>
+
+    <details class="card acc" id="android-card" hidden>
+      <summary><span class="ttl">This phone</span><span class="sum" id="sum-android"></span><svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg></summary>
+      <div class="acc-body">
+        <label class="check"><span>Let other devices connect (remote server)</span><input type="checkbox" id="and-remote"></label>
+        <p class="muted small" id="and-remote-info"></p>
+        <label class="check"><span>Use an external camera (USB)</span><input type="checkbox" id="and-external"></label>
+        <p class="muted small" id="and-external-info"></p>
+        <div class="field" id="and-camera-row"><label for="and-camera">Camera</label><span></span><select id="and-camera"></select></div>
+        <p class="muted small" id="and-camera-info"></p>
+      </div>
+    </details>
+  </div>
 </section>
+</main>
 
 <footer id="version" class="muted small"></footer>
+<div id="toasts" aria-live="assertive"></div>
 
 <script>
 'use strict';
@@ -373,6 +867,11 @@ const $ = id => document.getElementById(id);
 let S = null;                       // latest state from the server
 let tab = 'live';
 let lastGamesSignature = '';
+const icon = name => '<svg class="i" aria-hidden="true"><use href="#i-' + name + '"/></svg>';
+// The page is drawn again at every message of the server, several times a second. These two write only what changed, so
+// that a button being pressed, a list being scrolled or a text being selected is not replaced under the finger.
+function setText(el, text) { if (el.textContent !== text) el.textContent = text; }
+function setHtml(el, html) { if (el._html === html) return false; el._html = html; el.innerHTML = html; return true; }
 
 let lastApiError = '';
 async function api(method, path, body) {
@@ -386,17 +885,22 @@ async function api(method, path, body) {
     return data;
   } catch (e) { toast('Server not reachable'); return null; }
 }
-let toastTimer = null;
+// A short message that goes away by itself (an error of a command, a piece dropped on the wrong square). Tap it to close it.
 function toast(text) {
-  const el = $('notice'); el.textContent = text; el.classList.add('err'); el.hidden = false;
-  clearTimeout(toastTimer); toastTimer = setTimeout(() => renderNotice(), 5000);
+  const box = $('toasts'), el = document.createElement('div');
+  el.className = 'toast'; el.textContent = text;
+  el.onclick = () => el.remove();
+  box.appendChild(el);
+  while (box.children.length > 3) box.firstChild.remove();
+  setTimeout(() => el.remove(), 5000);
 }
+// What the server has to say for as long as it is true: its notice, a camera that fails.
 function renderNotice() {
   const el = $('notice');
   const second = S && S.second && S.second.error ? 'Camera 2: ' + S.second.error : '';
   const text = S && (S.notice || (S.camera && S.camera.error) || second);
   el.classList.toggle('err', !!(S && ((S.camera && S.camera.error) || second)));
-  el.textContent = text || ''; el.hidden = !text;
+  setText(el, text || ''); el.hidden = !text;
 }
 function mmss(sec) {
   sec = Math.max(0, Math.round(sec));
@@ -409,6 +913,30 @@ function dateText(iso) {
   const d = new Date(iso);
   return isNaN(d) ? 'undated' : d.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
 }
+
+// ---------- the theme, and the little panel behind the role ----------
+// Light or dark follows the device unless one is chosen here; the choice is kept on this device.
+function setTheme(name) {
+  if (name !== 'light' && name !== 'dark') name = 'auto';
+  if (name === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = name;
+  remember('nicochess-theme', name);
+  document.querySelectorAll('#theme button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.theme === name)));
+  paintBrowser();
+}
+// The colour of the browser's own bars follows the header.
+function paintBrowser() {
+  const meta = document.querySelector('meta[name=theme-color]');
+  if (meta) meta.content = getComputedStyle(document.documentElement).getPropertyValue('--surface').trim() || '#ffffff';
+}
+document.querySelectorAll('#theme button').forEach(b => b.onclick = () => setTheme(b.dataset.theme));
+setTheme(stored('nicochess-theme') || 'auto');
+if (window.matchMedia) {
+  const scheme = matchMedia('(prefers-color-scheme: dark)');
+  if (scheme.addEventListener) scheme.addEventListener('change', paintBrowser);
+}
+function showSession(open) { $('session').hidden = !open; $('role').setAttribute('aria-expanded', String(open)); }
+$('role').onclick = () => showSession($('session').hidden);
+document.addEventListener('click', e => { if (!$('session').hidden && !e.target.closest('#session, #role')) showSession(false); });
 
 // ---------- board drawing ----------
 // The pieces are drawn here, not taken from a font (fonts differ between devices, and some turn a chess glyph into a
@@ -433,14 +961,13 @@ const PIECE_SHAPES = {
 };
 const PLINTH = '<rect x="2.5" y="8.2" width="5" height="1" rx=".4"/>';
 // (x, y) is the top left of a cell `size` units wide and high (10 for a square of the board), the piece is drawn `scale` times
-// its design size in it.
+// its design size in it. The colours come from the style sheet (`.pc.w`, `.pc.b`).
 function pieceSvg(ch, x, y, scale, size) {
   const white = ch === ch.toUpperCase();
   const shape = PIECE_SHAPES[ch.toLowerCase()];
   if (!shape) return '';
   scale = scale || 1.1; size = size || 10;
-  const fill = white ? '#fbf7ea' : '#1f1f1f', line = white ? '#151515' : '#fbf7ea';
-  return `<g transform="translate(${x + size / 2} ${y + size / 2}) scale(${scale}) translate(-5 -5)" fill="${fill}" stroke="${line}" stroke-width="${(.22 * 1.1 / scale).toFixed(2)}" stroke-linejoin="round" stroke-linecap="round">${shape}${PLINTH}</g>`;
+  return `<g class="pc ${white ? 'w' : 'b'}" transform="translate(${x + size / 2} ${y + size / 2}) scale(${scale}) translate(-5 -5)" stroke-width="${(.26 * 1.1 / scale).toFixed(2)}">${shape}${PLINTH}</g>`;
 }
 
 // ---------- what each player has taken ----------
@@ -467,9 +994,9 @@ function materialLead(fen) {
 // king, and one more for a promotion), about 4.9 units each in a strip 80 units high.
 function drawTaken(svg, pieces, takenAreWhite, lead, who) {
   let out = '';
-  pieces.forEach((p, i) => { out += pieceSvg(takenAreWhite ? p.toUpperCase() : p, 0, i * 4.7, .6, 6); });
-  if (lead > 0) out += `<text x="3" y="78.8" font-size="3" text-anchor="middle" fill="var(--fg)">+${lead}</text>`;
-  svg.innerHTML = out;
+  pieces.forEach((p, i) => { out += pieceSvg(takenAreWhite ? p.toUpperCase() : p, 0, .4 + i * 4.65, .6, 6); });
+  if (lead > 0) out += `<text x="3" y="78.4" class="lead">+${lead}</text>`;
+  if (!setHtml(svg, out)) return;
   const names = pieces.map(p => PIECE_NAMES[p]).join(', ');
   svg.setAttribute('aria-label', 'Taken by ' + who + (names ? ': ' + names : ': nothing') + (lead > 0 ? '. ' + who + ' is ahead by ' + lead + '.' : ''));
 }
@@ -488,47 +1015,71 @@ function squareAt(col, row, turn) {
   switch (turn) { case 1: return [row, col]; case 2: return [7 - col, row]; case 3: return [7 - row, 7 - col]; default: return [col, 7 - row]; }
 }
 const squareName = (f, r) => 'abcdefgh'[f] + (r + 1);
+const posOf = name => squarePos('abcdefgh'.indexOf(name[0]), +name[1] - 1, boardTurn);
+// The players are written above and below the board as they sit: White below, until the board is turned. Turned a quarter,
+// the player on the left of the board is the one above.
+function placePlayers() {
+  const top = boardTurn === 0 || boardTurn === 3 ? 'black' : 'white';
+  $('tab-live').dataset.top = top; $('rp').dataset.top = top;
+}
 // What `drawBoard` takes besides the position: `marks` squares to highlight (the last move), `hide` a square whose piece is
-// being dragged, `dots` squares a piece may go to, `selected` the square of the piece that was picked up.
+// being dragged, `dots` squares a piece may go to, `selected` the square of the piece that was picked up, `slide` a move
+// (`{from, to}`) that has just been made, whose piece is shown sliding to its square. Nothing is drawn when nothing changed.
 function drawBoard(svg, fen, marks, opts) {
   opts = opts || {};
+  const signature = JSON.stringify([fen || '', marks || [], opts.hide || '', opts.dots || [], opts.selected || '', boardTurn]);
+  if (svg._signature === signature) return;
+  const slide = svg._signature && opts.slide ? opts.slide : null;
+  svg._signature = signature;
   const rows = (fen || '8/8/8/8/8/8/8/8').split(' ')[0].split('/');
   const marked = new Set(marks || []);
   const turn = boardTurn;
-  let out = '<rect x="0" y="0" width="80" height="80" fill="var(--sq-dark)"/>';
+  let out = '<rect width="80" height="80" class="sqd"/>', over = '';
   for (let f = 0; f < 8; f++) {
     for (let r = 0; r < 8; r++) {
       const [col, row] = squarePos(f, r, turn);
-      const name = squareName(f, r);
+      const name = squareName(f, r), at = `x="${col * 10}" y="${row * 10}" width="10" height="10"`;
       // a1 is a dark square: a square is light when its file number and its rank add up to an odd number.
-      const light = (f + r) % 2 === 1;
-      out += `<rect x="${col * 10}" y="${row * 10}" width="10" height="10" fill="${light ? 'var(--sq-light)' : 'var(--sq-dark)'}"/>`;
-      if (marked.has(name)) out += `<rect x="${col * 10}" y="${row * 10}" width="10" height="10" fill="#f6d84a" opacity=".55"/>`;
-      if (opts.selected === name) out += `<rect x="${col * 10}" y="${row * 10}" width="10" height="10" fill="#4aa3f6" opacity=".45"/>`;
+      if ((f + r) % 2 === 1) out += `<rect ${at} class="sql"/>`;
+      if (marked.has(name)) over += `<rect ${at} class="mk${slide ? ' new' : ''}"/>`;
+      if (opts.selected === name) over += `<rect ${at} class="pk"/>`;
     }
   }
-  for (let ri = 0; ri < 8; ri++) {
-    let f = 0;
-    for (const ch of rows[ri] || '') {
-      if (/\d/.test(ch)) { f += +ch; continue; }
-      const r = 7 - ri;
-      if (squareName(f, r) !== opts.hide) {
-        const [col, row] = squarePos(f, r, turn);
-        out += pieceSvg(ch, col * 10, row * 10);
-      }
-      f++;
-    }
-  }
-  for (const name of opts.dots || []) {
-    const [col, row] = squarePos('abcdefgh'.indexOf(name[0]), +name[1] - 1, turn);
-    out += `<circle cx="${col * 10 + 5}" cy="${row * 10 + 5}" r="1.7" fill="#2b2b2b" opacity=".45" pointer-events="none"/>`;
-  }
+  out += over;
   for (let i = 0; i < 8; i++) {
     // The coordinates along the bottom and the left edge of the picture, whichever way it is turned.
     const [bf, br] = squareAt(i, 7, turn), [lf, lr] = squareAt(0, i, turn);
     const bottomLight = (bf + br) % 2 === 1, leftLight = (lf + lr) % 2 === 1;
-    out += `<text x="${i * 10 + 9.4}" y="79" font-size="2.4" text-anchor="end" fill="${bottomLight ? 'var(--sq-dark)' : 'var(--sq-light)'}">${turn % 2 === 0 ? 'abcdefgh'[bf] : br + 1}</text>`;
-    out += `<text x="0.8" y="${i * 10 + 3}" font-size="2.4" fill="${leftLight ? 'var(--sq-dark)' : 'var(--sq-light)'}">${turn % 2 === 0 ? lr + 1 : 'abcdefgh'[lf]}</text>`;
+    out += `<text x="${i * 10 + 9.3}" y="79" text-anchor="end" class="co ${bottomLight ? 'l' : 'd'}">${turn % 2 === 0 ? 'abcdefgh'[bf] : br + 1}</text>`;
+    out += `<text x="0.7" y="${i * 10 + 2.8}" class="co ${leftLight ? 'l' : 'd'}">${turn % 2 === 0 ? lr + 1 : 'abcdefgh'[lf]}</text>`;
+  }
+  const occupied = new Set();
+  let last = '';
+  for (let ri = 0; ri < 8; ri++) {
+    let f = 0;
+    for (const ch of rows[ri] || '') {
+      if (/\d/.test(ch)) { f += +ch; continue; }
+      const r = 7 - ri, name = squareName(f, r);
+      occupied.add(name);
+      if (name !== opts.hide) {
+        const [col, row] = squarePos(f, r, turn);
+        const piece = pieceSvg(ch, col * 10, row * 10);
+        if (slide && slide.to === name) {
+          // The piece that moved is drawn last, over the others, and starts where it came from.
+          const [fc, fr] = posOf(slide.from);
+          last = `<g class="slide" style="--dx:${(fc - col) * 10}px;--dy:${(fr - row) * 10}px">${piece}</g>`;
+        } else out += piece;
+      }
+      f++;
+    }
+  }
+  out += last;
+  for (const name of opts.dots || []) {
+    // An empty square the piece may go to has a dot, a piece it may take has a ring around it.
+    const [col, row] = posOf(name);
+    out += occupied.has(name)
+      ? `<circle cx="${col * 10 + 5}" cy="${row * 10 + 5}" r="4.4" class="ring" pointer-events="none"/>`
+      : `<circle cx="${col * 10 + 5}" cy="${row * 10 + 5}" r="1.6" class="dot" pointer-events="none"/>`;
   }
   svg.innerHTML = out;
 }
@@ -548,6 +1099,7 @@ function lastMoveMarks(moves, count) {
   }
   return marks;
 }
+const slideOf = m => ({ from: m.uci.slice(0, 2), to: m.uci.slice(2, 4) });
 
 // ---------- move list ----------
 // Returns rows of {n, white: index|null, black: index|null} from the start position.
@@ -562,23 +1114,44 @@ function moveRows(startFen, count) {
   for (; i < count; i += 2) rows.push({ n: number++, white: i, black: i + 1 < count ? i + 1 : null });
   return rows;
 }
-function drawMoves(table, moves, startFen, current, clickable) {
-  let html = '<tr><th></th><th>White</th><th>Black</th></tr>';
-  const cell = idx => {
-    if (idx === null) return '<td></td>';
-    const m = moves[idx];
-    const on = current === idx + 1 ? ' on' : '';
-    return `<td class="m${on}" data-ply="${idx + 1}">${esc(m.san)}${m.guess ? '<small>?</small>' : ''}<small>${mmss(m.t)}</small></td>`;
-  };
-  for (const row of moveRows(startFen, moves.length)) {
-    html += `<tr><td class="n">${row.n}.</td>${cell(row.white)}${cell(row.black)}</tr>`;
-  }
-  table.innerHTML = html;
-  if (!clickable) table.querySelectorAll('td.m').forEach(td => td.style.cursor = 'default');
-  const active = table.querySelector('td.on');
-  if (active && active.scrollIntoView) active.scrollIntoView({ block: 'nearest' });
+// Scrolls a list, and only that list, so that one of its entries is seen (the page itself stays where it is).
+function reveal(box, el) {
+  if (!box) return;
+  const b = box.getBoundingClientRect(), r = el.getBoundingClientRect();
+  if (r.top < b.top + 26) box.scrollTop += r.top - b.top - 26; else if (r.bottom > b.bottom) box.scrollTop += r.bottom - b.bottom + 4;
+  if (r.left < b.left) box.scrollLeft += r.left - b.left - 8; else if (r.right > b.right) box.scrollLeft += r.right - b.right + 8;
 }
-
+// The time of a move that was seen in the same picture as others (`together`) is an estimate, marked with "~". A "?" marks
+// a promotion for which a queen was assumed (`guess`). In a replay the moves are buttons that jump to their position.
+const ESTIMATE = 'An estimate: several moves were seen in one picture, and the time between them was shared out evenly.';
+function drawMoves(box, moves, startFen, current, clickable) {
+  const open = clickable ? 'button type="button"' : 'span', close = clickable ? 'button' : 'span';
+  let estimated = false;
+  const cell = idx => {
+    if (idx === null) return '<span></span>';
+    const m = moves[idx];
+    if (m.together) estimated = true;
+    return `<${open} class="m${current === idx + 1 ? ' on' : ''}" data-ply="${idx + 1}"><b>${esc(m.san)}</b>` +
+      (m.guess ? '<i title="A queen was assumed for this promotion">?</i>' : '') +
+      `<small${m.together ? ' title="' + ESTIMATE + '"' : ''}>${m.together ? '~' : ''}${mmss(m.t)}</small></${close}>`;
+  };
+  let html = '<div class="mv-head"><span></span><span>White</span><span>Black</span></div>';
+  for (const row of moveRows(startFen, moves.length)) {
+    html += `<div class="mv-row"><span class="n">${row.n}.</span>${cell(row.white)}${cell(row.black)}</div>`;
+  }
+  if (!moves.length) html = '<p class="muted small">No move yet.</p>';
+  if (estimated) html += '<p class="mv-note muted small">~ an estimated time: several moves were seen in one picture.</p>';
+  const focused = box.contains(document.activeElement);
+  if (!setHtml(box, html)) return;
+  const active = box.querySelector('.on');
+  if (active) { reveal(box.closest('.scroll'), active); if (focused) active.focus({ preventScroll: true }); }
+}
+// On a phone the list of moves is one line until it is opened.
+document.querySelectorAll('.moves-toggle').forEach(b => b.onclick = () => {
+  const box = b.closest('.moves-box'), open = box.classList.toggle('open');
+  b.setAttribute('aria-expanded', String(open)); b.textContent = open ? 'One line' : 'All moves';
+  const active = box.querySelector('.on'); if (active) reveal(box.querySelector('.scroll'), active);
+});
 // ---------- state from the server ----------
 const STATUS = {
   no_calibration: 'The board is not calibrated.',
@@ -597,15 +1170,35 @@ function apply(state) {
   stateAt = performance.now();
   render();
 }
+// Whether the page hears from the server: the banner, and the chip of the header.
+let online = false;
+function setOnline(on) {
+  online = on;
+  $('offline').hidden = on;
+  document.body.classList.toggle('offline', !on);
+  renderMode();
+}
+function renderMode() {
+  const el = $('mode');
+  el.dataset.mode = !online ? (S ? 'offline' : '') : S ? S.mode : '';
+  setText(el, !online ? (S ? 'Offline' : 'Connecting…') : !S ? 'Connecting…' : S.mode === 'playing' ? 'Recording' : S.mode === 'calibrating' ? 'Calibrating' : 'Idle');
+}
 
 function render() {
   if (!S) return;
   $('version').textContent = 'NicoChess ' + S.version;
+  $('version-top').textContent = S.version;
   const ctl = S.role === 'controller';
-  $('role').textContent = ctl ? 'Controller' : 'Viewer';
+  $('role-text').textContent = ctl ? 'Controller' : 'Viewer';
   $('role').classList.toggle('ctl', ctl);
-  $('mode').textContent = S.mode === 'playing' ? 'Recording' : S.mode === 'calibrating' ? 'Calibrating' : 'Idle';
-  $('claim').hidden = ctl || !S.can_claim;
+  $('role-icon').setAttribute('href', ctl ? '#i-user' : '#i-eye');
+  $('role-info').textContent = ctl
+    ? 'You control the board from this page: you start and end the games, put moves right and calibrate. The other pages only watch.'
+    : S.can_claim ? 'You are watching. Nobody controls the board: you can take control.'
+    : 'You are watching. Another page controls the board; you can take control once it gives it up or stays silent.';
+  $('viewers').textContent = 'NicoChess ' + S.version + ' · ' + (S.clients === 1 ? 'this is the only page open.' : S.clients + ' pages are open.');
+  renderMode();
+  $('claim-bar').hidden = ctl || !S.can_claim;
   $('release').hidden = !ctl;
   renderNotice();
 
@@ -625,22 +1218,28 @@ function renderLive(ctl) {
   $('start-form').hidden = !(ctl && !playing);
   $('start-viewer').hidden = !(!ctl && !playing && !g);
   $('game-panel').hidden = !g;
-  $('to-calibrate').hidden = !!S.calibration;
+  $('cal-first').hidden = !!S.calibration;
   $('start').disabled = !S.calibration;
   // A second camera that is in use but not calibrated is not looked through: say so before the game starts.
   const uncalibrated = !!(S.second && S.second.enabled && !S.second.calibration);
   $('second-hint').hidden = !(ctl && !playing && uncalibrated);
   if (uncalibrated) $('second-hint').textContent = 'Camera 2 is chosen but not calibrated: only camera 1 will watch the board (see the Calibrate tab).';
 
+  const statusEl = $('status');
   if (!g) {
     $('live-title').textContent = 'Board';
     redrawLive();
-    $('status').textContent = ''; $('candidates').hidden = true; $('doubt').hidden = true; $('promotion').hidden = true;
+    setText(statusEl, 'No game is being recorded.'); statusEl.dataset.state = 'idle';
+    $('candidates').hidden = true; $('doubt').hidden = true; $('promotion').hidden = true;
+    $('tab-live').classList.remove('clocked');
     return;
   }
   $('live-title').textContent = g.white + ' – ' + g.black;
   redrawLive();
-  $('game-names').textContent = dateText(g.started_at) + (g.start_fen ? ' · from a position' : '');
+  // The clock of a game with a time limit: one button does what is needed (start it, hand the time over, go on).
+  const c = S.clock, timed = !!(c && c.base);
+  $('game-names').textContent = dateText(g.started_at) + (g.start_fen ? ' · from a position' : '')
+    + (timed ? ' · ' + mmss(c.base) + ' for each player' + (c.increment ? ', ' + c.increment + ' s more per move' : '') : ' · no clock: the times are the thinking times');
   drawMoves($('live-moves'), g.moves, g.start_fen, g.moves.length, false);
 
   const over = g.over;
@@ -651,12 +1250,11 @@ function renderLive(ctl) {
     $('game-pgn').href = '/api/games/' + encodeURIComponent(g.id) + '/pgn';
   }
   $('controls').hidden = !(ctl && (playing || (g.termination && /^(checkmate|stalemate|insufficient|fivefold|75-move|time forfeit)/.test(g.termination))));
-  // The clock of a game with a time limit: one button does what is needed (start it, hand the time over, go on).
-  const c = S.clock, timed = !!(c && c.base);
   $('clock-bar').hidden = !(ctl && playing && timed);
   $('clock-hint').hidden = $('clock-bar').hidden;
+  $('tab-live').classList.toggle('clocked', !$('clock-bar').hidden);
   if (timed) {
-    $('clock-switch').textContent = (c.paused ? 'Resume the clock' : !c.started ? 'Start the clock' : 'I have moved: switch the clock') + '  (space bar)';
+    setText($('clock-switch-text'), c.paused ? 'Resume the clock' : !c.started ? 'Start the clock' : 'I have moved: switch the clock');
     $('clock-pause').hidden = !c.started || c.paused;
   }
   // A draw by the 50-move rule or by threefold repetition has to be claimed by a player.
@@ -668,42 +1266,42 @@ function renderLive(ctl) {
   $('move').disabled = !playing; $('send-move').disabled = !playing;
 
   const st = S.tracker.status;
-  const statusEl = $('status');
   if (playing) {
     const turn = g.turn === 'white' ? 'White' : 'Black';
     const twoCameras = !!(S.second && S.second.enabled && S.second.calibration) && st !== 'learning';
     const used = (S.tracker.views || []).filter(Boolean).length;
     const depthOn = !!(S.depth && S.depth.on && S.depth.offered) && st !== 'learning';
-    statusEl.textContent = (STATUS[st] || st) + ' ' + turn + ' to move.'
+    setText(statusEl, (STATUS[st] || st) + ' ' + turn + ' to move.'
       + (twoCameras ? (used >= 2 ? ' Two cameras are watching.' : ' Only one camera is giving a picture.') : '')
-      + (depthOn ? (S.depth.in_use && !S.depth.ignored ? ' The depth is helping.' : ' The depth is not being used (see the Calibrate tab).') : '');
+      + (depthOn ? (S.depth.in_use && !S.depth.ignored ? ' The depth is helping.' : ' The depth is not being used (see the Calibrate tab).') : ''));
+    statusEl.dataset.state = st;
   } else {
-    statusEl.textContent = over ? 'Game over.' : 'The recording is stopped.';
+    setText(statusEl, over ? 'Game over: ' + g.result + (g.termination ? ' (' + g.termination + ')' : '') + '.' : 'The recording is stopped.');
+    statusEl.dataset.state = 'idle';
   }
-  statusEl.className = 'status' + (playing && st === 'unsure' ? ' unsure' : '');
 
   const cands = $('candidates');
   const showCands = ctl && playing && (st === 'unsure' || st === 'undone') && S.tracker.candidates.length;
   cands.hidden = !showCands;
   if (showCands) {
-    cands.innerHTML = '<span>Which move?</span>' + S.tracker.candidates
-      .map(c => `<button data-move="${esc(c.uci)}">${esc(c.san)} · ${pct(c.chance)}</button>`).join('');
+    setHtml(cands, '<span>Which move?</span>' + S.tracker.candidates
+      .map(c => `<button type="button" data-move="${esc(c.uci)}"><b>${esc(c.san)}</b><small>${pct(c.chance)}</small></button>`).join(''));
   }
   // A move was taken although the tracker was not sure: say so, and let the controller put it right at once.
   const doubt = S.tracker.doubt, doubtEl = $('doubt');
   doubtEl.hidden = !(playing && doubt);
   if (!doubtEl.hidden) {
-    doubtEl.innerHTML = '<div>Not completely sure about <b>' + esc(doubt.played) + '</b> (' + pct(doubt.certainty) + ' sure).'
+    setHtml(doubtEl, '<div>Not completely sure about <b>' + esc(doubt.played) + '</b> (' + pct(doubt.certainty) + ' sure).'
       + (ctl ? ' If it is wrong, pick what was played, or take the move back:' : '') + '</div>'
-      + (ctl ? '<div class="bar">' + doubt.alternatives.map(c => `<button data-doubt="${esc(c.uci)}">${esc(c.san)} · ${pct(c.chance)}</button>`).join('')
-        + '<button class="danger" data-doubt="">Undo</button></div>' : '');
+      + (ctl ? '<div class="bar">' + doubt.alternatives.map(c => `<button type="button" data-doubt="${esc(c.uci)}"><b>${esc(c.san)}</b><small>${pct(c.chance)}</small></button>`).join('')
+        + '<button type="button" class="danger" data-doubt="">' + icon('undo') + 'Undo</button></div>' : ''));
   }
   $('promotion').hidden = !(ctl && playing && S.tracker.promotion_pending);
 }
 
 // ---------- commands ----------
 $('claim').onclick = () => api('POST', '/api/claim');
-$('release').onclick = () => api('POST', '/api/release');
+$('release').onclick = () => { showSession(false); api('POST', '/api/release'); };
 
 $('start').onclick = async () => {
   remember('nicochess-white', $('white').value); remember('nicochess-black', $('black').value);
@@ -715,10 +1313,19 @@ $('start').onclick = async () => {
     minutes: minutes > 0 ? minutes : 0, extra_seconds: minutes > 0 && extra > 0 ? extra : 0,
   });
 };
+// The preset that matches the two numbers is shown as chosen.
+function showPreset() {
+  const minutes = parseFloat($('tc-minutes').value), extra = parseFloat($('tc-extra').value) || 0;
+  document.querySelectorAll('#tc-presets button').forEach(b => b.setAttribute('aria-pressed',
+    String(b.dataset.minutes === '' ? !(minutes > 0) : minutes === +b.dataset.minutes && extra === +b.dataset.extra)));
+}
 $('tc-presets').addEventListener('click', e => {
   const b = e.target.closest('button[data-minutes]'); if (!b) return;
   $('tc-minutes').value = b.dataset.minutes; $('tc-extra').value = b.dataset.extra;
+  showPreset();
 });
+$('tc-minutes').addEventListener('input', showPreset);
+$('tc-extra').addEventListener('input', showPreset);
 $('to-calibrate').onclick = () => showTab('calibrate');
 $('claim-draw').onclick = () => S && S.game && S.game.draw_claim &&
   confirm('Claim the draw (' + S.game.draw_claim + ') and end the game?') &&
@@ -738,10 +1345,12 @@ $('clock-switch').onclick = () => clockAction('switch');
 $('clock-pause').onclick = () => clockAction('pause');
 // The space bar is the button of a chess clock, for the controller of a game that has one, on the Live tab. Not while
 // typing (a move, a name, a number). It works whichever button has the focus, and does not press that button.
-function spaceIsTheClock(e) {
-  if (e.code !== 'Space' || e.ctrlKey || e.metaKey || e.altKey || tab !== 'live') return false;
+function typing(e) {
   const t = e.target, tag = t && t.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return false;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!(t && t.isContentEditable);
+}
+function spaceIsTheClock(e) {
+  if (e.code !== 'Space' || e.ctrlKey || e.metaKey || e.altKey || tab !== 'live' || typing(e)) return false;
   return !!(S && S.role === 'controller' && S.mode === 'playing' && S.clock && S.clock.base);
 }
 document.addEventListener('keydown', e => { if (spaceIsTheClock(e)) { e.preventDefault(); if (!e.repeat) clockAction('switch'); } });
@@ -762,16 +1371,36 @@ $('doubt').addEventListener('click', e => {
 
 // ---------- tabs ----------
 function showTab(name) {
+  const changed = tab !== name;
   tab = name;
-  document.querySelectorAll('nav button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
+  document.querySelectorAll('#nav button').forEach(b => b.dataset.tab === name ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current'));
   for (const t of ['live', 'games', 'calibrate']) $('tab-' + t).hidden = t !== name;
+  if (name !== 'live') setFocus(false);
   if (name === 'games') refreshGames();
   if (name === 'calibrate') camRefresh();
   cameraLoops();
   renderCalibrate(S && S.role === 'controller');
+  if (changed) window.scrollTo(0, 0);
 }
-document.querySelectorAll('nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+document.querySelectorAll('#nav button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
+// ---------- the board and the clocks alone ----------
+// For a phone or a tablet propped up beside the board: everything else is put away until the button is pressed again
+// (or Escape). The button of the chess clock stays, since it is needed to play.
+function setFocus(on) {
+  document.body.classList.toggle('focus', on);
+  const b = $('focus-live');
+  b.setAttribute('aria-pressed', String(on));
+  b.title = on ? 'Show everything again' : 'Show only the board and the clocks';
+  b.setAttribute('aria-label', b.title);
+  $('focus-icon').setAttribute('href', on ? '#i-unfocus' : '#i-focus');
+}
+$('focus-live').onclick = () => setFocus(!document.body.classList.contains('focus'));
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (!$('session').hidden) { showSession(false); $('role').focus(); }
+  else if (document.body.classList.contains('focus')) setFocus(false);
+});
 // ---------- calibration ----------
 // The calibration card is about one camera at a time: the first, or the second when there is one.
 let camN = 0;
@@ -784,22 +1413,38 @@ const NAMES = ['a1', 'h1', 'h8', 'a8'];
 const live = $('live'), warp = $('warp'), overlay = $('overlay');
 let clicks = [];
 let calNote = null;                 // a message about the last auto-detect, kept until the next click
+// The line above the picture that says what to do next; `bad` when something was refused or not found.
+function calMsg(text, bad) {
+  const el = $('cal-msg');
+  setText(el, text); el.dataset.state = bad ? 'unsure' : 'info';
+}
+// The four corners in the order they are marked: those done, and the one that comes next.
+function showCorners(show) {
+  const box = $('corner-steps');
+  box.hidden = !show;
+  if (!show) return;
+  const done = clicks.length ? clicks.length : calOf(camN) ? 4 : 0;
+  [...box.children].forEach((li, i) => { li.className = i < done ? 'done' : i === done ? 'next' : ''; });
+}
 
 function renderCalibrate(ctl) {
   if (!S) return;
   if (camN === 1 && !S.second) camN = 0;
   const cal = calOf(camN), usable = camUsable();
   const cameraOn = S.mode !== 'idle';
-  // With a second camera there is a tab for each; what is below is about the one chosen.
+  // With a second camera there is a button for each; what is below is about the one chosen.
   $('cam-tabs').hidden = !S.second;
-  document.querySelectorAll('#cam-tabs button').forEach(b => b.classList.toggle('on', +b.dataset.cam === camN));
+  document.querySelectorAll('#cam-tabs button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.cam === camN)));
   $('camera-title').textContent = S.second ? 'Camera ' + (camN + 1) : 'Camera';
   $('picture-title').textContent = S.second ? 'Picture of camera ' + (camN + 1) : 'Picture';
   $('warp-title').textContent = S.second ? 'Board, top-down, from camera ' + (camN + 1) : 'Board, top-down';
-  $('cam2-info').textContent = !S.second ? ''
+  const info = !S.second ? ''
     : camN === 1 && !S.second.enabled ? 'No second camera is in use: the board is watched by camera 1 alone. Choose a camera for camera 2 below (when this computer offers a choice).'
     : 'Two cameras on opposite sides of the board see more than one: a hand or a tall piece that hides squares from one does not from the other. Each is calibrated by itself.';
+  $('cam2-info').textContent = info; $('cam2-info').hidden = !info;
   $('cal-viewer').hidden = ctl; $('cal-controls').hidden = !ctl;
+  $('tracking-box').hidden = !ctl;
+  $('cal-idle').hidden = cameraOn;
   $('cal-open').hidden = cameraOn;
   $('cal-detect').hidden = !(cameraOn && S.mode === 'calibrating' && usable);
   $('cal-swap').hidden = !(cal && S.mode === 'calibrating' && usable);
@@ -811,6 +1456,7 @@ function renderCalibrate(ctl) {
       ? 'Realigned ' + st.adjusted + (st.adjusted === 1 ? ' time' : ' times') + ' this session, the last time by ' + st.last_shift.toFixed(2) + ' of a square.'
       : 'During a game, the board is looked for every second or two and the calibration moves along if it shifted a little.';
   }
+  $('sum-tracking').textContent = (S.rate ? Math.round(S.rate.fps) + ' a second · ' : '') + (S.stabilize && S.stabilize.on ? 'follows the board' : 'does not follow the board');
   $('cal-clear').hidden = !(cal && S.mode !== 'playing');
   $('cal-stage').hidden = !(cameraOn && ctl && usable);
   $('warp-card').hidden = !(cameraOn && cal && usable);
@@ -818,33 +1464,38 @@ function renderCalibrate(ctl) {
   showPicture();
   if (tab === 'calibrate') { andRender(); camRender(); }
   if (!cameraOn) { clicks = []; calNote = null; }
-  if (cameraOn && ctl && !clicks.length && calNote) {
-    $('cal-msg').className = 'status' + (calNote.bad ? ' unsure' : '');
-    $('cal-msg').textContent = calNote.text;
-  } else if (cameraOn && ctl && usable && !clicks.length) {
-    $('cal-msg').className = 'status';
-    $('cal-msg').textContent = cal
-      ? 'Calibrated. Click anywhere on the image to do it again.'
-      : 'Click the 4 corners of the board, in this order: a1, h1, h8, a8 (a1 is the corner of the square at the left of White’s back row).';
-  }
+  showCorners(cameraOn && ctl && usable);
+  if (cameraOn && ctl && !clicks.length && calNote) calMsg(calNote.text, calNote.bad);
+  else if (cameraOn && ctl && usable && !clicks.length) {
+    calMsg(cal
+      ? 'Calibrated. Click or tap anywhere on the picture to do it again.'
+      : 'Click or tap the 4 corners of the board, in this order: a1, h1, h8, a8 (a1 is the corner of the square at the left of White’s back row).');
+  } else if (!cameraOn || !usable) { $('cal-msg').textContent = ''; }
   cameraLoops();
 }
 
+// The outline and the corners over the camera picture, drawn sharp on a dense screen.
 function drawOverlay() {
-  const w = live.clientWidth, h = live.clientHeight;
-  overlay.width = w; overlay.height = h;
-  if (!live.naturalWidth) return;
+  const w = live.clientWidth, h = live.clientHeight, dense = window.devicePixelRatio || 1;
+  overlay.width = Math.round(w * dense); overlay.height = Math.round(h * dense);
+  if (!live.naturalWidth || !w) return;
   const sx = w / live.naturalWidth, sy = h / live.naturalHeight;
   const ctx = overlay.getContext('2d');
-  const pts = clicks.length ? clicks : calOf(camN) || [];
-  ctx.lineWidth = 2; ctx.strokeStyle = '#3ecf8e'; ctx.font = '14px system-ui';
-  ctx.beginPath();
-  pts.forEach((p, i) => i ? ctx.lineTo(p[0] * sx, p[1] * sy) : ctx.moveTo(p[0] * sx, p[1] * sy));
-  if (pts.length === 4) ctx.closePath();
-  ctx.stroke();
+  ctx.scale(dense, dense);
+  const pts = (clicks.length ? clicks : calOf(camN) || []).map(p => [p[0] * sx, p[1] * sy]);
+  const outline = () => { ctx.beginPath(); pts.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); if (pts.length === 4) ctx.closePath(); ctx.stroke(); };
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(0, 0, 0, .55)'; outline();
+  ctx.lineWidth = 2.5; ctx.strokeStyle = '#4ee0a6'; outline();
+  ctx.font = '600 13px system-ui, sans-serif'; ctx.textBaseline = 'middle';
   pts.forEach((p, i) => {
-    ctx.fillStyle = '#ff5252'; ctx.beginPath(); ctx.arc(p[0] * sx, p[1] * sy, 5, 0, 7); ctx.fill();
-    ctx.fillStyle = '#fff'; ctx.fillText(NAMES[i], p[0] * sx + 8, p[1] * sy - 8);
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(p[0], p[1], 7, 0, 7); ctx.fill();
+    ctx.fillStyle = '#e5352b'; ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, 7); ctx.fill();
+    // The name of the corner on a dark label, kept inside the picture.
+    const tw = ctx.measureText(NAMES[i]).width + 10;
+    const x = Math.min(Math.max(p[0] + 10, 2), w - tw - 2), y = Math.min(Math.max(p[1] - 16, 11), h - 11);
+    ctx.fillStyle = 'rgba(0, 0, 0, .7)'; ctx.fillRect(x, y - 10, tw, 20);
+    ctx.fillStyle = '#fff'; ctx.fillText(NAMES[i], x + 5, y + 1);
   });
 }
 
@@ -856,24 +1507,23 @@ live.addEventListener('click', async ev => {
   if (clicks.length === 4 || (calOf(camN) && !clicks.length)) clicks = [];
   const r = live.getBoundingClientRect();
   clicks.push([(ev.clientX - r.left) * live.naturalWidth / r.width, (ev.clientY - r.top) * live.naturalHeight / r.height]);
-  drawOverlay();
-  const msg = $('cal-msg'); msg.className = 'status';
-  if (clicks.length < 4) { msg.textContent = 'Now click corner ' + NAMES[clicks.length] + '.'; return; }
+  drawOverlay(); showCorners(true);
+  if (clicks.length < 4) { calMsg('Now mark corner ' + NAMES[clicks.length] + '.'); return; }
   const ok = await api('POST', '/api/calibration' + camQuery(), { corners: clicks });
   clicks = [];
-  msg.textContent = ok ? 'Calibration saved.' : 'Rejected. Click the 4 corners again, starting with a1.';
-  msg.className = 'status' + (ok ? '' : ' unsure');
-  drawOverlay();
+  calMsg(ok ? 'Calibration saved.' : 'Rejected. Mark the 4 corners again, starting with a1.', !ok);
+  drawOverlay(); showCorners(true);
 });
 $('cal-open').onclick = () => api('POST', '/api/calibration/open');
 $('cal-detect').onclick = async () => {
-  const b = $('cal-detect'); b.disabled = true; b.textContent = 'Looking for the board…';
+  const b = $('cal-detect'), label = b.querySelector('span');
+  b.disabled = true; label.textContent = 'Looking for the board…';
   clicks = [];
   const res = await api('POST', '/api/calibration/detect' + camQuery());
-  b.disabled = false; b.textContent = 'Auto-detect the board';
+  b.disabled = false; label.textContent = 'Auto-detect the board';
   calNote = res
-    ? { text: res.message + ' Check that the outline and the labels a1, h1, h8, a8 sit on the board, or click the corners to adjust.', bad: false }
-    : { text: (lastApiError || 'The board was not found.') + ' You can still click the 4 corners by hand.', bad: true };
+    ? { text: res.message + ' Check that the outline and the labels a1, h1, h8, a8 sit on the board, or mark the corners to adjust.', bad: false }
+    : { text: (lastApiError || 'The board was not found.') + ' You can still mark the 4 corners by hand.', bad: true };
   renderCalibrate(true); drawOverlay();
 };
 // a1 and h8 are both dark: when the other one was picked, turn the labels half way round.
@@ -903,19 +1553,20 @@ function liveStream(wanted) {
   if (wanted && !liveOn) { liveOn = true; liveCam = camN; live.src = '/frame.mjpg?cam=' + (camN + 1) + '&t=' + Date.now(); }
   else if (!wanted && liveOn) { liveOn = false; live.removeAttribute('src'); liveSize = ''; }
 }
-// Draw the overlay again only when the picture changes size, not for every picture.
-live.onload = () => {
-  const size = live.naturalWidth + 'x' + live.naturalHeight;
-  if (size !== liveSize) { liveSize = size; drawOverlay(); }
-};
+// Draw the overlay again only when the picture changes size, not for every picture. The shape of the picture is told to the
+// style sheet, which keeps the whole picture on the screen (a picture turned upright is high and narrow).
+function pictureSized() {
+  const size = live.naturalWidth + 'x' + live.naturalHeight + '/' + live.clientWidth;
+  if (size === liveSize) return;
+  liveSize = size;
+  if (live.naturalHeight) $('cal-stage').style.setProperty('--ar', (live.naturalWidth / live.naturalHeight).toFixed(3));
+  drawOverlay();
+}
+live.onload = pictureSized;
 // The server ends the stream when the camera has been off for a while: start it again if still wanted.
 live.onerror = () => { if (liveOn) { liveOn = false; setTimeout(cameraLoops, 1000); } };
 // A new picture size (after a turn) needs the overlay drawn again.
-setInterval(() => {
-  if (!liveOn) return;
-  const size = live.naturalWidth + 'x' + live.naturalHeight;
-  if (size !== liveSize) { liveSize = size; drawOverlay(); }
-}, 300);
+setInterval(() => { if (liveOn) pictureSized(); }, 300);
 
 // The top-down board is a stream too (a few pictures per second).
 let warpOn = false, warpCam = 0;
@@ -961,6 +1612,7 @@ function renderDepth(ctl) {
   else if (d.aligned) text = (d.message || 'The board was found in the depth picture.') + (playing ? (d.in_use ? ' The depth is helping.' : ' The depth is learning the squares.') : ' It is used in the next game.');
   else text = (d.message || 'The board is looked for in the depth picture when a game starts. To check now, open the camera, set the pieces in their starting positions and press the button.') + (d.source ? '' : ' (The depth camera is not open: it opens with the camera.)');
   $('depth-info').textContent = text;
+  $('sum-depth').textContent = !d.on ? 'off' : d.error ? 'error' : d.ignored ? 'not used' : d.aligned ? 'on, board found' : 'on';
   renderDepthSettings(d, playing);
   $('depth-settings').hidden = !d.on;
   const showViews = d.on && !!d.source;
@@ -1027,9 +1679,9 @@ $('depth-on').onchange = async () => {
   $('depth-on').blur();
 };
 $('depth-align').onclick = () => api('POST', '/api/depth/align');
-// What the depth camera sees, a few times a second while the Calibrate tab shows it.
+// What the depth camera sees, a few times a second while the Calibrate tab shows it (and its section is open).
 setInterval(() => {
-  if (tab !== 'calibrate' || document.hidden || $('depth-views').hidden) return;
+  if (tab !== 'calibrate' || document.hidden || $('depth-views').hidden || !$('depth-box').open) return;
   $('depth-img').src = '/depth.jpg?t=' + Date.now();
   if (!$('depth-warp').hidden) $('depth-warp').src = '/depth-warp.jpg?t=' + Date.now();
 }, 1000);
@@ -1047,6 +1699,7 @@ function camRender() {
   const sel = $('cam-select'), sel2 = $('cam2-select');
   const ok = !!(S && S.camera && S.camera.choice && S.role === 'controller' && camList && camList.selectable);
   const list = ok ? camList.cameras : [];
+  $('cam-choice-box').hidden = !ok;
   // The second camera, when this program can have one that the page chooses: which one is in use ('' is none).
   const second = ok && S.second && S.second.choice && camList.second ? camList.second : null;
   const secondSel = second ? second.selected : '';
@@ -1068,6 +1721,8 @@ function camRender() {
   }
   sel.disabled = playing; sel2.disabled = playing;
   $('cam-refresh').disabled = playing;
+  const chosen = ok && list.find(c => c.id === camList.selected);
+  $('sum-cameras').textContent = !ok ? '' : chosen ? chosen.name : list.length + ' found';
   $('cam-choose-info').textContent = !ok ? ''
     : camList.error ? 'Cannot list the cameras: ' + camList.error
     : playing ? 'The camera cannot be changed during a game.'
@@ -1105,7 +1760,7 @@ setInterval(() => {
 }, 5000);
 
 // ---------- the Android app: remote server, camera choice ----------
-// Only the WebView of the app has window.NicoAndroid; in a browser the card stays hidden.
+// Only the WebView of the app has window.NicoAndroid; in a browser the section stays hidden.
 const NA = window.NicoAndroid;
 let andSignature = '';
 function andInfo() {
@@ -1121,6 +1776,7 @@ function andRender() {
   const busy = id => document.activeElement === $(id);
 
   if (!busy('and-remote')) $('and-remote').checked = info.remote.enabled;
+  $('sum-android').textContent = info.remote.enabled ? 'other devices can connect' : 'this phone only';
   $('and-remote-info').textContent = !info.remote.enabled
     ? 'Off: only this app can open the page.'
     : info.remote.error ? 'Cannot open the server for other devices: ' + info.remote.error
@@ -1149,7 +1805,7 @@ function andRender() {
 }
 if (NA) {
   $('and-remote').onchange = () => { NA.setRemote($('and-remote').checked); setTimeout(andRender, 700); };
-  // The app answers "" or why it refused (not during a game); the card is drawn again from its answer.
+  // The app answers "" or why it refused (not during a game); the section is drawn again from its answer.
   $('and-external').onchange = () => { const refused = NA.setExternal($('and-external').checked); if (refused) toast(refused); setTimeout(andRender, 700); };
   $('and-camera').onchange = () => { const refused = NA.setCamera($('and-camera').value); if (refused) toast(refused); setTimeout(andRender, 700); };
   // A USB camera can be plugged in or pulled out, and the network address can change.
@@ -1164,6 +1820,7 @@ function showPicture() {
   if (!pictureDragging) { $('bright').value = p.brightness; $('contrast').value = p.contrast; }
   $('bright-val').textContent = Math.round(p.brightness);
   $('contrast-val').textContent = p.contrast.toFixed(2);
+  $('sum-picture').textContent = 'brightness ' + Math.round(p.brightness) + ' · contrast ' + p.contrast.toFixed(2);
   drawOverlay();
 }
 function sendPicture() {
@@ -1180,58 +1837,82 @@ $('rot-cw').onclick = () => api('POST', '/api/camera/rotate' + camQuery(), { tur
 $('rot-ccw').onclick = () => api('POST', '/api/camera/rotate' + camQuery(), { turns: -1 });
 $('auto-contrast').onclick = () => api('POST', '/api/camera/auto-contrast' + camQuery());
 $('pic-reset').onclick = () => api('POST', '/api/camera/picture/reset' + camQuery());
-
 // ---------- past games and replay ----------
 let gamesTimer = null;
 function refreshGamesSoon() { clearTimeout(gamesTimer); gamesTimer = setTimeout(refreshGames, 300); }
 async function refreshGames() {
   let data;
   try { data = await (await fetch('/api/games')).json(); } catch (e) { return; }
-  const list = $('games-list');
-  $('games-empty').hidden = data.games.length > 0;
-  list.innerHTML = data.games.map(g =>
-    `<li data-id="${esc(g.id)}"><strong>${esc(g.white)} – ${esc(g.black)}</strong>` +
-    `<span class="result">${g.result ? esc(g.result) : 'in progress'}</span>` +
-    `<span class="muted">${esc(dateText(g.started_at))} · ${g.moves} moves</span></li>`).join('');
+  const games = data && Array.isArray(data.games) ? data.games : null;
+  if (!games) { setHtml($('games-list'), '<li class="muted">The games could not be read' + (data && data.error ? ': ' + esc(data.error) : '') + '.</li>'); return; }
+  $('games-empty').hidden = games.length > 0;
+  setHtml($('games-list'), games.map(g =>
+    `<li><button type="button" class="game" data-id="${esc(g.id)}"><span><strong>${esc(g.white)} – ${esc(g.black)}</strong>` +
+    `<span class="muted">${esc(dateText(g.started_at))} · ${g.moves} ${g.moves === 1 ? 'move' : 'moves'}</span></span>` +
+    `<span class="res${g.result ? '' : ' now'}">${g.result ? esc(g.result) : 'in progress'}</span></button></li>`).join(''));
+  markOpenGame();
 }
-$('games-list').addEventListener('click', e => { const li = e.target.closest('li[data-id]'); if (li) openReplay(li.dataset.id); });
+// The game that is open in the replay is marked in the list.
+function markOpenGame() {
+  document.querySelectorAll('#games-list .game').forEach(b => R.game && b.dataset.id === R.game.id ? b.setAttribute('aria-current', 'true') : b.removeAttribute('aria-current'));
+}
+$('games-list').addEventListener('click', e => { const b = e.target.closest('[data-id]'); if (b) openReplay(b.dataset.id); });
 
 const R = { game: null, ply: 0, timer: null };
 async function openReplay(id) {
   stopReplay();
   let game;
   try { game = await (await fetch('/api/games/' + encodeURIComponent(id))).json(); } catch (e) { return toast('Cannot load the game'); }
+  if (!game || !Array.isArray(game.moves) || !Array.isArray(game.fens)) return toast('Cannot load the game');
   R.game = game; R.ply = 0;
-  $('replay').hidden = false;
+  $('replay').hidden = false; $('replay-empty').hidden = true;
+  // On a phone the game takes the place of the list (the Games button above it goes back); on a wide screen both show.
+  $('tab-games').classList.add('open');
   $('replay-title').textContent = game.white + ' – ' + game.black + (game.result ? ' · ' + game.result : '');
   $('r-pgn').href = '/api/games/' + encodeURIComponent(id) + '/pgn';
+  markOpenGame();
   showPly(0);
-  $('replay').scrollIntoView({ block: 'nearest' });
+  if (tab === 'games') window.scrollTo(0, 0);
 }
+function closeReplay() {
+  stopReplay();
+  R.game = null;
+  $('replay').hidden = true; $('replay-empty').hidden = false;
+  $('tab-games').classList.remove('open');
+  markOpenGame();
+}
+$('r-back').onclick = closeReplay;
 function showPly(n) {
   const g = R.game; if (!g) return;
+  const before = R.ply;
   R.ply = Math.max(0, Math.min(g.moves.length, n));
   const last = R.ply ? g.moves[R.ply - 1] : null;
-  drawBoard($('replay-board'), g.fens[R.ply], lastMoveMarks(g.moves, R.ply));
+  // One step forward shows the piece moving; a jump, or a step back, shows the position at once.
+  drawBoard($('replay-board'), g.fens[R.ply], lastMoveMarks(g.moves, R.ply), { slide: last && R.ply === before + 1 ? slideOf(last) : null });
   drawTakenPair('replay', g.moves, R.ply, g.start_fen, g.fens[R.ply]);
   drawMoves($('replay-moves'), g.moves, g.start_fen, R.ply, true);
   $('r-time').textContent = mmss(last ? last.t : 0) + ' / ' + mmss(g.moves.length ? g.moves[g.moves.length - 1].t : 0) +
     ' · move ' + R.ply + '/' + g.moves.length;
+  $('r-bar').style.width = (g.moves.length ? 100 * R.ply / g.moves.length : 0) + '%';
   const spent = thinkTimes(g.moves, g.start_fen, R.ply);
   // A game that was played against a clock shows what each player had left; the others, the time spent thinking.
   const tc = g.time_control, left = R.ply ? (last && last.left) : (tc ? [tc.base, tc.base] : null);
-  $('r-clocks').textContent = tc && left
-    ? g.white + ' ' + clockText(left[0]) + ' · ' + g.black + ' ' + clockText(left[1]) + ' time left (' + mmss(tc.base) + (tc.increment ? ' + ' + tc.increment + ' s' : '') + ')'
-    : g.white + ' ' + mmss(spent.white) + ' · ' + g.black + ' ' + mmss(spent.black) + ' thinking time';
+  const timed = !!(tc && left);
+  $('rp').classList.toggle('timed', timed);
+  $('r-clocks').textContent = timed ? 'Time left (' + mmss(tc.base) + (tc.increment ? ' + ' + tc.increment + ' s' : '') + ')' : 'Thinking time';
+  const toMove = R.ply < g.moves.length || !g.result ? sideOfPly(R.ply, g.start_fen) : null;
+  ['white', 'black'].forEach((side, i) => showPlayer('r-', side, g[side], timed ? clockText(left[i]) : mmss(spent[side]),
+    { on: toMove === side, out: timed && left[i] <= 0 }, timed ? 'The time this player had left' : 'The time this player has spent thinking'));
   $('r-first').disabled = $('r-prev').disabled = R.ply === 0;
   $('r-next').disabled = $('r-last').disabled = R.ply === g.moves.length;
 }
-function stopReplay() { clearTimeout(R.timer); R.timer = null; $('r-play').textContent = 'Play'; }
+function playLabel(playing) { $('r-play').innerHTML = icon(playing ? 'pause' : 'play') + (playing ? 'Stop' : 'Play'); }
+function stopReplay() { clearTimeout(R.timer); R.timer = null; playLabel(false); }
 function playReplay() {
   const g = R.game; if (!g) return;
   if (R.timer) return stopReplay();
   if (R.ply >= g.moves.length) showPly(0);
-  $('r-play').textContent = 'Stop';
+  playLabel(true);
   const speed = +$('r-speed').value;
   const step = () => {
     if (R.ply >= g.moves.length) return stopReplay();
@@ -1242,6 +1923,7 @@ function playReplay() {
   };
   step();
 }
+playLabel(false);
 $('r-first').onclick = () => { stopReplay(); showPly(0); };
 $('r-prev').onclick = () => { stopReplay(); showPly(R.ply - 1); };
 $('r-next').onclick = () => { stopReplay(); showPly(R.ply + 1); };
@@ -1249,7 +1931,14 @@ $('r-last').onclick = () => { stopReplay(); showPly(R.game ? R.game.moves.length
 $('r-play').onclick = playReplay;
 $('r-speed').onchange = () => { if (R.timer) { stopReplay(); playReplay(); } };
 $('replay-moves').addEventListener('click', e => {
-  const td = e.target.closest('td[data-ply]'); if (td) { stopReplay(); showPly(+td.dataset.ply); }
+  const m = e.target.closest('[data-ply]'); if (m) { stopReplay(); showPly(+m.dataset.ply); }
+});
+// The arrow keys step through the game that is open (Home and End go to its start and its end).
+document.addEventListener('keydown', e => {
+  if (tab !== 'games' || !R.game || typing(e) || e.ctrlKey || e.metaKey || e.altKey) return;
+  const to = { ArrowLeft: R.ply - 1, ArrowRight: R.ply + 1, Home: 0, End: R.game.moves.length }[e.key];
+  if (to === undefined) return;
+  e.preventDefault(); stopReplay(); showPly(to);
 });
 
 // ---------- the clocks: how long each player has been thinking ----------
@@ -1269,42 +1958,48 @@ function clockText(sec) {
   sec = Math.max(0, sec);
   return sec < 9.95 ? '0:0' + sec.toFixed(1) : mmss(Math.floor(sec));
 }
+// One player's line beside a board (`prefix` is '' for the live game and 'r-' for the replay): the name, the time, and how
+// the time is shown (`on` it is running or it is this player's move, `low` little is left, `out` none is, `paused`).
+function showPlayer(prefix, side, name, time, how, title) {
+  const bar = $(prefix + 'player-' + side), clock = $(prefix + 'clock-' + side);
+  setText($(prefix + 'name-' + side), name);
+  setText(clock, time);
+  if (clock.title !== title) clock.title = title;
+  bar.classList.toggle('on', !!how.on); bar.classList.toggle('low', !!how.low); bar.classList.toggle('out', !!how.out);
+  bar.classList.toggle('paused', !!how.paused);
+  $(prefix + 'tag-' + side).hidden = !how.paused;
+}
 function tickClocks() {
-  const g = S && S.game, box = $('clocks');
-  if (!g) { box.hidden = true; return; }
-  box.hidden = false;
+  const g = S && S.game;
   // A game with a time limit: what each player has left, counting down for the one whose time runs.
-  const limit = S.clock && S.clock.base ? S.clock : null;
-  box.classList.toggle('limited', !!limit);
+  const limit = g && S.clock && S.clock.base ? S.clock : null;
+  $('tab-live').classList.toggle('timed', !!limit);
+  if (!g) {
+    showPlayer('', 'white', 'White', '', {}, ''); showPlayer('', 'black', 'Black', '', {}, '');
+    return;
+  }
   if (limit) {
-    box.title = 'The time each player has left (' + mmss(limit.base) + (limit.increment ? ' + ' + limit.increment + ' s per move' : '') + ')'
+    const title = 'The time this player has left (' + mmss(limit.base) + (limit.increment ? ' + ' + limit.increment + ' s per move' : '') + ')'
       + (limit.paused ? ', paused' : '');
     const left = limit.left.slice(), running = S.mode === 'playing' ? limit.running : null;
     if (running) {
       const i = running === 'white' ? 0 : 1;
       left[i] = Math.max(0, left[i] - (performance.now() - stateAt) / 1000);
     }
-    ['white', 'black'].forEach((side, i) => {
-      const el = $('clock-' + side);
-      el.textContent = g[side] + '  ' + clockText(left[i]) + (limit.paused ? '  ⏸' : '');
-      el.classList.toggle('on', running === side);
-      el.classList.toggle('low', left[i] > 0 && left[i] < Math.min(20, limit.base / 10));
-      el.classList.toggle('out', left[i] <= 0);
-    });
+    ['white', 'black'].forEach((side, i) => showPlayer('', side, g[side], clockText(left[i]), {
+      on: running === side, low: left[i] > 0 && left[i] < Math.min(20, limit.base / 10), out: left[i] <= 0, paused: limit.paused,
+    }, title));
     return;
   }
-  box.title = 'The time each player has spent thinking, from the first move';
-  for (const side of ['white', 'black']) $('clock-' + side).classList.remove('low', 'out');
   const total = thinkTimes(g.moves, g.start_fen, g.moves.length);
   const running = S.mode === 'playing' && !g.over && g.moves.length > 0 && typeof g.elapsed === 'number';
   if (running) {
     const now = g.elapsed + (performance.now() - stateAt) / 1000;
     total[g.turn] += Math.max(0, now - g.moves[g.moves.length - 1].t);
   }
-  $('clock-white').textContent = g.white + '  ' + mmss(total.white);
-  $('clock-black').textContent = g.black + '  ' + mmss(total.black);
-  $('clock-white').classList.toggle('on', running && g.turn === 'white');
-  $('clock-black').classList.toggle('on', running && g.turn === 'black');
+  for (const side of ['white', 'black']) {
+    showPlayer('', side, g[side], mmss(total[side]), { on: running && g.turn === side }, 'The time this player has spent thinking, from the first move');
+  }
 }
 setInterval(tickClocks, 250);
 
@@ -1314,6 +2009,7 @@ setInterval(tickClocks, 250);
 // piece it becomes.
 let legal = { fen: null, from: {} };
 let drag = null, selected = null, pendingPromo = null, promoDrag = null;
+let shown = { id: null, count: 0 };   // the game and the number of its moves that the live board last showed
 const liveBoard = $('live-board');
 
 function canMovePieces() { return !!(S && S.role === 'controller' && S.mode === 'playing' && S.game && !S.game.over); }
@@ -1352,11 +2048,12 @@ function squareFromEvent(e) {
 }
 
 // The piece that follows the finger or the mouse: the one picked up from the board (`drag`) or from the promotion tray.
+// It is drawn a little larger than on its square, as a piece that is held.
 function showGhost(d) {
   d = d || drag;
   let ghost = liveBoard.querySelector('#ghost');
   if (!ghost) {
-    liveBoard.insertAdjacentHTML('beforeend', '<g id="ghost" pointer-events="none">' + pieceSvg(d.piece, -5, -5) + '</g>');
+    liveBoard.insertAdjacentHTML('beforeend', '<g id="ghost" pointer-events="none">' + pieceSvg(d.piece, -5, -5, 1.3) + '</g>');
     ghost = liveBoard.querySelector('#ghost');
   }
   const rect = liveBoard.getBoundingClientRect();
@@ -1369,6 +2066,7 @@ function redrawLive() {
   if (!g) {
     drawBoard(liveBoard, null); liveBoard.classList.remove('playable'); $('drag-hint').hidden = true;
     drawTakenPair('live', [], 0, null, null);
+    shown = { id: null, count: 0 };
     return;
   }
   drawTakenPair('live', g.moves, g.moves.length, g.start_fen, g.fen);
@@ -1387,10 +2085,14 @@ function redrawLive() {
   // the promotion is only being corrected).
   const target = pendingPromo ? pendingPromo.to : promoDrag ? promoTarget(promoDrag.kind) : null;
   if (target) opts.selected = target;
+  // A move that was just added to the game that is shown slides to its square.
+  if (shown.id === g.id && g.moves.length > shown.count) opts.slide = slideOf(g.moves[g.moves.length - 1]);
+  shown = { id: g.id, count: g.moves.length };
   drawBoard(liveBoard, g.fen, lastMoveMarks(g.moves, g.moves.length), opts);
-  // The piece that is being dragged is drawn on top of the board, which was drawn again.
+  // The piece that is being dragged is drawn on top of the board, which may have been drawn again.
   if (drag) showGhost();
   else if (promoDrag && promoDrag.moved) showGhost(promoDrag);
+  else { const ghost = liveBoard.querySelector('#ghost'); if (ghost) ghost.remove(); }
 }
 
 async function sendMove(from, to) {
@@ -1430,7 +2132,7 @@ function renderPromoTrays() {
     tray.dataset.key = key;
     tray.innerHTML = ['q', 'r', 'b', 'n'].map(p => {
       const name = PIECE_NAMES[p][0].toUpperCase() + PIECE_NAMES[p].slice(1);
-      return `<button type="button" class="piece-btn" data-piece="${p}" title="${name}" aria-label="${name}">` +
+      return `<button type="button" class="piece-btn" data-piece="${p}" data-white="${white ? 1 : 0}" title="${name}" aria-label="${name}">` +
         `<svg viewBox="0 0 10 10" aria-hidden="true">${pieceSvg(white ? p.toUpperCase() : p, 0, 0, 1.1, 10)}</svg></button>`;
     }).join('');
   }
@@ -1452,7 +2154,7 @@ function endPromoDrag(e, cancelled) {
   if (!d) return;
   promoDrag = null;
   const square = cancelled ? null : squareFromEvent(e), target = promoTarget(d.kind);
-  if (!cancelled && target && (!d.moved || square === target)) { choosePromotion(d.kind, d.choice); return; }
+  if (!cancelled && target && (!d.moved || square === target)) { redrawLive(); choosePromotion(d.kind, d.choice); return; }
   if (!cancelled && d.moved && square) toast('Drop the piece on the blue square, or tap it.');
   redrawLive();
 }
@@ -1462,7 +2164,7 @@ for (const [id, kind] of [['drag-promo', 'move'], ['promotion', 'fix']]) {
     const b = e.target.closest('button.piece-btn');
     if (!b || (e.pointerType === 'mouse' && e.button !== 0) || !promoTarget(kind)) return;
     e.preventDefault();
-    const white = b.querySelector('svg g').getAttribute('fill') === '#fbf7ea';
+    const white = b.dataset.white === '1';
     promoDrag = { kind, choice: b.dataset.piece, piece: white ? b.dataset.piece.toUpperCase() : b.dataset.piece,
       x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: false };
     try { b.setPointerCapture(e.pointerId); } catch (err) { /* the drag works without */ }
@@ -1519,6 +2221,7 @@ liveBoard.addEventListener('pointercancel', e => endDrag(e, true));
 function turnBoard() {
   boardTurn = (boardTurn + 1) & 3;
   remember('nicochess-turn', String(boardTurn));
+  placePlayers();
   redrawLive();
   if (R.game) showPly(R.ply);
 }
@@ -1541,14 +2244,20 @@ $('white').value = stored('nicochess-white') || '';
 $('black').value = stored('nicochess-black') || '';
 $('tc-minutes').value = stored('nicochess-minutes') || '';
 $('tc-extra').value = stored('nicochess-extra') || '';
+showPreset();
+placePlayers();
 drawBoard($('live-board'), null);
+drawTakenPair('live', [], 0, null, null);
+tickClocks();
+// On a wide screen there is room to show every group of settings of the Calibrate tab open; on a phone only the picture's.
+if (window.matchMedia && matchMedia('(min-width: 880px)').matches) document.querySelectorAll('details.acc').forEach(d => { d.open = true; });
 
 let retryTimer = null;
 function connect() {
   const source = new EventSource('/api/events?token=' + token);
-  source.addEventListener('state', e => { $('offline').hidden = true; apply(JSON.parse(e.data)); });
+  source.addEventListener('state', e => { setOnline(true); apply(JSON.parse(e.data)); });
   source.onerror = () => {
-    $('offline').hidden = false;
+    setOnline(false);
     // The browser retries by itself, except after a refusal (too many pages open) or a server that
     // answered with an error: then the stream is closed for good, so open it again later.
     if (source.readyState === EventSource.CLOSED) { clearTimeout(retryTimer); retryTimer = setTimeout(connect, 3000); }
@@ -1563,7 +2272,7 @@ const wanted = hashes.find(h => h === "games" || h === "calibrate");
 if (wanted) showTab(wanted);
 if (window.EventSource && !hashes.includes("poll")) connect();
 else {
-  const poll = async () => { try { apply(await (await fetch('/api/state?token=' + token)).json()); $('offline').hidden = true; } catch (e) { $('offline').hidden = false; } };
+  const poll = async () => { try { apply(await (await fetch('/api/state?token=' + token)).json()); setOnline(true); } catch (e) { setOnline(false); } };
   poll(); setInterval(poll, 2000);
 }
 </script>

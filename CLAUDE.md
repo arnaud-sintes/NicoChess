@@ -22,7 +22,7 @@ The page is one HTML file built into the program. Everything works offline.
 | Try it without a camera | `cargo run --release -- --source demo` (also `--source synthetic`, `--source photo.jpg`), page on http://localhost:8080 |
 | Use a camera | `cargo run --release -- --probe` lists cameras (Windows: `--device 0`; Linux: `--device /dev/video0`), then `--device N --width 1280 --height 720 --open`; a second one: `--device2 M` (Windows: also on the page); `--source demo --second-camera` tries two without hardware |
 | Test | `cargo test` (a minute or so, runs real capture threads on the synthetic source) |
-| Record, replay | `--record` (with `--record-dir`, `--record-every`) keeps a folder per game: pictures, decisions, corrections; `--replay <folder>` runs it through the tracker again, tuning flags replace the recorded ones (ENVIRONMENT.md, "Record and replay") |
+| Record, replay | `--record` (with `--record-dir`, `--record-every`; `--record-all` keeps every picture) keeps a folder per game: pictures, decisions, corrections; `--replay <folder>` runs it through the tracker again, tuning flags replace the recorded ones (ENVIRONMENT.md, "Record and replay") |
 | Format, lint | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (CI runs both) |
 | Windows package | `.\scripts\package-windows.ps1` gives `dist\NicoChess-windows.zip` |
 | Linux 32-bit program | `.\scripts\build-target.ps1` gives `dist\nicochess` (Docker Desktop running) |

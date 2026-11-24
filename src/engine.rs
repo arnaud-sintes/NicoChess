@@ -1358,13 +1358,18 @@ impl Engine {
         });
     }
 
-    /// Two or three moves were recognised at once: all are recorded, at the time the board became still.
+    /// Two or three moves were recognised at once: all are recorded. The camera only knows when the board became still,
+    /// which is the time of the last of them; the others are put evenly between the move before them and that time
+    /// (an estimate, so that the time each player took is shared out, not all given to the last move). At the start of a
+    /// game there is no move before: the clock starts with the first move, and all are at 0.
     fn apply_detected_moves(&self, inner: &mut Inner, moves: &[shakmaty::Move], since: Instant) {
         let t = Self::move_time(inner, since);
         let Some(game) = inner.game.as_mut() else { return };
         let before = game.moves.len();
+        let from = game.moves.last().map_or(t, |m| m.t.min(t));
         for (i, mv) in moves.iter().copied().enumerate() {
-            match game.push_move(mv, t, mv.promotion().is_some()) {
+            let at = from + (t - from) * (i + 1) as f64 / moves.len() as f64;
+            match game.push_move(mv, at, mv.promotion().is_some()) {
                 Ok(record) => eprintln!("game: {} {} ({} moves at once)", record.san, record.uci, moves.len()),
                 Err(e) => {
                     // The tracker and the game disagree: trust the game, and keep neither move.
@@ -2683,6 +2688,39 @@ mod tests {
             assert!(inner.notice.as_deref().is_some_and(|n| n.contains("the moves detected at once were rejected")));
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn moves_seen_in_one_picture_share_the_time_since_the_move_before_them() {
+        let (engine, dir) = engine_playing("shared-time");
+        use shakmaty::Position;
+        let mut position = shakmaty::Chess::default();
+        let mut play = |uci: &str| {
+            let mv = crate::game::parse_move(&position, uci).unwrap();
+            position.play_unchecked(mv);
+            mv
+        };
+        let (e4, e5, nf3, nc6, bb5) = (play("e2e4"), play("e7e5"), play("g1f3"), play("b8c6"), play("f1b5"));
+        let first = Instant::now();
+        let mut inner = engine.inner.grab();
+        // The first move starts the clock. A pair seen after 9 seconds: 4.5 and 9.0, between the move before and the picture.
+        engine.apply_detected_move(&mut inner, e4, first, false);
+        engine.apply_detected_moves(&mut inner, &[e5, nf3], first + Duration::from_secs(9));
+        // Two more seen 6 seconds later: 12 and 15.
+        engine.apply_detected_moves(&mut inner, &[nc6, bb5], first + Duration::from_secs(15));
+        let times: Vec<f64> = inner.game.as_ref().unwrap().moves.iter().map(|m| m.t).collect();
+        assert_eq!(times, [0.0, 4.5, 9.0, 12.0, 15.0]);
+        drop(inner);
+
+        // At the start of a game there is nothing before the first move: the clock starts with it, and all are at 0.
+        let (engine, dir2) = engine_playing("shared-time-start");
+        let mut inner = engine.inner.grab();
+        engine.apply_detected_moves(&mut inner, &[e4, e5], first + Duration::from_secs(5));
+        let times: Vec<f64> = inner.game.as_ref().unwrap().moves.iter().map(|m| m.t).collect();
+        assert_eq!(times, [0.0, 0.0]);
+        drop(inner);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]

@@ -47,6 +47,12 @@ The pictures show whatever the camera sees, so look at a few before sending a fo
 Nothing is sent anywhere by the program. Expect a few hundred MB per hour of play at
 1280x720: delete the folders you no longer need. To send one, zip its folder.
 
+"Start NicoChess (record all).bat" keeps every picture the program looks at (25 a second),
+also while the board is quiet: for a fast game (blitz) that has to be followed again picture
+by picture. It takes several megabytes a second on the disk, so use it for one game at a time
+and delete the folder afterwards. If the disk cannot keep up, the program says how many
+pictures were left out when the game ends.
+
 If it does not start
 --------------------
 - "forbidden by its access permissions" or "address already in use": the port is

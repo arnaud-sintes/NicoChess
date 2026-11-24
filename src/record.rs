@@ -44,6 +44,8 @@ pub const FORMAT: u32 = 2;
 /// Pictures that may wait for the writer: more than this and the next ones are dropped (a picture is about a
 /// megabyte in memory), so that a slow disk costs pictures, not memory.
 pub const DEFAULT_BACKLOG: usize = 12;
+/// The same when every picture is kept: about a hundred megabytes at most, to ride out a pause of the disk.
+pub const ALL_BACKLOG: usize = 32;
 /// Lines and pictures waiting in all.
 const QUEUE: usize = 512;
 /// Quality of the saved pictures: the camera's own pictures are already JPEG, so a high quality adds little noise.
@@ -65,6 +67,18 @@ pub struct RecordOptions {
 impl RecordOptions {
     pub fn new(dir: PathBuf, every: Duration) -> RecordOptions {
         RecordOptions { dir, every, backlog: DEFAULT_BACKLOG, busy_every: Duration::from_millis(150) }
+    }
+
+    /// Every picture the detection looks at is kept, quiet or not (`--record-all`). At 25 pictures a second that is
+    /// several megabytes a second, so more of them may wait for the disk than usual before some are dropped (and
+    /// counted: the program says so when the game ends).
+    pub fn keeping_all(dir: PathBuf) -> RecordOptions {
+        RecordOptions { dir, every: Duration::ZERO, backlog: ALL_BACKLOG, busy_every: Duration::ZERO }
+    }
+
+    /// True when no picture is left out on purpose.
+    pub fn keeps_all(&self) -> bool {
+        self.every.is_zero() && self.busy_every.is_zero()
     }
 }
 
@@ -474,6 +488,28 @@ mod tests {
         let name = folder.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(name.len(), 19, "{name}");
         assert!(name.as_bytes()[4] == b'-' && name.as_bytes()[10] == b'_', "{name}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn keeping_every_picture_leaves_none_out_whatever_the_status() {
+        let dir = temp_dir("all");
+        let options = RecordOptions::keeping_all(dir.clone());
+        assert!(options.keeps_all() && !RecordOptions::new(dir.clone(), Duration::ZERO).keeps_all());
+        assert!(options.backlog > DEFAULT_BACKLOG);
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        let image = Arc::new(RgbImage::from_pixel(16, 12, image::Rgb([10, 20, 30])));
+        // Quiet pictures, 40 ms apart, none of them forced: all are kept.
+        for i in 0..10u64 {
+            recorder.frame(begun + Duration::from_millis(40 * i), &image, "watching", false);
+            recorder.wait_idle();
+        }
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let lines: Vec<Value> =
+            fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.iter().filter(|l| l["type"] == "frame").count(), 10, "{lines:?}");
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -96,8 +96,12 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
 - `session.json`: the program and commit, the source, the calibration, the picture settings, the tracker settings
   and the position the tracker started from.
 - `frames/000001.jpg`, ...: the pictures the detection was given, as it saw them (turned and adjusted). One every
-  `--record-every` seconds (default 2) while the board is quiet, and every picture while something happens (learning,
-  a hand moving, unsure, a move found). `--record-every 0` keeps every picture. Roughly 100 KB each at 1280x720.
+  `--record-every` seconds (default 2) while the board is quiet, and a few a second (at least 0.15 s apart) while
+  something happens (learning, a hand moving, unsure, a move found). `--record-every 0` keeps every quiet picture.
+  `--record-all` (instead of `--record`; the Windows package's `Start NicoChess (record all).bat` does it at 25
+  pictures a second) keeps every picture the detection looks at, whatever is going on, with a longer queue for the
+  disk: several megabytes a second at 1280x720, for a fast game that has to be replayed picture by picture. Roughly
+  100 KB each at 1280x720.
 - `events.jsonl`: what happened, in order, with `t` in seconds: `frame` (file and the tracker's status), `detect` (the
   moves found and the position after them), `unsure` (the candidates offered), `rejected`, `manual` (a move typed by
   hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`.
@@ -114,7 +118,7 @@ replayed recording by recording. The tuning options replace the recorded ones, t
 status and every list of candidates. Open the picture files named in the report to see what the camera saw.
 
 Limits: a replay sees only the pictures that were kept, so with the default spacing it follows the live run closely
-only around moves (where every picture is kept); use `--record-every 0` for a faithful replay of a short session. A
+only around moves (where a few pictures a second are kept); use `--record-all` for a faithful replay of a short session. A
 move that the people undid after the program found it counts as played. When the disk is too slow, pictures are
 dropped (the end of the replay report says so) and the game is never delayed. Recordings show whatever the camera
 sees: they stay on the PC, and look at them before sending them anywhere.

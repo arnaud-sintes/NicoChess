@@ -54,8 +54,11 @@ OPTIONS:
     --record                 keep a recording of every game: a folder named after the start (date and time) with
                              the pictures the detection saw, what it decided, and what the people did
     --record-dir <DIR>       where the recordings go             [default: recordings]
-    --record-every <SECS>    time between two pictures kept while the board is quiet; every picture is kept
-                             while something happens. 0 keeps all of them  [default: 2]
+    --record-every <SECS>    time between two pictures kept while the board is quiet; while something happens
+                             a few a second are kept. 0 keeps all the quiet ones  [default: 2]
+    --record-all             record, and keep every picture the detection looks at, quiet or not (with --fps 25
+                             that is several megabytes a second: for a game that must be followed again picture
+                             by picture, for example a blitz game). Use it instead of --record
     --replay <DIR>           no camera, no page: run a recording (or all those in a folder) through the
                              detection again and compare it with what happened. The tuning options below
                              replace the recorded ones, to try them on real pictures
@@ -139,9 +142,14 @@ fn run() -> Result<()> {
     };
     let tracker = overrides.apply(TrackerConfig::default());
 
-    let record = args.contains("--record");
+    let record_all = args.contains("--record-all");
+    let record = args.contains("--record") || record_all;
     let record_dir: PathBuf = args.opt_value_from_str("--record-dir")?.unwrap_or_else(|| PathBuf::from("recordings"));
-    let record_every: f32 = args.opt_value_from_str("--record-every")?.unwrap_or(2.0);
+    let record_every_option: Option<f32> = args.opt_value_from_str("--record-every")?;
+    if record_all && record_every_option.is_some() {
+        bail!("--record-all keeps every picture already: leave --record-every out");
+    }
+    let record_every = record_every_option.unwrap_or(2.0);
     let replay: Option<PathBuf> = args.opt_value_from_str("--replay")?;
     let replay_verbose = args.contains("--replay-verbose");
 
@@ -241,7 +249,13 @@ fn run() -> Result<()> {
         idle_timeout: Duration::from_secs(idle_secs),
         game_timeout: Duration::from_secs(game_mins * 60),
         max_viewers,
-        record: record.then(|| RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))),
+        record: record.then(|| {
+            if record_all {
+                RecordOptions::keeping_all(record_dir)
+            } else {
+                RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))
+            }
+        }),
         remember_camera,
         second_device,
         second_synthetic,

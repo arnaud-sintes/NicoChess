@@ -55,7 +55,17 @@
 | `examples/stress.rs` | Benchmark (not part of the program): plays whole games through the tracker under those conditions with a simulated person who types a move when the tracker is unsure; `STRESS_CAMERAS=2` and `STRESS_HAND=0.4` add the second camera and hands over the squares of the moves |
 
 ### Page (`web/index.html`)
-One file: markup, style and script. Tabs Live, Games, Calibrate; the page state comes from the event stream; commands go through `api()`. With a second camera the Calibrate tab has a button for each camera (`camN`): the picture, the calibration, the top-down view and the picture settings are those of the one chosen, and every request about a camera carries `?cam=2` for the second.
+One file: style (tokens, components, then the three layouts as media queries), markup, script. Tabs Live, Games, Calibrate; the page state comes from the event stream; commands go through `api()`. With a second camera the Calibrate tab has a button for each camera (`camN`): the picture, the calibration, the top-down view and the picture settings are those of the one chosen, and every request about a camera carries `?cam=2` for the second.
+
+| Part of the page | What is in it |
+|---|---|
+| Header | Name and version, the three sections (`#nav`: a bar at the bottom of a phone, in the header from 720 px, a rail on a phone held sideways), the chip that says what the program does or that it cannot be reached (`#mode`), the role button (`#role`) and its panel (`#session`: what the role means, Release control, the theme, the version) |
+| Banners, toasts | `#offline` (connection lost), `#notice` (the server's notice, a camera error), `#claim-bar` (Take control, when nobody controls); `#toasts` for what goes away by itself (`toast()`) |
+| Live (`#tab-live`) | A grid: the two players with their clocks (`#player-white`, `#player-black`, written by `showPlayer` from `tickClocks`), the board between its two strips of taken pieces (`.board-row`), the status with the buttons that turn the board and show it alone (`setFocus`), then the panel (`.side`): the questions of the tracker (`#candidates`, `#doubt`, `#promotion`, `#drag-promo`), the game (`#game-panel`: result, clock button, moves, controls) and the new-game form (`#start-form`) |
+| Games (`#tab-games`) | The list (`#games-list`) and the replay (`#replay`: the same players, board and strips, the transport buttons, the moves as buttons). On a narrow screen the replay takes the place of the list (`.open`) |
+| Calibrate (`#tab-calibrate`) | The camera card (buttons, the corners to mark, the next step in `#cal-msg`, the picture with its overlay), the top-down view, and one `<details>` for each group of settings: `#picture-card`, `#cam-choice-box`, `#depth-box`, `#tracking-box` (pictures a second, following the board), `#android-card` (only in the app) |
+
+The script draws from the snapshot at every message (`render`), writing only what changed (`setText`, `setHtml`, the signature kept by `drawBoard`). The layouts are chosen by the style sheet alone; the script only says which player is above the board (`placePlayers`) and tells the style sheet the shape of the camera picture (`--ar`).
 
 ### Android (`android/`)
 

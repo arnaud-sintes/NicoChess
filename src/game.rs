@@ -27,7 +27,8 @@ pub struct MoveRecord {
     #[serde(default)]
     pub promotion_guess: bool,
     /// The move was seen in the same picture as the one before it (two or three moves played between two pictures):
-    /// the page shows them all as the last move.
+    /// the page shows them all as the last move. Their times `t` are an estimate: the camera knows only when the board
+    /// became still, so the moves are spread evenly between the move before them and that moment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub together: bool,
     /// In a game with a clock: the seconds White and Black have left once this move is made (the extra time of the
