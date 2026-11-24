@@ -5,6 +5,16 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.11.1
+
+**Replay on a wide screen no longer overlaps.** On a screen 1240 px wide or more the replay (board on the left, controls
+on the right) took its size from the screen and not from the card it sits in beside the list of games, so the board and
+the controls ran out of the card over the list of games and over each other. The board now takes what the card has
+(a container query on the replay card), and the Games view may be wider on very large screens so that the board can
+reach its full size there. Also: the corner marks of Calibrate wrap on a narrow screen instead of running out of their
+row. The page checks now also look for a panel that sticks out of the one that holds it and for panels that cover each
+other, at 22 sizes from 320 px to 3440 px wide.
+
 ## 0.11.0
 
 **Licence.** NicoChess is under the GNU General Public License, version 3 or later (file `LICENSE`, `license` in both
