@@ -1014,6 +1014,10 @@ mod tests {
         assert_eq!(state["game"]["termination"], "checkmate");
         assert_eq!(state["game"]["moves"].as_array().unwrap().len(), 33);
         assert_eq!(state["game"]["moves"][32]["san"], "Rd8#");
+        // Each move says which piece it took (the page shows what each player has taken): 4.dxe5 took a pawn, 4...Bxf3 a knight.
+        assert!(state["game"]["moves"][0]["took"].is_null());
+        assert_eq!(state["game"]["moves"][6]["took"], "p");
+        assert_eq!(state["game"]["moves"][7]["took"], "n");
         assert_eq!(state["mode"], "idle", "the camera is released when the game ends");
 
         let id = state["game"]["id"].as_str().unwrap().to_string();
@@ -1028,6 +1032,7 @@ mod tests {
         let (status, detail) = rig.call("GET", &format!("/api/games/{id}"), "", "");
         assert_eq!(status, 200);
         assert_eq!(detail["fens"].as_array().unwrap().len(), 34);
+        assert_eq!(detail["moves"][7]["took"], "n", "a replay says what was taken too");
         assert_eq!(detail["white"], "Morphy");
 
         let reply = (rig.handler)(Request::for_test("GET", &format!("/api/games/{id}/pgn"), &[], ""));

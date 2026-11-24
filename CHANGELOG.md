@@ -5,6 +5,20 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## Unreleased
+
+**Pieces taken, and promotion by drag and drop.** Both are on the page only; the detection is not changed.
+
+- The pieces each player has taken stand on the two sides of the board, in the live game and in a replay: White's on the
+  left, Black's on the right, the strongest first, with the lead in points (pawn 1, knight and bishop 3, rook 5, queen 9)
+  written under the player who is ahead. The server says which piece each move took (`took` in the moves of the game),
+  from the rules, so a pawn taken en passant and a piece taken on the promotion square are counted. The lead is counted
+  from the pieces on the board, so a promotion counts for what it adds.
+- The piece of a promotion is chosen from four icons, in the colour of the player, instead of text buttons: tap one, or
+  drag it onto the blue square. It works the same when the camera saw the promotion and took a queen for it. A piece
+  dropped anywhere else chooses nothing.
+- Not tried with a real board or on a phone: checked in a browser on a staged game and on pointer events only.
+
 ## 0.10.1
 
 **Leaning pieces no longer block the game.** Four recordings of real games (three blitz, one slow) showed the tracker

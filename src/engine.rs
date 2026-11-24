@@ -1536,7 +1536,7 @@ impl Engine {
                 "start_fen": g.start_fen,
                 "fen": position.as_ref().map(game::fen_of),
                 "turn": position.as_ref().map(|p| if shakmaty::Position::turn(p) == shakmaty::Color::White { "white" } else { "black" }),
-                "moves": g.moves.iter().map(|m| json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together, "left": m.left})).collect::<Vec<_>>(),
+                "moves": moves_json(g),
                 // Seconds since the first move while the game is going on: the page runs the clock of the player to move.
                 "elapsed": inner.game_started.filter(|_| playing && !g.moves.is_empty()).map(|s| s.elapsed().as_secs_f64()),
                 "result": g.result,
@@ -2540,7 +2540,7 @@ impl Engine {
             "start_fen": game.start_fen,
             "result": game.result,
             "termination": game.termination,
-            "moves": game.moves.iter().map(|m| json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together, "left": m.left})).collect::<Vec<_>>(),
+            "moves": moves_json(&game),
             "time_control": game.time_control,
             "fens": fens,
         })))
@@ -2553,6 +2553,20 @@ impl Engine {
             None => Ok(None),
         }
     }
+}
+
+/// The moves of a game for the page. `took` is the piece the move took (`"p"`, `"n"`, `"b"`, `"r"` or `"q"`, `null` when it took
+/// nothing): the page adds them up to show what each player has taken, in the live game and in a replay.
+fn moves_json(game: &GameRecord) -> Vec<Value> {
+    let taken = game.captures().unwrap_or_default();
+    game.moves
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let took = taken.get(i).copied().flatten().map(|role| role.char().to_string());
+            json!({"san": m.san, "uci": m.uci, "t": m.t, "guess": m.promotion_guess, "together": m.together, "left": m.left, "took": took})
+        })
+        .collect()
 }
 
 /// How a camera's picture is turned and adjusted, for the page.

@@ -53,6 +53,15 @@
   .doubt { margin: 8px 0; padding: 8px 10px; border-radius: 8px; background: var(--hl); border: 1px solid var(--line); }
   .doubt .bar { margin: 6px 0 0; }
   svg.board { width: 100%; max-width: 480px; height: auto; display: block; border-radius: 4px; touch-action: manipulation; }
+  /* The board with what each player has taken on its two sides: White's on the left, Black's on the right. A strip is as
+     high as the board (6 by 80 against the 80 by 80 of the board, so about a thirteenth of the board wide, and a little less). */
+  .board-row { display: flex; gap: 6px; align-items: flex-start; max-width: 560px; }
+  .board-row svg.board { flex: 1 1 auto; min-width: 0; max-width: none; }
+  svg.taken { flex: 0 0 6.4%; width: 6.4%; height: auto; display: block; }
+  /* The pieces to choose from when a pawn is promoted: tapped, or dragged onto the square. */
+  .tray { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+  button.piece-btn { width: 3rem; height: 3rem; padding: 2px; touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
+  button.piece-btn svg { width: 100%; height: 100%; display: block; pointer-events: none; }
   svg.board.playable { touch-action: none; cursor: grab; user-select: none; -webkit-user-select: none; }
   svg.board.playable.lifted { cursor: grabbing; }
   .clocks { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 8px; font-variant-numeric: tabular-nums; }
@@ -117,18 +126,23 @@
     <div class="card">
       <h2 id="live-title">Game</h2>
       <div class="clocks" id="clocks" hidden title="The time each player has spent thinking, from the first move"><span id="clock-white"></span><span id="clock-black"></span></div>
-      <svg class="board" id="live-board" viewBox="0 0 80 80" role="img" aria-label="Chess board"></svg>
+      <div class="board-row">
+        <svg class="taken" id="taken-live-white" viewBox="0 0 6 80" role="img" aria-label="Taken by White"></svg>
+        <svg class="board" id="live-board" viewBox="0 0 80 80" role="img" aria-label="Chess board"></svg>
+        <svg class="taken" id="taken-live-black" viewBox="0 0 6 80" role="img" aria-label="Taken by Black"></svg>
+      </div>
       <div class="board-tools"><button id="turn-live" title="Turn the board a quarter turn">&#x27F3; 90&deg;</button><span class="muted small" id="drag-hint" hidden>Move a piece by dragging it (or tap it, then the square).</span></div>
       <div id="drag-promo" class="bar" hidden>
-        <span>Promote to:</span>
-        <button data-piece="q">Queen</button><button data-piece="r">Rook</button><button data-piece="b">Bishop</button><button data-piece="n">Knight</button><button data-piece="">Cancel</button>
+        <span>Promote to (tap a piece, or drag it onto the blue square):</span>
+        <span class="tray"></span>
+        <button type="button" id="promo-cancel">Cancel</button>
       </div>
       <div class="status" id="status"></div>
       <div id="candidates" class="bar" hidden></div>
       <div id="doubt" class="doubt" hidden></div>
       <div id="promotion" class="bar" hidden>
-        <span>Promoted to a queen? Change it:</span>
-        <button data-piece="r">Rook</button><button data-piece="b">Bishop</button><button data-piece="n">Knight</button><button data-piece="q">Queen</button>
+        <span>Promoted to a queen? Change it (tap a piece, or drag it onto the blue square):</span>
+        <span class="tray"></span>
       </div>
     </div>
 
@@ -221,7 +235,11 @@
     </div>
     <div class="card" id="replay" hidden>
       <h2 id="replay-title"></h2>
-      <svg class="board" id="replay-board" viewBox="0 0 80 80" role="img" aria-label="Replay board"></svg>
+      <div class="board-row">
+        <svg class="taken" id="taken-replay-white" viewBox="0 0 6 80" role="img" aria-label="Taken by White"></svg>
+        <svg class="board" id="replay-board" viewBox="0 0 80 80" role="img" aria-label="Replay board"></svg>
+        <svg class="taken" id="taken-replay-black" viewBox="0 0 6 80" role="img" aria-label="Taken by Black"></svg>
+      </div>
       <div class="bar">
         <button id="r-first" title="Start">⏮</button>
         <button id="r-prev" title="Back">◀</button>
@@ -414,12 +432,51 @@ const PIECE_SHAPES = {
      '<circle cx="5" cy="3.6" r="1.5"/><path d="M4.1 5.2 H5.9" fill="none"/>',
 };
 const PLINTH = '<rect x="2.5" y="8.2" width="5" height="1" rx=".4"/>';
-function pieceSvg(ch, x, y) {
+// (x, y) is the top left of a cell `size` units wide and high (10 for a square of the board), the piece is drawn `scale` times
+// its design size in it.
+function pieceSvg(ch, x, y, scale, size) {
   const white = ch === ch.toUpperCase();
   const shape = PIECE_SHAPES[ch.toLowerCase()];
   if (!shape) return '';
+  scale = scale || 1.1; size = size || 10;
   const fill = white ? '#fbf7ea' : '#1f1f1f', line = white ? '#151515' : '#fbf7ea';
-  return `<g transform="translate(${x + 5} ${y + 5}) scale(1.1) translate(-5 -5)" fill="${fill}" stroke="${line}" stroke-width=".22" stroke-linejoin="round" stroke-linecap="round">${shape}${PLINTH}</g>`;
+  return `<g transform="translate(${x + size / 2} ${y + size / 2}) scale(${scale}) translate(-5 -5)" fill="${fill}" stroke="${line}" stroke-width="${(.22 * 1.1 / scale).toFixed(2)}" stroke-linejoin="round" stroke-linecap="round">${shape}${PLINTH}</g>`;
+}
+
+// ---------- what each player has taken ----------
+// Every move says which piece it took (`took`, a letter, from the rules on the server). White's strip is on the left of the
+// board and Black's on the right; the player who is ahead in material has the lead written under the pieces. The lead is
+// counted from the pieces left on the board, so a promotion counts for what it adds.
+const PIECE_POINTS = { p: 1, n: 3, b: 3, r: 5, q: 9 };
+const PIECE_NAMES = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen' };
+function takenBy(moves, count, startFen) {
+  const out = { white: [], black: [] };
+  for (let i = 0; i < count; i++) if (moves[i].took) out[sideOfPly(i, startFen)].push(moves[i].took);
+  for (const side of ['white', 'black']) out[side].sort((a, b) => 'qrbnp'.indexOf(a) - 'qrbnp'.indexOf(b));
+  return out;
+}
+function materialLead(fen) {
+  let lead = 0;
+  for (const ch of (fen || '').split(' ')[0]) {
+    const points = PIECE_POINTS[ch.toLowerCase()];
+    if (points) lead += ch === ch.toUpperCase() ? points : -points;
+  }
+  return lead;
+}
+// `pieces` are what the player took, so they are drawn in the other colour. Sixteen pieces would be the most (all but the
+// king, and one more for a promotion), about 4.9 units each in a strip 80 units high.
+function drawTaken(svg, pieces, takenAreWhite, lead, who) {
+  let out = '';
+  pieces.forEach((p, i) => { out += pieceSvg(takenAreWhite ? p.toUpperCase() : p, 0, i * 4.7, .6, 6); });
+  if (lead > 0) out += `<text x="3" y="78.8" font-size="3" text-anchor="middle" fill="var(--fg)">+${lead}</text>`;
+  svg.innerHTML = out;
+  const names = pieces.map(p => PIECE_NAMES[p]).join(', ');
+  svg.setAttribute('aria-label', 'Taken by ' + who + (names ? ': ' + names : ': nothing') + (lead > 0 ? '. ' + who + ' is ahead by ' + lead + '.' : ''));
+}
+function drawTakenPair(prefix, moves, count, startFen, fen) {
+  const taken = takenBy(moves, count, startFen), lead = materialLead(fen);
+  drawTaken($('taken-' + prefix + '-white'), taken.white, false, Math.max(0, lead), 'White');
+  drawTaken($('taken-' + prefix + '-black'), taken.black, true, Math.max(0, -lead), 'Black');
 }
 // The board can be turned by quarter turns (the button beside it), to match how the real board is seen. The pieces stay
 // upright. A square is (file, rank) with 0 for a and for rank 1; it is drawn at (column, row) of the picture.
@@ -701,9 +758,6 @@ $('candidates').addEventListener('click', e => {
 $('doubt').addEventListener('click', e => {
   const b = e.target.closest('button[data-doubt]');
   if (b) api('POST', '/api/game/doubt', b.dataset.doubt ? { move: b.dataset.doubt } : {});
-});
-$('promotion').addEventListener('click', e => {
-  const b = e.target.closest('button[data-piece]'); if (b) api('POST', '/api/game/promotion', { piece: b.dataset.piece });
 });
 
 // ---------- tabs ----------
@@ -1159,6 +1213,7 @@ function showPly(n) {
   R.ply = Math.max(0, Math.min(g.moves.length, n));
   const last = R.ply ? g.moves[R.ply - 1] : null;
   drawBoard($('replay-board'), g.fens[R.ply], lastMoveMarks(g.moves, R.ply));
+  drawTakenPair('replay', g.moves, R.ply, g.start_fen, g.fens[R.ply]);
   drawMoves($('replay-moves'), g.moves, g.start_fen, R.ply, true);
   $('r-time').textContent = mmss(last ? last.t : 0) + ' / ' + mmss(g.moves.length ? g.moves[g.moves.length - 1].t : 0) +
     ' · move ' + R.ply + '/' + g.moves.length;
@@ -1258,7 +1313,7 @@ setInterval(tickClocks, 250);
 // the server (`/api/game/legal`), so a piece cannot be dropped anywhere else. A pawn that reaches the last rank asks which
 // piece it becomes.
 let legal = { fen: null, from: {} };
-let drag = null, selected = null, pendingPromo = null;
+let drag = null, selected = null, pendingPromo = null, promoDrag = null;
 const liveBoard = $('live-board');
 
 function canMovePieces() { return !!(S && S.role === 'controller' && S.mode === 'playing' && S.game && !S.game.over); }
@@ -1296,19 +1351,27 @@ function squareFromEvent(e) {
   return squareName(f, r);
 }
 
-function showGhost() {
+// The piece that follows the finger or the mouse: the one picked up from the board (`drag`) or from the promotion tray.
+function showGhost(d) {
+  d = d || drag;
   let ghost = liveBoard.querySelector('#ghost');
   if (!ghost) {
-    liveBoard.insertAdjacentHTML('beforeend', '<g id="ghost" pointer-events="none">' + pieceSvg(drag.piece, -5, -5) + '</g>');
+    liveBoard.insertAdjacentHTML('beforeend', '<g id="ghost" pointer-events="none">' + pieceSvg(d.piece, -5, -5) + '</g>');
     ghost = liveBoard.querySelector('#ghost');
   }
   const rect = liveBoard.getBoundingClientRect();
-  ghost.setAttribute('transform', 'translate(' + ((drag.x - rect.left) / rect.width * 80) + ' ' + ((drag.y - rect.top) / rect.height * 80) + ')');
+  ghost.setAttribute('transform', 'translate(' + ((d.x - rect.left) / rect.width * 80) + ' ' + ((d.y - rect.top) / rect.height * 80) + ')');
 }
 
 function redrawLive() {
   const g = S && S.game;
-  if (!g) { drawBoard(liveBoard, null); liveBoard.classList.remove('playable'); $('drag-hint').hidden = true; return; }
+  renderPromoTrays();
+  if (!g) {
+    drawBoard(liveBoard, null); liveBoard.classList.remove('playable'); $('drag-hint').hidden = true;
+    drawTakenPair('live', [], 0, null, null);
+    return;
+  }
+  drawTakenPair('live', g.moves, g.moves.length, g.start_fen, g.fen);
   const movable = canMovePieces();
   liveBoard.classList.toggle('playable', movable);
   liveBoard.classList.toggle('lifted', !!drag);
@@ -1320,9 +1383,14 @@ function redrawLive() {
     if (drag) opts.hide = drag.from;
     if (selected) { opts.selected = selected; opts.dots = legalTargets(selected).map(t => t.to); }
   }
+  // The square a promotion piece goes to is shown while one is being chosen (and not before the piece is picked up, when
+  // the promotion is only being corrected).
+  const target = pendingPromo ? pendingPromo.to : promoDrag ? promoTarget(promoDrag.kind) : null;
+  if (target) opts.selected = target;
   drawBoard(liveBoard, g.fen, lastMoveMarks(g.moves, g.moves.length), opts);
   // The piece that is being dragged is drawn on top of the board, which was drawn again.
   if (drag) showGhost();
+  else if (promoDrag && promoDrag.moved) showGhost(promoDrag);
 }
 
 async function sendMove(from, to) {
@@ -1338,14 +1406,81 @@ async function sendMove(from, to) {
   redrawLive();
   await api('POST', '/api/game/move', { move: from + to });
 }
-$('drag-promo').addEventListener('click', async e => {
-  const b = e.target.closest('button');
-  if (!b || !pendingPromo) return;
-  const { from, to } = pendingPromo;
-  pendingPromo = null;
-  $('drag-promo').hidden = true;
-  if (b.dataset.piece) await api('POST', '/api/game/move', { move: from + to + b.dataset.piece });
-});
+$('promo-cancel').onclick = () => { pendingPromo = null; $('drag-promo').hidden = true; redrawLive(); };
+
+// ---------- choosing the piece of a promotion ----------
+// Two places offer the four pieces, each as a tray of icons: after a pawn was dragged to the last rank (`move`, the move is
+// sent with the piece chosen), and after the camera saw a promotion and took a queen for it (`fix`, the piece of the move
+// that was made is changed). A piece is tapped, or dragged onto the square (shown in blue); dropped anywhere else, nothing
+// is chosen, so that a slip of the finger changes nothing.
+function promoTarget(kind) {
+  if (kind === 'move') return pendingPromo ? pendingPromo.to : null;
+  const moves = S && S.game ? S.game.moves : [];
+  return moves.length ? moves[moves.length - 1].uci.slice(2, 4) : null;
+}
+function renderPromoTrays() {
+  const g = S && S.game; if (!g) return;
+  // The pieces are in the colour of the player who promotes: the one to move for a pawn that has just been dragged, the one
+  // who has just moved for a promotion that was seen.
+  const trays = [['drag-promo', g.turn === 'white'], ['promotion', g.turn !== 'white']];
+  for (const [id, white] of trays) {
+    const tray = $(id).querySelector('.tray');
+    const key = white ? 'w' : 'b';
+    if (tray.dataset.key === key) continue;   // left alone, so that a piece being dragged is not taken from under the finger
+    tray.dataset.key = key;
+    tray.innerHTML = ['q', 'r', 'b', 'n'].map(p => {
+      const name = PIECE_NAMES[p][0].toUpperCase() + PIECE_NAMES[p].slice(1);
+      return `<button type="button" class="piece-btn" data-piece="${p}" title="${name}" aria-label="${name}">` +
+        `<svg viewBox="0 0 10 10" aria-hidden="true">${pieceSvg(white ? p.toUpperCase() : p, 0, 0, 1.1, 10)}</svg></button>`;
+    }).join('');
+  }
+}
+async function choosePromotion(kind, piece) {
+  if (kind === 'move') {
+    if (!pendingPromo) return;
+    const { from, to } = pendingPromo;
+    pendingPromo = null;
+    $('drag-promo').hidden = true;
+    redrawLive();
+    await api('POST', '/api/game/move', { move: from + to + piece });
+  } else {
+    await api('POST', '/api/game/promotion', { piece });
+  }
+}
+function endPromoDrag(e, cancelled) {
+  const d = promoDrag;
+  if (!d) return;
+  promoDrag = null;
+  const square = cancelled ? null : squareFromEvent(e), target = promoTarget(d.kind);
+  if (!cancelled && target && (!d.moved || square === target)) { choosePromotion(d.kind, d.choice); return; }
+  if (!cancelled && d.moved && square) toast('Drop the piece on the blue square, or tap it.');
+  redrawLive();
+}
+for (const [id, kind] of [['drag-promo', 'move'], ['promotion', 'fix']]) {
+  const box = $(id);
+  box.addEventListener('pointerdown', e => {
+    const b = e.target.closest('button.piece-btn');
+    if (!b || (e.pointerType === 'mouse' && e.button !== 0) || !promoTarget(kind)) return;
+    e.preventDefault();
+    const white = b.querySelector('svg g').getAttribute('fill') === '#fbf7ea';
+    promoDrag = { kind, choice: b.dataset.piece, piece: white ? b.dataset.piece.toUpperCase() : b.dataset.piece,
+      x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, moved: false };
+    try { b.setPointerCapture(e.pointerId); } catch (err) { /* the drag works without */ }
+  });
+  box.addEventListener('pointermove', e => {
+    if (!promoDrag || promoDrag.kind !== kind) return;
+    promoDrag.x = e.clientX; promoDrag.y = e.clientY;
+    if (!promoDrag.moved && Math.hypot(e.clientX - promoDrag.startX, e.clientY - promoDrag.startY) > 6) { promoDrag.moved = true; redrawLive(); }
+    if (promoDrag.moved) showGhost(promoDrag);
+  });
+  box.addEventListener('pointerup', e => { if (promoDrag && promoDrag.kind === kind) endPromoDrag(e, false); });
+  box.addEventListener('pointercancel', e => { if (promoDrag && promoDrag.kind === kind) endPromoDrag(e, true); });
+  // From the keyboard a button gives a click without a pointer (detail 0); with a mouse or a finger the pointer events did it.
+  box.addEventListener('click', e => {
+    const b = e.target.closest('button.piece-btn');
+    if (b && e.detail === 0) choosePromotion(kind, b.dataset.piece);
+  });
+}
 
 liveBoard.addEventListener('pointerdown', e => {
   if (!canMovePieces() || (e.pointerType === 'mouse' && e.button !== 0) || pendingPromo) return;

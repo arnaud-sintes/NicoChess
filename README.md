@@ -18,7 +18,9 @@ moves played between two pictures) by how well the picture fits, and takes the l
 - **Quick.** A move is on the page about 0.7 s after it is made (25 pictures a second; the slider on the Calibrate tab
   sets the rate). The page shows how long each player has been thinking from the first move, can be turned a quarter
   at a time, and a move can be made on it by dragging a piece (or tapping it and then the square) when the camera
-  missed it.
+  missed it. The pieces each player has taken stand beside the board (White's on the left, Black's on the right, with
+  the lead in points under them), also when a game is replayed. A pawn that reaches the last rank asks for the new
+  piece as four icons to tap or to drag onto the square.
 - **A chess clock, if you want one.** Give each player a time (and an extra time per move) when starting a game: the
   clocks count down on every page, the space bar (or a big button) hands the time over as you move, there is a pause,
   and the game ends when a time runs out.

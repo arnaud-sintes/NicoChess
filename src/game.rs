@@ -205,6 +205,20 @@ impl GameRecord {
         Ok(pos)
     }
 
+    /// The piece each move took, one entry per move (`None` for a move that took nothing). A pawn taken en passant counts.
+    /// The page adds these up to show what each player has taken. It comes from the rules, not from the notation: the
+    /// notation says that a piece was taken, not which one.
+    pub fn captures(&self) -> Result<Vec<Option<Role>>> {
+        let mut pos = self.start_position()?;
+        let mut taken = Vec::with_capacity(self.moves.len());
+        for record in &self.moves {
+            let mv = parse_move(&pos, &record.uci)?;
+            taken.push(mv.capture());
+            pos.play_unchecked(mv);
+        }
+        Ok(taken)
+    }
+
     /// The position at the start, then after each move (so `moves.len() + 1` entries).
     pub fn fens(&self) -> Result<Vec<String>> {
         let mut pos = self.start_position()?;
@@ -489,6 +503,33 @@ mod tests {
         assert_eq!(game.moves[32].san, "Rd8#");
         assert_eq!(game.rules_outcome().unwrap(), Some(("1-0".to_string(), "checkmate".to_string())));
         assert_eq!(game.fens().unwrap().len(), 34);
+    }
+
+    #[test]
+    fn says_which_piece_each_move_took() {
+        // The opera game: 1.e4 e5 2.Nf3 d6 3.d4 Bg4 4.dxe5 Bxf3 5.Qxf3 dxe5 ...
+        let game = opera();
+        let taken = game.captures().unwrap();
+        assert_eq!(taken.len(), game.moves.len());
+        let letters: Vec<char> = taken.iter().map(|t| t.map_or('-', Role::char)).collect();
+        assert_eq!(&letters[..10], ['-', '-', '-', '-', '-', '-', 'p', 'n', 'b', 'p'], "{letters:?}");
+        // Every capture in the notation is a capture here, and no other move is.
+        for (record, took) in game.moves.iter().zip(&taken) {
+            assert_eq!(record.san.contains('x'), took.is_some(), "{}", record.san);
+        }
+    }
+
+    #[test]
+    fn a_pawn_taken_en_passant_and_a_piece_taken_on_the_promotion_square_count() {
+        // White pawn on e5, Black plays d7d5: en passant. Then a white pawn on g7 takes the rook on h8 and promotes.
+        let mut game = GameRecord::new("t".into(), None, "", "", Some("4k3/3p4/8/4P3/8/8/8/4K3 b - - 0 1".into())).unwrap();
+        game.push_text("d5", 1.0).unwrap();
+        game.push_text("exd6", 2.0).unwrap();
+        assert_eq!(game.captures().unwrap(), [None, Some(Role::Pawn)]);
+
+        let mut game = GameRecord::new("t".into(), None, "", "", Some("7r/6P1/8/8/8/8/k7/4K3 w - - 0 1".into())).unwrap();
+        game.push_text("gxh8=N", 1.0).unwrap();
+        assert_eq!(game.captures().unwrap(), [Some(Role::Rook)]);
     }
 
     #[test]
