@@ -385,7 +385,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     }
 
     let _ = writeln!(text);
-    let _ = writeln!(text, "{} pictures replayed.", summary.pictures);
+    let _ = writeln!(text, "{} pictures replayed; the replay ends in {}.", summary.pictures, fen_of(tracker.position()));
     let _ = writeln!(
         text,
         "During the game: {} detections of moves by the program, {} moves typed by hand, {} undone.",

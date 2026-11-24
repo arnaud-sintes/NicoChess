@@ -5,6 +5,29 @@ and as the version of the Android app. Each release is a tag `vX.Y.Z` on GitHub 
 (see `scripts/release.ps1`). Versions follow semantic versioning while the project is below 1.0: a new
 minor number may change behaviour, a patch number only fixes things.
 
+## 0.10.1
+
+**Leaning pieces no longer block the game.** Four recordings of real games (three blitz, one slow) showed the tracker
+stuck for good, also in the slow game. The camera looks at the board from the side and low, so the head of a tall
+piece reaches over the square behind it: an empty square then looks occupied, and the single-square limit refused
+the right move (a bishop to b3 was the likeliest move at 100% and was refused because a3 looked white).
+
+- The tracker now knows, from the calibration, which neighbours of a square lie below it in the picture (where a piece
+  can lean over it from). An empty square next to such a piece may show its colour, for the limits on what may be left
+  unexplained. With a depth camera this is only believed where the height picture sees the square empty (it sees the
+  foot of a piece), and then it also counts for which move is the likeliest. With colour alone it is believed at a
+  higher price and never changes which move is the likeliest, because colour cannot tell a lean from a piece of the
+  same colour that has just come there.
+- A depth camera that disagrees with the colour pictures about a leaning square is no longer thrown out because of it.
+- When the tracker has been unsure for a second, the board has been still as long, one explanation is clear and the only
+  odd squares are leaned over, it takes it and allows what those squares misfit from then on; the models do not learn the
+  lean as the look of an empty square.
+- `--replay` also prints the position the replay ends in, to compare with the last picture of a recording.
+
+On the four recordings (replayed, not played live): the slow game is now followed to the end and its final position
+matches the last picture; the longest blitz game recovers more moves; the two other blitz games are not better (moves
+played faster than the tracker can follow, hands over the board). Not tried live.
+
 ## 0.10.0
 
 **A chess clock, if you want one.** A tester asked for an integrated timer with a time limit per player, an extra

@@ -26,6 +26,8 @@ struct WithDepth {
     depth: bool,
     /// The black pieces give no depth reading at all.
     absorbing: bool,
+    /// Squares over which a white head leans in the colour picture (the depth camera is not fooled by it).
+    ghosts: Vec<usize>,
     /// The depth pictures already drawn, by board and by which of a few noises they have (drawing takes long in a
     /// test build).
     drawn: HashMap<(PieceGrid, u32), depth::DepthFrame>,
@@ -40,7 +42,16 @@ impl WithDepth {
             tracker.set_view_advisory(2, true);
         }
         tracker.start(position);
-        WithDepth { tracker, now: Instant::now(), frames: 0, filter: DepthFilter::default(), depth, absorbing, drawn: HashMap::new() }
+        WithDepth {
+            tracker,
+            now: Instant::now(),
+            frames: 0,
+            filter: DepthFilter::default(),
+            depth,
+            absorbing,
+            ghosts: Vec::new(),
+            drawn: HashMap::new(),
+        }
     }
 
     /// `covered` are squares a hand hides in the colour picture. The depth camera is not bothered by it.
@@ -53,6 +64,9 @@ impl WithDepth {
             synthetic::degrade(&mut colour, -15, 10, self.frames);
             for &square in covered {
                 synthetic::occlude(&mut colour, &synthetic::corners(), square, 0.6);
+            }
+            for &square in &self.ghosts {
+                super::lean_tests::lean_over(&mut colour, square, super::lean_tests::WHITE_HEAD, 1.0);
             }
             let height = self.depth.then(|| {
                 let mut occupied = [false; 64];
@@ -174,4 +188,25 @@ fn a_depth_camera_that_sees_nothing_cannot_spoil_the_colour_camera() {
         }
     }
     assert_eq!(seen, ["e2e4", "e7e5", "g1f3"]);
+}
+
+/// A head as white as a piece leans over an empty square. Colour alone takes it for a piece and cannot follow the game;
+/// the depth camera, which sees the foot of things, sees nothing there, and the move is taken.
+#[test]
+fn a_head_that_leans_over_an_empty_square_stops_the_colour_camera_but_not_the_depth_camera() {
+    let square = super::lean_tests::leaned_square();
+    let steps = synthetic::game_steps(&["e4"]);
+    let mut taken = Vec::new();
+    for depth in [false, true] {
+        let mut rig = WithDepth::new(Chess::default(), depth, false);
+        rig.show(&synthetic::start_grid(), 7, &[]);
+        rig.ghosts = vec![square];
+        let found = rig.show(&steps[0].after, 8, &[]);
+        let wrong = found
+            .iter()
+            .any(|d| matches!(d, Detection::Move { mv, .. } if uci_of(*mv) != "e2e4") || matches!(d, Detection::Sequence { .. }));
+        taken.push((found.iter().any(|d| matches!(d, Detection::Move { mv, .. } if uci_of(*mv) == "e2e4")), wrong));
+    }
+    assert_eq!(taken[1], (true, false), "with the depth camera: {taken:?}");
+    assert!(!taken[0].0, "colour alone cannot tell the head from a piece: {taken:?}");
 }

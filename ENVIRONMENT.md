@@ -106,7 +106,9 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
 recorded times, applies what the people did, and prints what the replay found beside what happened, with the picture
 file of each line, then a summary: how many moves the program found and how many were typed during the game, and
 how many detections of the replay fit the game, how many do not, and at how many places the replay was behind (the
-number of moves it would have made someone type). The recorded game is the truth. A folder that holds recordings is
+number of moves it would have made someone type), and the position the replay ends in (compare it with the last colour
+picture of the recording: when the live game was lost, "do not fit" only means the live game never had that position,
+not that the replay is wrong). The recorded game is the truth. A folder that holds recordings is
 replayed recording by recording. The tuning options replace the recorded ones, to try a change on real pictures
 (`--replay recordings\2026-11-16_11-30-05 --max-excess 80 --margin 9`); `--replay-verbose` also lists every change of
 status and every list of candidates. Open the picture files named in the report to see what the camera saw.

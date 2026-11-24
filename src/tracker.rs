@@ -131,6 +131,23 @@ const NO_CHANGE_PENALTY: f32 = 14.0;
 /// How much a single square may be unexplained, in nats: a leaning piece or a glare spoils several squares a
 /// little, a piece that was knocked over or a hand left on the board spoils one square a lot.
 const SQUARE_LIMIT: f32 = 45.0;
+/// An empty square beside a piece that stands below it in the picture may show that piece's head (see
+/// `Sampler::lean_sources`): for the limits on what may be left unexplained it then costs what it costs to be that
+/// colour, plus a penalty (nats). With a height picture, which must see the square empty (`LEAN_DEPTH_NEEDED`, 0 to 1,
+/// see `Evidence::occupancy`), the penalty is `LEAN_PENALTY` times how far from empty it sees it plus one: nothing where
+/// it is sure. A lean changes which explanation is the likeliest only where the height picture is as sure as `LEAN_SURE`.
+/// With no height picture the penalty is `LEAN_PENALTY_COLOUR`.
+const LEAN_PENALTY: f32 = 12.0;
+const LEAN_PENALTY_COLOUR: f32 = 24.0;
+const LEAN_DEPTH_NEEDED: f32 = 0.3;
+const LEAN_SURE: f32 = 0.5;
+/// When the tracker has been unsure for this long, in seconds, and one explanation is clear and leaves nothing
+/// unexplained but a single odd square (a lean the models have not seen, a stain, a reflection), the board is taken
+/// as it is and the oddity is allowed from then on (see `Tracker::allow`). Without it, one square nobody can explain
+/// blocks the game for good: every explanation has the same misfit, and refusing them all teaches nothing.
+const ADOPT_AFTER: f32 = 1.0;
+/// The most a single square may misfit, in nats, to be adopted: more is a piece knocked over or a hand left there.
+const ADOPT_LIMIT: f32 = 150.0;
 /// A square that none of empty, white and black explains by this many nats (beyond what it usually shows) is covered: a
 /// hand, an arm or a sleeve is over it. What it shows says nothing about the game, so it counts the same for every
 /// explanation; the likeliest one is no longer the one that moves a covered piece away because a hand looks more like
@@ -352,11 +369,28 @@ struct View {
     /// piece, not of which colour, and its picture is noisier than a colour one, so it never decides when the board
     /// is still (the colour cameras do) and what it says is added to what they say (see `Evidence`).
     advisory: bool,
+    /// For each square, the squares whose pieces may lean over it in this camera's picture (see `Sampler::lean_sources`).
+    lean: Vec<Vec<u8>>,
 }
 
 impl View {
     fn new(cfg: &TrackerConfig) -> View {
-        View { sampler: None, models: None, gate: Gate::new(cfg), reference: None, stale: [false; 64], active: true, advisory: false }
+        View {
+            sampler: None,
+            models: None,
+            gate: Gate::new(cfg),
+            reference: None,
+            stale: [false; 64],
+            active: true,
+            advisory: false,
+            lean: Vec::new(),
+        }
+    }
+
+    /// Where the squares are in this camera's picture.
+    fn set_sampler(&mut self, sampler: Option<Sampler>) {
+        self.lean = sampler.as_ref().map(Sampler::lean_sources).unwrap_or_default();
+        self.sampler = sampler;
     }
 
     /// A picture of the board, all of it known, is the reference from now on.
@@ -417,6 +451,14 @@ pub struct Tracker {
     /// When the tracker became unsure (valid while `unsure`), and the picture it last looked for a longer way for.
     unsure_since: Option<Instant>,
     deep_tried: Option<Grid>,
+    /// The picture that `adopt_again` last looked at.
+    adopt_tried: Option<Grid>,
+    /// The empty squares that the last position decided was explained by a piece leaning over them.
+    leaned: Vec<bool>,
+    /// Squares whose picture has been odd for a good while with nothing else wrong (see [`ADOPT_AFTER`]): the content they
+    /// were adopted with, and how much beyond the usual they misfit. That much is not held against any explanation, as
+    /// long as the square holds the same content. It goes when the picture of the square is normal again.
+    allow: Vec<Option<(usize, f32)>>,
 }
 
 /// What the board should look like for a position.
@@ -448,11 +490,22 @@ struct Evidence {
     covered: Vec<bool>,
     /// The squares whose reference picture showed a hand (see `View::stale`), where nothing is known about a change.
     unknown: Vec<bool>,
+    /// For each square, the squares whose pieces may lean over it (see `Sampler::lean_sources`), from the colour cameras.
+    lean: Vec<Vec<u8>>,
+    /// What the height picture believes about each square, from -1 (empty, for sure) to 1 (occupied, for sure); 0 where
+    /// it says nothing or there is no height picture.
+    occupancy: Vec<f32>,
+    /// A height picture was used (see `occupancy`).
+    has_depth: bool,
+    /// Squares whose misfit is allowed (see `Tracker::allow`): the content, and how much.
+    allow: Vec<Option<(usize, f32)>>,
 }
 
 /// One camera's picture of the still board, with what is known about its squares.
 struct Look<'a> {
     models: &'a Models,
+    /// What may lean over each square in this camera's picture.
+    lean: &'a [Vec<u8>],
     features: &'a [Features],
     reference: Option<&'a [Features]>,
     /// The squares of the reference that show a hand, not the board: what changed there is not known.
@@ -522,6 +575,15 @@ impl Evidence {
         let colour: Vec<&Look> = looks.iter().filter(|l| !l.advisory).collect();
         let main: Vec<&Look> = if colour.is_empty() { looks.iter().collect() } else { colour };
         let (mut evidence, colour_trust) = Evidence::of_colour(&main, base);
+        // What may lean over a square in any of the colour cameras' pictures.
+        evidence.lean = (0..64)
+            .map(|square| {
+                let mut sources: Vec<u8> = main.iter().flat_map(|l| l.lean.get(square).into_iter().flatten().copied()).collect();
+                sources.sort_unstable();
+                sources.dedup();
+                sources
+            })
+            .collect();
         for look in looks.iter().filter(|l| l.advisory && !main.iter().any(|m| std::ptr::eq(*m, *l))) {
             evidence.add_occupancy(&Part::of(look), &colour_trust);
         }
@@ -573,13 +635,18 @@ impl Evidence {
                     return false;
                 }
                 let depth_occupied = part.costs[s][1].min(part.costs[s][2]) < part.costs[s][0];
-                depth_occupied != (colour_read[s] != Cell::Empty)
+                if depth_occupied == (colour_read[s] != Cell::Empty) {
+                    return false;
+                }
+                // An empty square that shows the colour of the piece beside it is a lean, not a disagreement.
+                depth_occupied || !self.leans_over(s, colour_read[s], &colour_read)
             })
             .count();
         if disagree > DEPTH_MAX_DISAGREE {
             self.ignored = true;
             return;
         }
+        self.has_depth = true;
         for square in 0..64 {
             let trust = part.trust(square);
             let colour = colour_trust[square];
@@ -587,6 +654,7 @@ impl Evidence {
             let own = [part.costs[square][0], occupied, occupied];
             let lowest = own[0].min(occupied);
             let stand_in = (1.0 - colour) * trust;
+            self.occupancy[square] = ((own[0] - occupied).clamp(-DEPTH_CAP, DEPTH_CAP) / DEPTH_CAP) * trust;
             // What the colour cameras say about a change on this square is worth what they are worth about the square.
             if let Some((unchanged, changed)) = self.change.as_mut() {
                 unchanged[square] *= 1.0 - stand_in;
@@ -616,6 +684,10 @@ impl Evidence {
                     ignored: false,
                     covered: vec![false; 64],
                     unknown: only.unknown,
+                    lean: Vec::new(),
+                    occupancy: vec![0.0; 64],
+                    has_depth: false,
+                    allow: vec![None; 64],
                 },
                 trust,
             );
@@ -647,7 +719,20 @@ impl Evidence {
         });
         let best_trust = (0..64).map(|s| trust.iter().map(|t| t[s]).fold(0.0f32, f32::max)).collect();
         let unknown = (0..64).map(|s| parts.iter().all(|p| p.unknown[s])).collect();
-        (Evidence { costs, typical, base, change, ignored: false, covered: vec![false; 64], unknown }, best_trust)
+        let evidence = Evidence {
+            costs,
+            typical,
+            base,
+            change,
+            ignored: false,
+            covered: vec![false; 64],
+            unknown,
+            lean: Vec::new(),
+            occupancy: vec![0.0; 64],
+            has_depth: false,
+            allow: vec![None; 64],
+        };
+        (evidence, best_trust)
     }
 
     /// How the picture fits a board: the misfit including what changed since the last confirmed picture, how
@@ -655,10 +740,8 @@ impl Evidence {
     fn fit(&self, grid: &Grid) -> (f32, f32, f32) {
         let (mut nll, mut excess, mut worst) = (0.0f32, 0.0f32, 0.0f32);
         for square in 0..64 {
-            let c = grid[square].index();
-            let cost = self.costs[square][c];
+            let (cost, beyond, _) = self.square(square, grid);
             nll += cost;
-            let beyond = (cost - self.typical[square][c] - SLACK).max(0.0);
             excess += beyond;
             worst = worst.max(beyond);
             if let Some((unchanged, changed)) = &self.change {
@@ -666,6 +749,88 @@ impl Evidence {
             }
         }
         (nll, excess, worst)
+    }
+
+    /// Whether a piece of this colour stands on a square that may lean over `square` (see `Sampler::lean_sources`).
+    fn leans_over(&self, square: usize, cell: Cell, grid: &Grid) -> bool {
+        cell != Cell::Empty && self.lean.get(square).is_some_and(|sources| sources.iter().any(|&n| grid[usize::from(n)] == cell))
+    }
+
+    /// Whether a lean may explain the square. With a height picture it must see the square empty (it sees the foot of
+    /// things, which a head that leans over does not hide): colour alone cannot tell a lean from a piece of the same
+    /// colour that has come to the square, and a lean taken for one lets an explanation that misses a move through.
+    fn lean_allowed(&self, square: usize) -> bool {
+        !self.covered[square] && (!self.has_depth || self.occupancy[square] <= -LEAN_DEPTH_NEEDED)
+    }
+
+    /// What a lean costs on top of the colour of the piece (see `LEAN_PENALTY`).
+    fn lean_penalty(&self, square: usize) -> f32 {
+        if self.has_depth { LEAN_PENALTY * (1.0 + self.occupancy[square]).max(0.0) } else { LEAN_PENALTY_COLOUR }
+    }
+
+    /// Whether the picture of a square can be a piece beside it that leans over it: the square is empty, a piece stands on
+    /// a square that may lean over it, and the picture looks more like that piece's colour than like an empty square. The
+    /// height picture, where it is sure that the square is occupied, says there is no lean.
+    fn lean_explains(&self, square: usize, grid: &Grid) -> bool {
+        grid[square] == Cell::Empty
+            && self.lean_allowed(square)
+            && self.lean.get(square).into_iter().flatten().any(|&n| {
+                let other = grid[usize::from(n)];
+                other != Cell::Empty && self.costs[square][other.index()] < self.costs[square][Cell::Empty.index()]
+            })
+    }
+
+    /// What a square costs with the content `grid` gives it, how much of that is beyond what it usually costs (what the
+    /// limits judge), and whether a lean explains the misfit.
+    ///
+    /// An empty square may show the head of a piece that leans over it (a tall piece seen from the side by a low
+    /// camera). The limits then take it as costing what the colour of that piece costs, plus a little. Which explanation
+    /// is the likeliest is not changed by it: that stays as the pictures say, only a square that a lean explains no
+    /// longer makes a good explanation unfit to be taken. The height picture, which sees the foot of things, confirms
+    /// the lean where it sees the square empty and turns it down where it sees it occupied. A square whose misfit was
+    /// allowed (see `Tracker::allow`) is not held against the explanation up to that much.
+    fn square(&self, square: usize, grid: &Grid) -> (f32, f32, bool) {
+        let c = grid[square].index();
+        let (mut cost, mut judged, leaned) = self.square_raw(square, grid);
+        let typical = self.typical[square][c];
+        if let Some((content, level)) = self.allow[square]
+            && content == c
+        {
+            cost -= level.min((cost - typical - SLACK).max(0.0));
+            judged -= level.min((judged - typical - SLACK).max(0.0));
+        }
+        (cost, (judged - typical - SLACK).max(0.0), leaned)
+    }
+
+    /// The same without the allowance: what the square costs, what it costs for the limits (less when a lean explains
+    /// it), and whether a lean does.
+    fn square_raw(&self, square: usize, grid: &Grid) -> (f32, f32, bool) {
+        let c = grid[square].index();
+        let mut cost = self.costs[square][c];
+        let mut judged = cost;
+        let mut leaned = false;
+        if c == Cell::Empty.index() && self.lean_allowed(square) {
+            let penalty = self.lean_penalty(square);
+            // Colour alone cannot tell a lean from a piece that has just come to the square, so what the pictures say
+            // about which explanation is likeliest is only changed where the height picture is sure the square is empty.
+            let sure = self.has_depth && self.occupancy[square] <= -LEAN_SURE;
+            for &n in self.lean.get(square).into_iter().flatten() {
+                let other = grid[usize::from(n)];
+                if other == Cell::Empty {
+                    continue;
+                }
+                let o = other.index();
+                let via_lean = self.costs[square][o] - self.typical[square][o] + self.typical[square][c] + penalty;
+                if via_lean < judged {
+                    judged = via_lean;
+                    leaned = true;
+                }
+            }
+            if sure {
+                cost = cost.min(judged);
+            }
+        }
+        (cost, judged, leaned)
     }
 }
 
@@ -819,6 +984,9 @@ impl Tracker {
             covered: vec![false; 64],
             unsure_since: None,
             deep_tried: None,
+            adopt_tried: None,
+            leaned: vec![false; 64],
+            allow: vec![None; 64],
         }
     }
 
@@ -901,7 +1069,7 @@ impl Tracker {
     pub fn set_view_calibration(&mut self, view: usize, calibration: Option<&Calibration>) {
         let sampler = calibration.and_then(Sampler::new);
         let view = self.view_mut(view);
-        view.sampler = sampler;
+        view.set_sampler(sampler);
         view.models = None;
         view.reference = None;
         view.gate.reset();
@@ -921,7 +1089,7 @@ impl Tracker {
     pub fn move_view_calibration(&mut self, view: usize, calibration: &Calibration) {
         if let Some(sampler) = Sampler::new(calibration) {
             let view = self.view_mut(view);
-            view.sampler = Some(sampler);
+            view.set_sampler(Some(sampler));
             view.gate.reset();
         }
     }
@@ -953,6 +1121,7 @@ impl Tracker {
         self.unsure = false;
         self.held = false;
         self.resync_pending = true;
+        self.allow = vec![None; 64];
         // The references show another position: they say nothing about what changed.
         for view in &mut self.views {
             view.reference = None;
@@ -973,6 +1142,7 @@ impl Tracker {
         self.unsure = false;
         self.held = false;
         self.still = false;
+        self.allow = vec![None; 64];
     }
 
     /// Looks at a picture of the first (or only) camera.
@@ -1079,6 +1249,7 @@ impl Tracker {
                     let view = &self.views[*i];
                     Some(Look {
                         models: view.models.as_ref()?,
+                        lean: &view.lean,
                         features,
                         reference: view.reference.as_deref(),
                         stale: &view.stale,
@@ -1086,7 +1257,9 @@ impl Tracker {
                     })
                 })
                 .collect();
-            Evidence::new(&looks, expected)
+            let mut evidence = Evidence::new(&looks, expected);
+            evidence.allow.clone_from(&self.allow);
+            evidence
         };
         self.depth_ignored = evidence.ignored;
         self.covered.clone_from(&evidence.covered);
@@ -1123,8 +1296,10 @@ impl Tracker {
         }
         let detection = if self.last_eval == Some(grid) {
             if self.unsure {
-                // The same picture again: it may be time to look for a longer way (see `DEEP_AFTER`).
-                self.try_deeper(grid, &evidence, &seen, since, now)
+                // The same picture again: it may be time to take it with one odd square (see `ADOPT_AFTER`), or to
+                // look for a longer way (see `DEEP_AFTER`).
+                self.adopt_again(&evidence, &seen, since, now)
+                    .or_else(|| self.try_deeper(grid, &evidence, &seen, since, now))
                     .unwrap_or_else(|| Detection::Unsure { candidates: self.candidates.clone() })
             } else {
                 Detection::Nothing
@@ -1170,12 +1345,12 @@ impl Tracker {
         }
         // Two moves are only believed once three have been looked at too: a pair that leaves a low-contrast
         // change unexplained (a white pawn on a light square) can look best only because the third move is missing.
-        if let Some(detection) = self.decide(&pool, seen, since, max_plies <= 2) {
+        if let Some(detection) = self.decide(&pool, evidence, seen, since, max_plies <= 2) {
             return detection;
         }
         if max_plies >= 3 {
             pool.expand(3, evidence);
-            if let Some(detection) = self.decide(&pool, seen, since, true) {
+            if let Some(detection) = self.decide(&pool, evidence, seen, since, true) {
                 return detection;
             }
         }
@@ -1244,7 +1419,72 @@ impl Tracker {
             return None;
         }
         let scale = 1.0 + 0.5 * f32::from(plies - 1);
-        self.accept_doubtful(&pool, best, runner_up, self.cfg.margin * scale, seen, since)
+        self.accept_doubtful(&pool, evidence, best, runner_up, self.cfg.margin * scale, seen, since)
+    }
+
+    /// The same picture is still on the board and the tracker is still unsure: the explanations are looked at again,
+    /// once, now that it has waited long enough (see `try_adopt`).
+    fn adopt_again(&mut self, evidence: &Evidence, seen: &Seen, since: Instant, now: Instant) -> Option<Detection> {
+        if !self.can_adopt(since, now) || self.adopt_tried == self.last_eval {
+            return None;
+        }
+        self.adopt_tried = self.last_eval;
+        let mut pool = Pool::new(&self.position, evidence);
+        for depth in 1..=(self.cfg.max_plies.clamp(1, 3) as u8) {
+            pool.expand(depth, evidence);
+        }
+        self.try_adopt(&pool, evidence, seen, since, now)
+    }
+
+    /// The tracker has been unsure for long enough, the board has been still for as long, and the tracker is free to decide.
+    /// (A board that is still changing says nothing about an odd square: the tracker may simply be more than three moves
+    /// behind, and then the best of its explanations is wrong, and clear only by the odd square it leaves.)
+    fn can_adopt(&self, since: Instant, now: Instant) -> bool {
+        self.unsure
+            && !self.held
+            && !self.undone
+            && now.saturating_duration_since(since).as_secs_f32() >= ADOPT_AFTER
+            && self.unsure_since.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() >= ADOPT_AFTER)
+    }
+
+    /// When the tracker has been unsure for `ADOPT_AFTER` and one explanation (nothing, or up to three moves) is as clear as
+    /// it must be for any other, and leaves nothing unexplained but one square (or a few) that is odd by less than
+    /// `ADOPT_LIMIT`: the explanation is taken, and the odd squares are allowed from now on (see `Tracker::allow`). The
+    /// models do not learn what the odd squares show.
+    fn try_adopt(&mut self, pool: &Pool, evidence: &Evidence, seen: &Seen, since: Instant, now: Instant) -> Option<Detection> {
+        if !self.can_adopt(since, now) {
+            return None;
+        }
+        let (best, runner_up) = pool.best_within(3);
+        let plies = pool.hyps[best].plies;
+        let scale = 1.0 + 0.5 * f32::from(plies.saturating_sub(1));
+        let (excess, worst) = (pool.hyps[best].excess, pool.hyps[best].worst);
+        // Only odd squares are the trouble: what is left when the worst one is taken out is as small as for any other
+        // simple explanation.
+        if worst > ADOPT_LIMIT
+            || excess - worst > SIMPLE_FRACTION * self.cfg.max_excess
+            || runner_up - pool.hyps[best].score < self.cfg.margin * scale
+        {
+            return None;
+        }
+        // The odd squares are all ones that a leaning piece explains: another oddity may be a move nobody has seen.
+        let mut position = self.position.clone();
+        for mv in pool.moves(best) {
+            position.play_unchecked(mv);
+        }
+        let grid = expected_grid(&position);
+        if (0..64).any(|square| evidence.square(square, &grid).1 > 0.5 * SQUARE_LIMIT && !evidence.lean_explains(square, &grid)) {
+            return None;
+        }
+        // Written out before `accept_with` moves the position on.
+        let chance = pool.chances(&[best])[0];
+        let alternatives = self.likeliest(pool, 3, Some(best), pool.hyps[best].score);
+        let detection = self.accept_with(pool, evidence, best, runner_up, seen, since, ADOPT_LIMIT, true)?;
+        if plies >= 1 {
+            // Taken on a lead that is clear, but with a square nobody can explain: the person is told.
+            self.doubt = Some(Doubt { certainty: chance, alternatives });
+        }
+        Some(detection)
     }
 
     /// Accepts the likeliest explanation if it is clear, or learns the picture if the board has not
@@ -1252,7 +1492,7 @@ impl Tracker {
     ///
     /// Nothing or one move are tried first: when one of them explains the picture there is no reason to
     /// invent more moves. Several are only looked at when the simple explanations leave too much unexplained.
-    fn decide(&mut self, pool: &Pool, seen: &Seen, since: Instant, last_stage: bool) -> Option<Detection> {
+    fn decide(&mut self, pool: &Pool, evidence: &Evidence, seen: &Seen, since: Instant, last_stage: bool) -> Option<Detection> {
         let (simple, simple_runner_up) = pool.best_within(1);
         // A person has just said what the board shows, and the camera has had no time to see more than a reply:
         // a square that looks odd is the models being out of date, not two or three moves nobody saw. Without
@@ -1266,7 +1506,7 @@ impl Tracker {
             // The models are stale after a hand-set position, so a move that only looks somewhat better than the
             // position the person typed (a queen leaning over its neighbour) is not believed: the typed position
             // is adopted and the models learn from it.
-            return self.accept(pool, 0, simple_runner_up, seen, since);
+            return self.accept(pool, evidence, 0, simple_runner_up, seen, since);
         }
         // Two moves that explain the picture clearly better than the best of nothing and one move are not "one move that
         // fits well enough": the reply was played too, and the one move only looks right because it explains most of what
@@ -1280,9 +1520,9 @@ impl Tracker {
             if simple_runner_up - pool.hyps[simple].score < self.cfg.margin {
                 // Two simple explanations fit nearly alike: more moves would not help. If one leads a little,
                 // it is taken and flagged; else the person is asked.
-                return self.accept_doubtful(pool, simple, simple_runner_up, self.cfg.soft_margin, seen, since);
+                return self.accept_doubtful(pool, evidence, simple, simple_runner_up, self.cfg.soft_margin, seen, since);
             }
-            return self.accept(pool, simple, simple_runner_up, seen, since);
+            return self.accept(pool, evidence, simple, simple_runner_up, seen, since);
         }
         // The simple explanations leave too much unexplained: several moves may have been played.
         let (best, runner_up) = pool.best_within(3);
@@ -1292,9 +1532,9 @@ impl Tracker {
         // Several moves at once must be clearer than one: there are many more ways to look alike.
         let scale = 1.0 + 0.5 * f32::from(pool.hyps[best].plies.saturating_sub(1));
         if runner_up - pool.hyps[best].score < self.cfg.margin * scale {
-            return self.accept_doubtful(pool, best, runner_up, self.cfg.soft_margin * scale, seen, since);
+            return self.accept_doubtful(pool, evidence, best, runner_up, self.cfg.soft_margin * scale, seen, since);
         }
-        self.accept(pool, best, runner_up, seen, since)
+        self.accept(pool, evidence, best, runner_up, seen, since)
     }
 
     /// The explanations that move something, likeliest first (at most `n`, without `skip`), each with its chance.
@@ -1318,9 +1558,11 @@ impl Tracker {
     /// The likeliest explanation leads, but not by the margin: it is taken if it leads by the soft margin, and
     /// the doubt goes with it (see `take_doubt`) so that the person can be told and can correct it. Not right
     /// after a position was set by hand, where nothing is taken on thin evidence.
+    #[allow(clippy::too_many_arguments)]
     fn accept_doubtful(
         &mut self,
         pool: &Pool,
+        evidence: &Evidence,
         index: usize,
         runner_up: f32,
         soft_needed: f32,
@@ -1334,26 +1576,47 @@ impl Tracker {
         // Written out before `accept` moves the position on.
         let chance = pool.chances(&[index])[0];
         let alternatives = self.likeliest(pool, 3, Some(index), pool.hyps[index].score);
-        let detection = self.accept(pool, index, runner_up, seen, since)?;
+        let detection = self.accept(pool, evidence, index, runner_up, seen, since)?;
         self.doubt = Some(Doubt { certainty: chance, alternatives });
         Some(detection)
     }
 
-    fn accept(&mut self, pool: &Pool, index: usize, runner_up: f32, seen: &Seen, since: Instant) -> Option<Detection> {
+    fn accept(&mut self, pool: &Pool, evidence: &Evidence, index: usize, runner_up: f32, seen: &Seen, since: Instant) -> Option<Detection> {
+        self.accept_with(pool, evidence, index, runner_up, seen, since, SQUARE_LIMIT, false)
+    }
+
+    /// Takes an explanation. No single square may misfit by more than `limit`. With `adopt`, the squares that do misfit
+    /// are not learned from (the models would take a lean, a stain, a reflection for how the square looks) and are
+    /// allowed from now on instead (see `update_allow`).
+    #[allow(clippy::too_many_arguments)]
+    fn accept_with(
+        &mut self,
+        pool: &Pool,
+        evidence: &Evidence,
+        index: usize,
+        runner_up: f32,
+        seen: &Seen,
+        since: Instant,
+        limit: f32,
+        adopt: bool,
+    ) -> Option<Detection> {
         let best = &pool.hyps[index];
         let gap = runner_up - best.score;
 
         if best.plies == 0 {
             // The board shows the position the game is in.
-            if self.resync_pending && best.excess <= RESYNC_FACTOR * self.cfg.max_excess {
+            let set_by_hand = self.resync_pending && best.excess <= RESYNC_FACTOR * self.cfg.max_excess;
+            let drift = !set_by_hand && (best.excess > self.cfg.max_excess || best.worst > limit);
+            if drift && ((best.excess > ADAPT_FACTOR * self.cfg.max_excess && !adopt) || best.worst > limit) {
+                return None; // too much is unexplained, or one square is: not a drift of the light
+            }
+            self.update_allow(evidence, adopt);
+            if set_by_hand {
                 // A person set this position: whatever the picture looks like now is what it looks like.
                 self.teach(seen, RESYNC_WEIGHT);
                 self.remember(seen);
-            } else if best.excess > self.cfg.max_excess || best.worst > SQUARE_LIMIT {
-                if best.excess > ADAPT_FACTOR * self.cfg.max_excess || best.worst > SQUARE_LIMIT {
-                    return None; // too much is unexplained, or one square is: not a drift of the light
-                }
-                self.teach(seen, ADAPT_WEIGHT);
+            } else if drift {
+                self.teach(seen, if adopt { 1.0 } else { ADAPT_WEIGHT });
                 self.remember(seen);
             }
             self.refresh_stale(seen);
@@ -1364,15 +1627,18 @@ impl Tracker {
 
         // A misfit spread thinly over many squares (no square far off) is the models being out of date, not a
         // hand or a knocked piece: it is allowed to be larger when the move wins clearly.
-        let diffuse =
-            best.excess > self.cfg.max_excess && best.excess <= ADAPT_FACTOR * self.cfg.max_excess && gap >= DIFFUSE_GAP * self.cfg.margin;
-        if (best.excess > self.cfg.max_excess && !diffuse) || best.worst > SQUARE_LIMIT {
+        let diffuse = best.excess > self.cfg.max_excess
+            && best.excess <= ADAPT_FACTOR * self.cfg.max_excess
+            && gap >= DIFFUSE_GAP * self.cfg.margin
+            && !adopt;
+        if (best.excess > self.cfg.max_excess && !diffuse && !adopt) || best.worst > limit {
             return None;
         }
         let moves = pool.moves(index);
         for mv in &moves {
             self.position.play_unchecked(*mv);
         }
+        self.update_allow(evidence, adopt);
         // A move seen clearly teaches the models what the board looks like now, and more when they were behind.
         if gap >= 2.0 * self.cfg.margin {
             self.teach(seen, if diffuse { ADAPT_WEIGHT } else { 1.0 });
@@ -1384,6 +1650,27 @@ impl Tracker {
             [mv] => Detection::Move { mv: *mv, since, promotion_guess: mv.promotion().is_some() },
             _ => Detection::Sequence { moves, since },
         })
+    }
+
+    /// The position the game is in has just been decided: notes which empty squares show a piece that leans over them (their
+    /// pictures are not learned), drops the allowances of squares that look normal again or hold something else, and with
+    /// `adopt` allows what the odd squares misfit.
+    fn update_allow(&mut self, evidence: &Evidence, adopt: bool) {
+        let grid = expected_grid(&self.position);
+        for square in 0..64 {
+            let c = grid[square].index();
+            let (_, judged, leaned) = evidence.square_raw(square, &grid);
+            let beyond = (judged - evidence.typical[square][c] - SLACK).max(0.0);
+            self.leaned[square] = leaned;
+            if let Some((content, level)) = self.allow[square]
+                && (content != c || beyond < 0.5 * level)
+            {
+                self.allow[square] = None;
+            }
+            if adopt && beyond > 0.5 * SQUARE_LIMIT {
+                self.allow[square] = Some((c, beyond));
+            }
+        }
     }
 
     /// The models of every camera learn its picture as the look of the current position, except the squares a hand
@@ -1405,7 +1692,10 @@ impl Tracker {
                 (0..64)
                     .map(|square| {
                         let c = labels[square].index();
-                        self.covered[square] || (ordinary && costs[square][c] - typical[square][c] - SLACK > TEACH_LIMIT)
+                        // (An empty square that shows the head of a piece beside it would become the look of an empty square.)
+                        self.covered[square]
+                            || (self.leaned[square] && !confirmed)
+                            || (ordinary && costs[square][c] - typical[square][c] - SLACK > TEACH_LIMIT)
                     })
                     .collect()
             };
@@ -1475,6 +1765,9 @@ mod timing_tests;
 
 #[cfg(test)]
 mod blitz_tests;
+
+#[cfg(test)]
+mod lean_tests;
 
 #[cfg(test)]
 mod tests {

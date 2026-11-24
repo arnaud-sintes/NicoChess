@@ -22,6 +22,9 @@ use image::RgbImage;
 
 /// Samples per side inside each square.
 const GRID: usize = 12;
+/// A neighbouring square is below another in the picture when the direction to it points down by at least this
+/// fraction of its length (0: level, 1: straight down). See [`Sampler::lean_sources`].
+const LEAN_BELOW: f32 = 0.5;
 /// The part of the square that is read, as a fraction of its side (the border is left out: it
 /// holds the neighbours of tall pieces).
 const SPAN: (f32, f32) = (0.12, 0.88);
@@ -108,6 +111,43 @@ impl Sampler {
         let inside = |u: f32| (MIDDLE.0..=MIDDLE.1).contains(&u);
         let middle = (0..GRID * GRID).map(|k| inside(at(k % GRID)) && inside(at(k / GRID))).collect();
         Some(Sampler { points, middle })
+    }
+
+    /// For each square, the squares whose piece may lean over it in the picture: the neighbours that lie below it
+    /// (toward the bottom of the picture). A camera that looks at the board from the side and low sees the head of a
+    /// tall piece above its foot, over the square behind it, so an empty square can show a piece's colour.
+    ///
+    /// Only the direction in the picture counts, so this holds for any way the board is turned in front of the camera.
+    pub fn lean_sources(&self) -> Vec<Vec<u8>> {
+        let per_square = GRID * GRID;
+        let centres: Vec<(f32, f32)> = self
+            .points
+            .chunks_exact(per_square)
+            .map(|square| {
+                let n = per_square as f32;
+                (square.iter().map(|p| p.0).sum::<f32>() / n, square.iter().map(|p| p.1).sum::<f32>() / n)
+            })
+            .collect();
+        (0..64usize)
+            .map(|square| {
+                let (file, rank) = ((square % 8) as i32, (square / 8) as i32);
+                let mut sources = Vec::new();
+                for (df, dr) in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                    let (f, r) = (file + df, rank + dr);
+                    if !(0..8).contains(&f) || !(0..8).contains(&r) {
+                        continue;
+                    }
+                    let other = (r * 8 + f) as usize;
+                    let (dx, dy) = (centres[other].0 - centres[square].0, centres[other].1 - centres[square].1);
+                    let length = dx.hypot(dy);
+                    // Below in the picture: the piece stands there and its head reaches up to this square.
+                    if length > 0.0 && dy / length > LEAN_BELOW {
+                        sources.push(other as u8);
+                    }
+                }
+                sources
+            })
+            .collect()
     }
 
     /// Reads the features of all 64 squares.
