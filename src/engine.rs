@@ -6,7 +6,7 @@
 //! thread (module `analysis`), which takes the pictures the capture threads put in its inbox and carries out the
 //! commands, in order, and takes the lock only to publish what it found.
 
-use crate::analysis::{self, Analyzer, Backlog, Context, Inbox, Item, Look, Next};
+use crate::analysis::{self, Analyzer, Backlog, Context, Inbox, Item, LAG_WAIT, Look, Next};
 use crate::boarddetect;
 use crate::calibration::{self, Calibration};
 use crate::camera::{FrameRate, SourceFactory};
@@ -835,7 +835,10 @@ impl Engine {
                     {
                         match source.next_frame() {
                             Ok(frame) => {
-                                link.publish(&frame);
+                                // Stamped with the moment the camera gave it (before the picture is cleaned up), in the clock of
+                                // the colour pictures, so that it can be paired with them by time.
+                                let captured = source.captured_at().unwrap_or_else(Instant::now);
+                                link.publish(&frame, captured);
                                 self.offer_depth_picture(link);
                             }
                             Err(e) => {
@@ -867,16 +870,15 @@ impl Engine {
         }
     }
 
-    /// A depth picture was read: its height picture goes to the analysis (when the tracker uses the depth) and, with
-    /// `--record-all`, to the recording, as the colour pictures do. The plane of the board takes a few milliseconds to
+    /// A depth picture was read: its height picture goes to the analysis (which leaves the depth out of a look until the
+    /// board is found in it) and, with `--record-all`, to the recording, as the colour pictures do. The plane of the board takes a few milliseconds to
     /// find: that is done here, on the depth thread, once for both, and not under the lock.
     fn offer_depth_picture(&self, link: &DepthLink) {
         let (rotation, recording_all) = {
             let inner = self.inner.grab();
             (inner.cams[0].picture.rotation, inner.recorder.as_ref().is_some_and(Recorder::records_every_picture))
         };
-        let for_the_tracker = link.wanted() && link.aligned();
-        if !for_the_tracker && !recording_all {
+        if !(link.wanted() && link.aligned()) && !recording_all {
             return;
         }
         let Some(stamp) = link.fresh() else { return };
@@ -885,16 +887,17 @@ impl Engine {
         if recording_all && let Some(recorder) = self.inner.grab().recorder.as_mut() {
             recorder.source(&Stamped { view: DEPTH_VIEW, seq: stamp.seq, captured: stamp.at, image: Arc::clone(&image) });
         }
-        if for_the_tracker {
-            self.offer_to_analysis(Item {
-                view: DEPTH_VIEW,
-                seq: stamp.seq,
-                captured: stamp.at,
-                waited: None,
-                image: Arc::clone(&image),
-                raw: image,
-            });
-        }
+        // Whatever was recorded is given to the analysis too, also before the squares were found in the depth picture
+        // (the analysis leaves the depth out of a look until then): so that a replay of every picture has the very same
+        // pictures to choose from as the analysis had.
+        self.offer_to_analysis(Item {
+            view: DEPTH_VIEW,
+            seq: stamp.seq,
+            captured: stamp.at,
+            waited: None,
+            image: Arc::clone(&image),
+            raw: image,
+        });
     }
 
     /// The squares are to be looked for in the depth picture, with the board in `position` (what is on it tells the
@@ -1143,8 +1146,18 @@ impl Engine {
         let engine = Arc::downgrade(self);
         let started = thread::Builder::new().name("analysis".into()).spawn(move || {
             loop {
-                match inbox.next() {
+                // A picture of a camera may be waiting for the picture of another that is due: when nothing comes for a while
+                // (the cameras stopped), it is decided with what there is.
+                let idle = analyzer.has_pending().then_some(LAG_WAIT);
+                match inbox.next(idle) {
                     Next::Stop => return,
+                    Next::Idle => {
+                        let Some(engine) = engine.upgrade() else { return };
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.flush_looks(&mut analyzer)));
+                        if outcome.is_err() {
+                            eprintln!("analysis: a picture could not be looked at (internal error); going on");
+                        }
+                    }
                     Next::Picture(item, backlog) => {
                         let Some(engine) = engine.upgrade() else { return };
                         // A panic while looking at a picture costs that picture, not the thread.
@@ -1159,6 +1172,12 @@ impl Engine {
                         // The person who sent it may have given up waiting: it must not run then.
                         if !job.begin() {
                             continue;
+                        }
+                        // The pictures that were captured before the command was sent are decided on first, also the ones that
+                        // were waiting for a picture that has not come.
+                        let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.flush_looks(&mut analyzer)));
+                        if flushed.is_err() {
+                            eprintln!("analysis: a picture could not be looked at (internal error); going on");
                         }
                         engine.inner.grab().job_after = Some(job.after());
                         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run(&engine, &mut analyzer)));
@@ -1249,7 +1268,18 @@ impl Engine {
             self.hub.notify();
         }
         let interval = self.track_interval();
-        if let Some(look) = analyzer.on_picture(item, || self.look_context(), interval) {
+        analyzer.deliver(item);
+        // Each look is published before the next is made: what a look led to may put the tracker back on the game's position.
+        while let Some(look) = analyzer.next_look(&mut || self.look_context(), interval) {
+            self.publish_look(analyzer, look, backlog);
+        }
+    }
+
+    /// Decides what is waiting for a picture that has not come (see `Analyzer::flush_look`).
+    fn flush_looks(&self, analyzer: &mut Analyzer) {
+        let interval = self.track_interval();
+        let backlog = self.inbox.backlog();
+        while let Some(look) = analyzer.flush_look(&mut || self.look_context(), interval) {
             self.publish_look(analyzer, look, backlog);
         }
     }
@@ -1261,7 +1291,7 @@ impl Engine {
         let mut guard = self.inner.grab();
         let lock_wait = asked_lock.elapsed();
         let inner = &mut *guard;
-        let Look { at, started, step, fed, active, views_changed, detection } = look;
+        let Look { at, started, step, fed, skews_us, trigger, released, flushed, unpaired, active, views_changed, detection } = look;
         // Commands run between pictures, in this thread: the game cannot have ended since the look began (a game that ended
         // while its pictures waited has no looks: the context said it was not played).
         if inner.mode != Mode::Playing {
@@ -1273,8 +1303,15 @@ impl Engine {
             Self::record(inner, "views", json!({"active": active}));
         }
         // How the pictures got here, for the console and the recording (see the module `pipeline`).
-        let seen: Vec<Fed> = fed.iter().map(|p| Fed { view: p.view, seq: p.seq, captured: p.captured, waited: p.waited }).collect();
-        let feed_note = inner.pipe.fed(started, lock_wait, step, &seen);
+        // How far in time each picture that went with the one that began the look was from it (in ms).
+        let skew_ms = |i: usize| (fed[i].view != trigger).then(|| skews_us[i] as f32 / 1000.0);
+        let seen: Vec<Fed> = fed
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Fed { view: p.view, seq: p.seq, captured: p.captured, waited: p.waited, skew_ms: skew_ms(i) })
+            .collect();
+        let without: Vec<usize> = (0..VIEWS).filter(|&v| unpaired[v]).collect();
+        let feed_note = inner.pipe.fed(started, lock_wait, step, &seen, &without);
         inner.pipe.backlog(&backlog);
         inner.backlog = backlog;
         // What the recording will say about this picture (see the module record).
@@ -1337,17 +1374,17 @@ impl Engine {
                 // Every picture was kept as it came: the recording only says which of them this look was given. The
                 // tracker may be given a picture that came before the recording began: it is kept now if it is not (a
                 // picture is kept once, whoever offers it first).
-                let mut given: Vec<(usize, u64)> = Vec::with_capacity(fed.len());
-                for picture in &fed {
+                let mut given: Vec<(usize, u64, Option<f32>)> = Vec::with_capacity(fed.len());
+                for (i, picture) in fed.iter().enumerate() {
                     recorder.source(&Stamped {
                         view: picture.view,
                         seq: picture.seq,
                         captured: picture.captured,
                         image: Arc::clone(&picture.raw),
                     });
-                    given.push((picture.view, picture.seq));
+                    given.push((picture.view, picture.seq, skew_ms(i)));
                 }
-                recorder.look(now, &given, status_name(status), at);
+                recorder.look(now, &given, status_name(status), at, released, flushed);
             } else if keep_picture {
                 let pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|p| (p.view, Arc::clone(&p.image))).collect();
                 recorder.frames(now, &pictures, status_name(status), loud);
@@ -3054,6 +3091,11 @@ mod tests {
             started: Instant::now(),
             step: Duration::ZERO,
             fed: Vec::new(),
+            skews_us: Vec::new(),
+            trigger: 0,
+            released: [0; VIEWS],
+            flushed: false,
+            unpaired: [false; VIEWS],
             active: [false; VIEWS],
             views_changed: false,
             detection: Detection::Move { mv: e4, since: Instant::now(), promotion_guess: false },

@@ -32,6 +32,12 @@ struct Window {
     gap_max: f64,
     capture_gap_max: f64,
     wait_min: Option<f64>,
+    /// How far in time (ms, either way) the pictures that went with a look were from the one that began it, over the
+    /// looks of the window, and the looks in which a view took part and was given no picture near enough in time.
+    skew_sum: f64,
+    skew_n: u64,
+    skew_max: f64,
+    unpaired: u64,
     kept: u64,
     kept_gap_max: f64,
     moves: u64,
@@ -104,6 +110,14 @@ fn main() {
                         w.over_limits += 1;
                     }
                 }
+                for view in event["views"].as_array().into_iter().flatten() {
+                    if let Some(skew) = view["skew_ms"].as_f64() {
+                        w.skew_sum += skew.abs();
+                        w.skew_n += 1;
+                        w.skew_max = w.skew_max.max(skew.abs());
+                    }
+                }
+                w.unpaired += event["unpaired"].as_array().map_or(0, |v| v.len() as u64);
                 // The columns are those of the first camera, the one that matters most for the board.
                 if let Some(view) = event["views"].as_array().and_then(|v| v.iter().find(|v| v["cam"] == 0)) {
                     let age = view["age_ms"].as_f64().unwrap_or(0.0);
@@ -177,9 +191,13 @@ fn main() {
         "capture thread waited for a picture (near 0: the picture was already there, the program was not keeping up); cam gap = the longest"
     );
     println!("time between two pictures as the camera made them (a gap of several pictures: the camera or its driver lost some).");
+    println!(
+        "skew = how far in time, in ms either way, the pictures of the other views were from the picture that began the look (recordings of format 6"
+    );
+    println!("and later; mean and max); unpaired = looks in which a view took part and got no picture, none being near enough in time.");
     println!();
     println!(
-        "{:>7} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>5} {:>6} {:>7}",
+        "{:>7} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>5} {:>6} {:>8} {:>8} {:>6} {:>7}",
         "from s",
         "looks",
         "per s",
@@ -192,6 +210,9 @@ fn main() {
         "max gap",
         "cam gap",
         "wait",
+        "skew ms",
+        "skew max",
+        "unpair",
         "moves",
         "unsure"
     );
@@ -204,7 +225,7 @@ fn main() {
         behind += usize::from(is_behind);
         let mean = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 };
         println!(
-            "{:>7.0} {:>5} {:>6.1} {:>7.1} {:>7.0} {:>8.0} {:>8.0} {:>7.0} {:>7} {:>8.0} {:>8.0} {:>5.0} {:>6} {:>7} {}",
+            "{:>7.0} {:>5} {:>6.1} {:>7.1} {:>7.0} {:>8.0} {:>8.0} {:>7.0} {:>7} {:>8.0} {:>8.0} {:>5.0} {:>8.0} {:>8.0} {:>6} {:>6} {:>7} {}",
             *key as f64 * width,
             w.looks,
             w.looks as f64 / width,
@@ -217,6 +238,9 @@ fn main() {
             w.gap_max,
             w.capture_gap_max,
             w.wait_min.unwrap_or(0.0),
+            mean(w.skew_sum, w.skew_n),
+            w.skew_max,
+            w.unpaired,
             w.moves,
             w.unsure,
             if is_behind { "BEHIND" } else { "" }

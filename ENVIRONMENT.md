@@ -105,7 +105,7 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   the board can be found in). The pictures are as the camera gave them, turned but not adjusted: the replay applies
   the brightness and contrast of `session.json` again (they cannot change during a game). Each picture has a number
   (`seq`, among the pictures of its camera, with no hole when nothing was lost) and `captured` (the moment the
-  camera made it); `look` lines say which pictures the tracker was given together, and `at` (the capture time of the picture that began the look, which the tracker was given as its time). Several megabytes a second as
+  camera made it); `look` lines say which pictures the tracker was given together, `skew_ms` (how far in time each picture that went with the one that began the look was captured from it, before it when negative), `at` (the capture time of the picture that began the look, which the tracker was given as its time), `released` (the number of the newest picture of each view that had come to the analysis when the look was made: a look may wait for the next picture of another view) and `flushed` (the analysis was told to decide at once). Several megabytes a second as
   JPEG at 1280x720 for two cameras, so use video (below). **Nothing is dropped for want of room in a queue**: the
   pictures that wait for the disk or the encoder take memory, up to 2 GB (`--record-budget <MB>`); at half of it the
   console and the recording say so (`backlog` line, every 5 s), and only past it are pictures left out: counted in
@@ -187,9 +187,15 @@ status and every list of candidates. Open the picture files named in the report 
 recording made with `--record-all` is replayed as the tracker saw it live (the pictures of each `look`, at the times of
 the looks), which is what compares with what happened; `--replay-all` feeds it every picture instead, one after the
 other in the order they were captured, by the rule of the analysis thread (the tracker looks when `track_interval` has
-passed since the look before, counted on capture times, with the newest picture of each camera that is not newer: so a replay of
-every picture finds what the program found live, however late the analysis was). The lines of the commands are put among the
-pictures by their `after`.
+passed since the look before, counted on capture times, with the picture of each other camera that was captured nearest in time to the one
+that began the look, within a tolerance; a recording of format 5 or before has the newest picture that had come instead). In a recording of format 6 the `look`
+lines say where the analysis made each look (`released`, `flushed`), the replay makes it again at that place from the pictures alone, and says
+if it could not, or made it with other pictures than the recording names: so a replay of every picture finds what the program found live,
+however late the analysis was, and the report checks it. (It can differ only where the analysis gave up waiting for a camera that was silent for more
+than 150 ms and took the pictures of the others in another order than their capture.) The lines of the commands are put among the pictures by their `after`.
+Pairing (format 6): `cargo run --release --example pipeline -- <recording>` shows by window how far in time the pictures that went together were
+(`skew`, mean and max) and how many looks had a view without a picture near enough (`unpair`); the `closed` line has the same for the whole game
+(`pair_skew_ms`, `unpaired`, for each view).
 
 **The analysis thread.** The tracker is not run by the capture threads: each picture is stamped, put in a queue and taken by the
 analysis thread in the order of capture across the cameras (`src/analysis.rs`). If it cannot keep up with the cameras, the pictures

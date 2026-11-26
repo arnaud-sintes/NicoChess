@@ -121,6 +121,11 @@ pub struct ViewFigures {
     pub age: Hist,
     /// The time between two looks of the tracker at this view: its maximum is the longest wait.
     pub fed_gap: Hist,
+    /// How far in time (in ms, either way) the picture of this view that went with a look was from the picture that
+    /// began the look: the pairing skew. Only for views whose picture was a companion, not the one that began the look.
+    pub skew: Hist,
+    /// Looks in which this view took part and was given no picture, because none was captured near enough in time.
+    pub unpaired: u64,
 }
 
 /// The figures of a stretch of play.
@@ -160,6 +165,9 @@ pub struct Fed {
     /// When the camera made the picture, and how long the capture thread waited for it (not known for the depth camera).
     pub captured: Instant,
     pub waited: Option<Duration>,
+    /// When it was captured, counted from the picture that began the look (in ms, negative before it); none for the picture
+    /// that began it.
+    pub skew_ms: Option<f32>,
 }
 
 /// What a look of the tracker was like, for the recording.
@@ -167,6 +175,8 @@ pub struct FeedNote {
     pub step_ms: f32,
     pub lock_ms: f32,
     pub views: Vec<ViewNote>,
+    /// Views that took part and were given no picture (none was near enough in time).
+    pub unpaired: Vec<usize>,
 }
 
 pub struct ViewNote {
@@ -177,6 +187,7 @@ pub struct ViewNote {
     /// Pictures of this view that came since the one the tracker looked at the time before.
     pub skipped: u64,
     pub since_last_ms: Option<f32>,
+    pub skew_ms: Option<f32>,
 }
 
 impl FeedNote {
@@ -195,10 +206,17 @@ impl FeedNote {
                 if let Some(x) = v.since_last_ms {
                     o["since_last_ms"] = json!(round1(x));
                 }
+                if let Some(x) = v.skew_ms {
+                    o["skew_ms"] = json!(round1(x));
+                }
                 o
             })
             .collect();
-        json!({"step_ms": round1(self.step_ms), "lock_ms": round1(self.lock_ms), "views": views})
+        let mut note = json!({"step_ms": round1(self.step_ms), "lock_ms": round1(self.lock_ms), "views": views});
+        if !self.unpaired.is_empty() {
+            note["unpaired"] = json!(self.unpaired);
+        }
+        note
     }
 }
 
@@ -242,8 +260,15 @@ impl Pipe {
 
     /// The tracker looked at `pictures`, starting at `started`, after `lock` waiting for the engine's lock, and took
     /// `step` to do it.
-    pub fn fed(&mut self, started: Instant, lock: Duration, step: Duration, pictures: &[Fed]) -> FeedNote {
-        let mut note = FeedNote { step_ms: ms(step), lock_ms: ms(lock), views: Vec::new() };
+    pub fn fed(&mut self, started: Instant, lock: Duration, step: Duration, pictures: &[Fed], unpaired: &[usize]) -> FeedNote {
+        let mut note = FeedNote { step_ms: ms(step), lock_ms: ms(lock), views: Vec::new(), unpaired: unpaired.to_vec() };
+        for &view in unpaired {
+            for sets in [&mut self.total, &mut self.window] {
+                if let Some(figures) = sets.views.get_mut(view) {
+                    figures.unpaired += 1;
+                }
+            }
+        }
         let mut behind = false;
         for picture in pictures {
             let Some(track) = self.tracking.get_mut(picture.view) else { continue };
@@ -261,6 +286,9 @@ impl Pipe {
                 if let Some(gap) = since_last {
                     figures.fed_gap.add(ms(gap));
                 }
+                if let Some(skew) = picture.skew_ms {
+                    figures.skew.add(skew.abs());
+                }
             }
             note.views.push(ViewNote {
                 view: picture.view,
@@ -269,6 +297,7 @@ impl Pipe {
                 capture_gap_ms: track.capture_gap.map(ms),
                 skipped,
                 since_last_ms: since_last.map(ms),
+                skew_ms: picture.skew_ms,
             });
         }
         for sets in [&mut self.total, &mut self.window] {
@@ -292,7 +321,7 @@ impl Pipe {
     pub fn summary(&self) -> Value {
         let mut views = serde_json::Map::new();
         for (i, v) in self.total.views.iter().enumerate() {
-            if v.received == 0 && v.fed == 0 {
+            if v.received == 0 && v.fed == 0 && v.unpaired == 0 {
                 continue;
             }
             views.insert(
@@ -301,6 +330,7 @@ impl Pipe {
                     "received": v.received, "fed": v.fed, "skipped": v.skipped,
                     "age_ms": v.age.json(), "wait_ms": v.wait.json(), "capture_gap_ms": v.capture_gap.json(),
                     "longest_gap_ms": if v.fed_gap.count() > 0 { json!(round1(v.fed_gap.max())) } else { Value::Null },
+                    "pair_skew_ms": v.skew.json(), "unpaired": v.unpaired,
                 }),
             );
         }
@@ -344,7 +374,7 @@ impl Pipe {
             },
         );
         for (i, v) in sets.views.iter().enumerate() {
-            if v.received == 0 && v.fed == 0 {
+            if v.received == 0 && v.fed == 0 && v.unpaired == 0 {
                 continue;
             }
             let name = if i == 2 { "depth".to_string() } else { format!("camera {}", i + 1) };
@@ -356,6 +386,9 @@ impl Pipe {
                 v.age.text(),
                 v.fed_gap.max()
             ));
+            if v.skew.count() > 0 || v.unpaired > 0 {
+                line.push_str(&format!(", {} paired {} away in time, {} looks without it", v.skew.count(), v.skew.text(), v.unpaired));
+            }
         }
         Some(line)
     }
@@ -395,14 +428,21 @@ mod tests {
             at(10),
             Duration::from_millis(1),
             Duration::from_millis(7),
-            &[Fed { view: 0, seq: 1, captured: at(0), waited: Some(Duration::from_millis(30)) }],
+            &[Fed { view: 0, seq: 1, captured: at(0), waited: Some(Duration::from_millis(30)), skew_ms: None }],
+            &[],
         );
         assert_eq!((a.views[0].skipped, a.views[0].since_last_ms), (0, None));
         assert!((a.views[0].age_ms - 10.0).abs() < 0.01 && (a.step_ms - 7.0).abs() < 0.01);
         for k in 1..=3 {
             pipe.arrival(0, at(40 * k), Duration::from_millis(2));
         }
-        let b = pipe.fed(at(130), Duration::ZERO, Duration::from_millis(50), &[Fed { view: 0, seq: 4, captured: at(120), waited: None }]);
+        let b = pipe.fed(
+            at(130),
+            Duration::ZERO,
+            Duration::from_millis(50),
+            &[Fed { view: 0, seq: 4, captured: at(120), waited: None, skew_ms: None }],
+            &[],
+        );
         assert_eq!(b.views[0].skipped, 2, "pictures 2 and 3 were not looked at");
         assert!((b.views[0].since_last_ms.unwrap() - 120.0).abs() < 0.01);
         assert!((b.views[0].capture_gap_ms.unwrap() - 40.0).abs() < 0.01);
@@ -417,12 +457,54 @@ mod tests {
     }
 
     #[test]
+    fn how_far_in_time_the_pictures_of_a_look_were_from_each_other_is_counted_and_a_view_with_no_picture_is_too() {
+        let t0 = Instant::now();
+        let mut pipe = Pipe::new(3, t0);
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let pictures = |skew: f32| {
+            vec![
+                Fed { view: 0, seq: 1, captured: at(100), waited: None, skew_ms: None },
+                Fed {
+                    view: 1,
+                    seq: 1,
+                    captured: at(100) + Duration::from_secs_f32(skew.abs() / 1000.0),
+                    waited: None,
+                    skew_ms: Some(skew),
+                },
+            ]
+        };
+        let note = pipe.fed(at(110), Duration::ZERO, Duration::from_millis(2), &pictures(15.0), &[]);
+        assert_eq!((note.views[0].skew_ms, note.views[1].skew_ms), (None, Some(15.0)));
+        let line = note.json();
+        assert_eq!(line["views"][1]["skew_ms"].as_f64(), Some(15.0));
+        assert!(line.get("unpaired").is_none());
+        let mut next = pictures(-25.0);
+        next[0].seq = 2;
+        next[1].seq = 2;
+        let note = pipe.fed(at(160), Duration::ZERO, Duration::from_millis(2), &next, &[2]);
+        assert_eq!(note.json()["unpaired"], serde_json::json!([2]));
+        let summary = pipe.summary();
+        let cam1 = &summary["views"]["cam1"];
+        assert_eq!(cam1["unpaired"].as_u64(), Some(0));
+        assert_eq!(cam1["pair_skew_ms"]["max"].as_f64(), Some(25.0), "the skew is counted either way");
+        assert!((cam1["pair_skew_ms"]["mean"].as_f64().unwrap() - 20.0).abs() < 0.2, "{cam1}");
+        assert!(summary["views"]["cam0"]["pair_skew_ms"].is_null(), "the picture that began a look has no skew");
+        assert_eq!(pipe.total.views[2].unpaired, 1);
+    }
+
+    #[test]
     fn a_picture_that_is_old_or_a_long_wait_counts_as_behind_and_the_console_line_says_so() {
         let t0 = Instant::now();
         let mut pipe = Pipe::new(3, t0);
         let late = t0 + Duration::from_millis(900);
         pipe.arrival(0, t0, Duration::ZERO);
-        pipe.fed(late, Duration::ZERO, Duration::from_millis(5), &[Fed { view: 0, seq: 1, captured: t0, waited: None }]);
+        pipe.fed(
+            late,
+            Duration::ZERO,
+            Duration::from_millis(5),
+            &[Fed { view: 0, seq: 1, captured: t0, waited: None, skew_ms: None }],
+            &[],
+        );
         assert_eq!(pipe.summary()["behind"], 1, "0.9 s old");
         assert!(pipe.report(t0 + Duration::from_secs(10)).is_none(), "not yet");
         let line = pipe.report(t0 + REPORT_EVERY).expect("it is time");

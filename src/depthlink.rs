@@ -116,6 +116,11 @@ impl DepthPatch {
 pub trait DepthSource: Send {
     fn describe(&self) -> String;
     fn next_frame(&mut self) -> Result<DepthFrame>;
+    /// When the camera gave the picture that `next_frame` returned last, as far as the source can tell, in the clock that
+    /// the colour pictures are stamped with; `None` when it cannot (the program then uses the time `next_frame` returned).
+    fn captured_at(&self) -> Option<Instant> {
+        None
+    }
     /// The modes the camera has, when it can say (the page offers them).
     fn modes(&self) -> Vec<DepthMode> {
         Vec::new()
@@ -377,14 +382,14 @@ impl DepthLink {
         lock(&self.calibration).is_some()
     }
 
-    /// A picture came from the depth camera: steadied, then kept as the latest.
-    pub fn publish(&self, frame: &DepthFrame) {
+    /// A picture came from the depth camera: steadied, then kept as the latest, stamped with the time it was captured.
+    pub fn publish(&self, frame: &DepthFrame, captured: Instant) {
         let settings = self.settings();
         let kept = depth::clip(frame, settings.near_mm, settings.far_mm);
         lock(&self.status).valid = depth::valid_share(&kept);
         let steady = lock(&self.filter).push(&kept);
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        *lock(&self.latest) = Some(DepthStamp { frame: Arc::new(steady), seq, at: Instant::now() });
+        *lock(&self.latest) = Some(DepthStamp { frame: Arc::new(steady), seq, at: captured });
     }
 
     /// The latest picture, if it is recent.
@@ -527,7 +532,7 @@ mod tests {
             // Half the picture is the board at 600 mm, half is a wall at 2500 mm.
             *z = if i % 60 < 30 { 600 } else { 2500 };
         }
-        link.publish(&DepthFrame::new(60, 40, mm));
+        link.publish(&DepthFrame::new(60, 40, mm), Instant::now());
         assert!((link.status().valid - 0.5).abs() < 0.01, "{}", link.status().valid);
         let stamp = link.fresh().unwrap();
         assert!(stamp.frame.mm.iter().all(|&z| z == 0 || z == 600), "the wall is not in the picture");
@@ -570,7 +575,7 @@ mod tests {
         assert!(link.open("X RGB").is_err());
 
         assert!(link.height_picture(0, false).is_none(), "no picture yet");
-        link.publish(&DepthFrame::new(60, 40, vec![600; 2400]));
+        link.publish(&DepthFrame::new(60, 40, vec![600; 2400]), Instant::now());
         let (seq, picture) = link.height_picture(0, false).expect("a flat picture has a plane");
         assert_eq!((picture.width(), picture.height()), (60, 40));
         link.mark_fed(seq);

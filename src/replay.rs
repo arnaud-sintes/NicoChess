@@ -11,7 +11,7 @@
 //!
 //! The pictures are fed at the times they were taken, so the replay is as fast as the computer, not the game.
 
-use crate::analysis::{Analyzer, Context as LookContext, Item};
+use crate::analysis::{Analyzer, Context as LookContext, Item, Pairing};
 use crate::game::{fen_of, parse_fen, san_of, uci_of};
 use crate::record::{FORMAT, SessionMeta};
 use crate::tracker::{Detection, Status, Tracker, TrackerConfig};
@@ -108,6 +108,9 @@ pub struct Report {
     /// What the replayed tracker found by itself, in order, for tools that set it beside another reading of the game
     /// (`tools/groundtruth`). A place where the replay had to be put on the real position is not in the list.
     pub detections: Vec<Found>,
+    /// The pictures (view, number) of each look, in order: as the recording names them with `Feed::AsLive`, as the analysis
+    /// chose them with `Feed::EveryPicture` (so that the two can be set side by side).
+    pub looks: Vec<Vec<(usize, u64)>>,
 }
 
 /// One detection of the replayed tracker: the moves (one or a sequence) with the time of the picture that gave them.
@@ -256,6 +259,14 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
         events = if feed == Feed::EveryPicture { interleave(rest, sources) } else { rest };
     }
     let events = group_pictures(events);
+    // A replay of every picture of a recording of format 6 or later is driven by the `look` lines: each is a look that the
+    // analysis made at that place (with the pictures that had come by then, see `interleave`), and the replay makes it again
+    // by the same rule, from the pictures alone, and checks that it gave the same pictures. A look that waited for a
+    // picture, or that was made because the analysis was asked to decide at once, is thus made where it was. Older
+    // recordings had looks that never waited: the pictures alone say where they were made.
+    let drive = every_picture && feed == Feed::EveryPicture && meta.format >= 6;
+    let mut unmatched_looks = 0usize;
+    let mut different_looks = 0usize;
     // Brightness and contrast are applied to the pictures of a recording of every picture, as the engine did live.
     let adjusting = [Some(meta.picture), meta.picture2, None];
     let mut missing = 0usize;
@@ -275,7 +286,8 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
     tracker.set_view_calibration(0, meta.calibration.as_ref());
     tracker.set_view_calibration(1, meta.calibration2.as_ref());
     tracker.start(parse_fen(&meta.start_fen).context("the start position of the recording")?);
-    let mut analyzer = Analyzer::new(tracker);
+    // A recording of format 5 or before was made with the newest picture of the other camera, not the nearest in time.
+    let mut analyzer = Analyzer::with_pairing(tracker, if meta.format >= 6 { Pairing::Nearest } else { Pairing::Newest });
     analyzer.begin();
     // What the live engine told the analysis at each look (see `analysis::Context`), as far as a recording says it: which
     // cameras have a calibration (and the second is in use), whether the depth camera found the squares, and until when
@@ -326,6 +338,7 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
 
     let mut summary = Summary::default();
     let mut detections: Vec<Found> = Vec::new();
+    let mut looks: Vec<Vec<(usize, u64)>> = Vec::new();
     let base = Instant::now();
     let mut last_file = String::new();
     let mut last_status = String::new();
@@ -350,15 +363,25 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
             }
             // A look of the tracker, in a recording of every picture: the pictures it was given together. With
             // `--replay-all` the looks are not followed: every picture is fed as it was captured.
-            "look" if feed == Feed::EveryPicture => {}
+            "look" if feed == Feed::EveryPicture && !drive => {}
             "frame" | "look" | "source" => {
                 // The pictures that were given to the tracker together: one per camera.
                 let files: Vec<(usize, PictureRef)> = match event.kind.as_str() {
+                    // The look is made again from the pictures that the analysis already has: none is loaded.
+                    "look" if drive => {
+                        let named: Vec<(usize, u64)> = event.data["pictures"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|p| Some((p["cam"].as_u64()? as usize, p["seq"].as_u64()?))).collect())
+                            .unwrap_or_default();
+                        last_file = named.iter().filter_map(|key| kept.get(key)).map(PictureRef::name).collect::<Vec<_>>().join(" ");
+                        Vec::new()
+                    }
                     "look" => {
                         let named: Vec<(usize, u64)> = event.data["pictures"]
                             .as_array()
                             .map(|a| a.iter().filter_map(|p| Some((p["cam"].as_u64()? as usize, p["seq"].as_u64()?))).collect())
                             .unwrap_or_default();
+                        looks.push(named.clone());
                         let mut files = Vec::new();
                         for key in named {
                             match kept.get(&key) {
@@ -416,74 +439,117 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
                     }
                 }
                 summary.pictures += files.len();
-                last_file = files.iter().map(|(_, p)| p.name()).collect::<Vec<_>>().join(" ");
-                let before = analyzer.tracker.position().clone();
-                let detection = if event.kind == "source" {
-                    // One picture, at the moment it was captured: the analysis decides by itself whether the tracker looks
-                    // (the same rule as the live program, on the time of capture).
+                if !(drive && event.kind == "look") {
+                    last_file = files.iter().map(|(_, p)| p.name()).collect::<Vec<_>>().join(" ");
+                }
+                if event.kind == "source" {
+                    // One picture, at the moment it was captured: the analysis takes it, and decides by itself whether the
+                    // tracker looks (the same rule as the live program, on the time of capture).
                     let Some((camera, _)) = files.first() else { continue };
                     let Some(image) = images.get_mut(*camera).and_then(Option::take) else { continue };
                     let image = std::sync::Arc::new(image);
-                    let item = Item {
+                    analyzer.deliver(Item {
                         view: *camera,
                         seq: event.data["seq"].as_u64().unwrap_or(0),
                         captured: now,
                         waited: None,
                         image: std::sync::Arc::clone(&image),
                         raw: image,
+                    });
+                }
+                // The looks that are due, one after the other: a picture may end the wait of several (see `Analyzer`). With the
+                // looks driving the replay, a picture only goes to the analysis, and a `look` line makes one look.
+                let pull_all = event.kind == "source" && !drive;
+                let pull_one = event.kind == "look" && drive;
+                let mut looked = false;
+                loop {
+                    let before = analyzer.tracker.position().clone();
+                    let detection = if pull_all || pull_one {
+                        if pull_one {
+                            if looked {
+                                break;
+                            }
+                            looked = true;
+                        }
+                        let mut context =
+                            || LookContext { playing, usable: calibrated, depth: depth_found, interval, fresh, begun_at: Some(base) };
+                        let flushed = pull_one && event.data["flushed"].as_bool().unwrap_or(false);
+                        let found =
+                            if flushed { analyzer.flush_look(&mut context, interval) } else { analyzer.next_look(&mut context, interval) };
+                        match found {
+                            Some(look) => {
+                                let made: Vec<(usize, u64)> = look.fed.iter().map(|p| (p.view, p.seq)).collect();
+                                if pull_one {
+                                    let named: Vec<(usize, u64)> = event.data["pictures"]
+                                        .as_array()
+                                        .map(|a| a.iter().filter_map(|p| Some((p["cam"].as_u64()? as usize, p["seq"].as_u64()?))).collect())
+                                        .unwrap_or_default();
+                                    different_looks += usize::from(made != named);
+                                }
+                                looks.push(made);
+                                look.detection
+                            }
+                            None => {
+                                unmatched_looks += usize::from(pull_one);
+                                break;
+                            }
+                        }
+                    } else if event.kind == "source" {
+                        // The looks drive the replay: the picture is only given to the analysis.
+                        break;
+                    } else {
+                        // The pictures that the tracker was given together, at the time it was given them: one look.
+                        if looked {
+                            break;
+                        }
+                        looked = true;
+                        let given: Vec<Option<&image::RgbImage>> = images.iter().map(Option::as_ref).collect();
+                        analyzer.tracker.feed_views(&given, now)
                     };
-                    let context = || LookContext { playing, usable: calibrated, depth: depth_found, interval, fresh, begun_at: Some(base) };
-                    match analyzer.on_picture(item, context, interval) {
-                        Some(look) => look.detection,
-                        None => continue,
+                    let moves = match detection {
+                        Detection::Move { mv, .. } => vec![mv],
+                        Detection::Sequence { moves, .. } => moves,
+                        Detection::Unsure { candidates } if verbose => {
+                            let best = candidates.first().map_or(String::new(), |c| format!("{} ({:.0}% sure)", c.san, 100.0 * c.chance));
+                            let why = why_unsure(candidates.get(1).map(|c| f64::from(c.cost)), config.margin);
+                            let _ = writeln!(text, "{:>8.1}s  replay unsure ({why}), likeliest: {best}   [{last_file}]", event.t);
+                            continue;
+                        }
+                        _ => Vec::new(),
+                    };
+                    let doubtful =
+                        analyzer.tracker.take_doubt().map_or(String::new(), |d| format!("   (doubtful, {:.0}% sure)", 100.0 * d.certainty));
+                    let status = status_text(analyzer.tracker.status());
+                    if verbose && status != last_status {
+                        let _ = writeln!(text, "{:>8.1}s  replay status: {status}   [{last_file}]", event.t);
                     }
-                } else {
-                    let given: Vec<Option<&image::RgbImage>> = images.iter().map(Option::as_ref).collect();
-                    analyzer.tracker.feed_views(&given, now)
-                };
-                let moves = match detection {
-                    Detection::Move { mv, .. } => vec![mv],
-                    Detection::Sequence { moves, .. } => moves,
-                    Detection::Unsure { candidates } if verbose => {
-                        let best = candidates.first().map_or(String::new(), |c| format!("{} ({:.0}% sure)", c.san, 100.0 * c.chance));
-                        let why = why_unsure(candidates.get(1).map(|c| f64::from(c.cost)), config.margin);
-                        let _ = writeln!(text, "{:>8.1}s  replay unsure ({why}), likeliest: {best}   [{last_file}]", event.t);
+                    last_status = status.to_string();
+                    if moves.is_empty() {
                         continue;
                     }
-                    _ => Vec::new(),
-                };
-                let doubtful =
-                    analyzer.tracker.take_doubt().map_or(String::new(), |d| format!("   (doubtful, {:.0}% sure)", 100.0 * d.certainty));
-                let status = status_text(analyzer.tracker.status());
-                if verbose && status != last_status {
-                    let _ = writeln!(text, "{:>8.1}s  replay status: {status}   [{last_file}]", event.t);
+                    let after = fen_of(analyzer.tracker.position());
+                    detections.push(Found {
+                        t: event.t,
+                        before: fen_of(&before),
+                        uci: moves.iter().map(|m| uci_of(*m)).collect(),
+                        san: sans_of(&before, &moves).split(' ').map(str::to_string).collect(),
+                        after: after.clone(),
+                    });
+                    let ok = real.contains(&key_of(&after));
+                    if ok {
+                        summary.found += 1;
+                    } else {
+                        summary.wrong += 1;
+                    }
+                    let _ = writeln!(
+                        text,
+                        "{:>8.1}s  replay found {}{}{}   [{last_file}]",
+                        event.t,
+                        sans_of(&before, &moves),
+                        doubtful,
+                        if ok { "" } else { "   WRONG: a position the game never had" }
+                    );
                 }
-                last_status = status.to_string();
-                if moves.is_empty() {
-                    continue;
-                }
-                let after = fen_of(analyzer.tracker.position());
-                detections.push(Found {
-                    t: event.t,
-                    before: fen_of(&before),
-                    uci: moves.iter().map(|m| uci_of(*m)).collect(),
-                    san: sans_of(&before, &moves).split(' ').map(str::to_string).collect(),
-                    after: after.clone(),
-                });
-                let ok = real.contains(&key_of(&after));
-                if ok {
-                    summary.found += 1;
-                } else {
-                    summary.wrong += 1;
-                }
-                let _ = writeln!(
-                    text,
-                    "{:>8.1}s  replay found {}{}{}   [{last_file}]",
-                    event.t,
-                    sans_of(&before, &moves),
-                    doubtful,
-                    if ok { "" } else { "   WRONG: a position the game never had" }
-                );
             }
             "detect" => {
                 summary.live_found += 1;
@@ -589,6 +655,12 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
     if unreadable > 0 {
         let _ = writeln!(text, "{unreadable} pictures of the videos could not be read and were left out.");
     }
+    if unmatched_looks + different_looks > 0 {
+        let _ = writeln!(
+            text,
+            "{unmatched_looks} looks of the recording could not be made again from its pictures, and {different_looks} were made with other pictures than the ones it names (the analysis took the pictures by another rule, or the recording is incomplete)."
+        );
+    }
     if missing > 0 {
         let _ = writeln!(
             text,
@@ -611,7 +683,7 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
         summary.typed_found,
         summary.live_typed
     );
-    Ok(Report { text, summary, detections })
+    Ok(Report { text, summary, detections, looks })
 }
 
 /// A replay of every picture feeds the pictures in the order they were captured, and puts the other lines of the recording
@@ -632,9 +704,15 @@ fn interleave(events: Vec<Event>, mut sources: Vec<Event>) -> Vec<Event> {
             let from = taken;
             let fits = |source: &Event| -> bool {
                 if event.kind == "look" {
-                    event.data["pictures"].as_array().is_some_and(|named| {
-                        named.iter().any(|p| p["cam"].as_u64() == Some(view(source)) && p["seq"].as_u64() == Some(seq(source)))
-                    })
+                    // A look made after the pictures that had come by then (format 6: it may have waited for a picture
+                    // that it was not given), or, before, after the last picture it was given.
+                    if let Some(released) = event.data["released"].as_array() {
+                        released.get(view(source) as usize).and_then(Value::as_u64).is_some_and(|n| seq(source) <= n)
+                    } else {
+                        event.data["pictures"].as_array().is_some_and(|named| {
+                            named.iter().any(|p| p["cam"].as_u64() == Some(view(source)) && p["seq"].as_u64() == Some(seq(source)))
+                        })
+                    }
                 } else if let Some(after) = event.data["after"].as_array() {
                     after.get(view(source) as usize).and_then(Value::as_u64).is_some_and(|n| seq(source) <= n)
                 } else {
@@ -801,7 +879,7 @@ mod tests {
 
         /// A recording of every picture: the pictures are given to `source` as they come, and the tracker looks at
         /// one of every `look_every` of them (`show_captured`).
-        fn every_picture(dir: &Path, picture: Picture) -> Session {
+        fn every_picture(dir: &Path, picture: Picture, track_interval: f64) -> Session {
             let meta = SessionMeta {
                 format: FORMAT,
                 program: "test".into(),
@@ -819,7 +897,7 @@ mod tests {
                 picture2: None,
                 video: None,
                 every_picture: true,
-                track_interval: 0.0,
+                track_interval,
             };
             let begun = Instant::now();
             let options = RecordOptions::keeping_all(dir.to_path_buf());
@@ -835,7 +913,7 @@ mod tests {
                 let at = self.at();
                 self.recorder.source(&crate::stage::Stamped { view: 0, seq: self.seq, captured: at, image: Arc::clone(&image) });
                 if i % look_every == 0 {
-                    self.recorder.look(at, &[(0, self.seq)], "watching", at);
+                    self.recorder.look(at, &[(0, self.seq, None)], "watching", at, [self.seq, 0, 0], false);
                 }
                 self.recorder.wait_idle();
             }
@@ -931,7 +1009,8 @@ mod tests {
         let dir = scratch("every");
         let steps = synthetic::game_steps(&["e4", "e5"]);
         let fens = fens_after(&["e4", "e5"]);
-        let mut session = Session::every_picture(&dir, Picture::default());
+        // Pictures every 333 ms and looks every 500 ms at most: the tracker looks at every second picture.
+        let mut session = Session::every_picture(&dir, Picture::default(), 0.5);
         // 14 pictures of the start position and 8 of e4 are captured; the tracker looks at every second one.
         session.show_captured(&synthetic::start_grid(), 14, 2);
         session.show_captured(&steps[0].after, 8, 2);
@@ -952,6 +1031,15 @@ mod tests {
         let all = replay_folder_with(&folder, &TrackerOverrides::default(), false, Feed::EveryPicture).unwrap();
         assert_eq!(all.summary.pictures, 22, "{}", all.text);
         assert_eq!((all.summary.found, all.summary.wrong, all.summary.behind), (1, 0, 0), "{}", all.text);
+        // The looks drive the replay: the look that names a picture the recording does not have cannot be made again, and the
+        // replay says so; the looks that can be made give the very pictures the recording names.
+        assert!(
+            all.text.contains("1 looks of the recording could not be made again from its pictures, and 0 were made with other"),
+            "{}",
+            all.text
+        );
+        assert_eq!(all.looks.len(), 11, "one look for each of the looks that could be made again: {:?}", all.looks);
+        assert_eq!(live.looks[..11], all.looks[..11].to_vec()[..], "the same pictures in each");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -964,7 +1052,7 @@ mod tests {
         let mut found = Vec::new();
         for (name, picture) in [("plain", Picture::default()), ("white", Picture { brightness: 255.0, ..Picture::default() })] {
             let dir = scratch(&format!("adjust-{name}"));
-            let mut session = Session::every_picture(&dir, picture);
+            let mut session = Session::every_picture(&dir, picture, 0.0);
             session.show_captured(&synthetic::start_grid(), 8, 1);
             session.show_captured(&steps[0].after, 6, 1);
             session.note("detect", json!({"moves": ["e2e4"], "san": ["e4"], "fen": fens[1]}));

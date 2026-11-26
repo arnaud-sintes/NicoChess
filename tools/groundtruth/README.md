@@ -40,7 +40,7 @@ On a recording without `pipe` lines it says so and shows only the pictures that 
 `legal --play` plays the moves (UCI) from the position and prints their SAN and the position after them; it refuses a move
 that is not legal, so a reader cannot write an impossible sequence.
 
-A recording made with `--record-all` (format 4; format 5 adds `at` to the `look` lines, `after` to the lines of the commands, and the figures of the pictures that waited for the analysis in `pipe` and `closed`) has every picture each camera gave, numbered `seq` and stamped `captured`,
+A recording made with `--record-all` (format 4; format 6 adds `skew_ms`, `released` and `flushed` to the `look` lines, and the pairing figures of `pipe` and `closed` that `pipeline` shows as `skew` and `unpair`; format 5 adds `at` to the `look` lines, `after` to the lines of the commands, and the figures of the pictures that waited for the analysis in `pipe` and `closed`) has every picture each camera gave, numbered `seq` and stamped `captured`,
 as the camera gave them (turned, not adjusted): `keyframes` applies the brightness and contrast of the session as the
 tracker saw them, finds the still stretches among all the pictures at the moment they were captured, and takes the
 tracker's status from its `look` lines; `compare` takes the unsure stretches from the `look` lines too, and `compare

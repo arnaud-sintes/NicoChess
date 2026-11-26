@@ -67,7 +67,9 @@ mod windows_impl {
 
     /// What the program uses: the pictures come from the thread that owns the camera.
     struct MfDepth {
-        frames: Receiver<Result<DepthFrame>>,
+        /// Each picture comes with the time the reading thread got it from the camera (before it waits for the program).
+        frames: Receiver<Result<(Instant, DepthFrame)>>,
+        captured: Option<Instant>,
         name: String,
         info: Info,
     }
@@ -87,7 +89,7 @@ mod windows_impl {
             let guard = ReadingGuard;
             let (ready_tx, ready_rx) = mpsc::channel::<Result<Info>>();
             // One picture at most is kept ahead: the camera waits for the program.
-            let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<DepthFrame>>(1);
+            let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<(Instant, DepthFrame)>>(1);
             let (name, wanted) = (depth_name.to_string(), *settings);
             thread::Builder::new()
                 .name("depth-read".into())
@@ -105,7 +107,10 @@ mod windows_impl {
                         }
                     };
                     loop {
-                        let frame = reader.next_frame();
+                        // The moment the camera gave the picture, as far as the program can tell: the sample time of Media
+                        // Foundation is not used (it counts from the start of the stream, and nothing here can say how
+                        // it relates to the clock that the colour pictures are stamped with).
+                        let frame = reader.next_frame().map(|frame| (Instant::now(), frame));
                         let failed = frame.is_err();
                         // The receiver is gone when the camera is closed.
                         if frames_tx.send(frame).is_err() || failed {
@@ -115,7 +120,7 @@ mod windows_impl {
                 })
                 .context("cannot start the depth camera thread")?;
             match ready_rx.recv_timeout(OPEN_TIMEOUT) {
-                Ok(opened) => Ok(MfDepth { frames: frames_rx, name: depth_name.to_string(), info: opened? }),
+                Ok(opened) => Ok(MfDepth { frames: frames_rx, captured: None, name: depth_name.to_string(), info: opened? }),
                 Err(mpsc::RecvTimeoutError::Timeout) => bail!("the depth camera did not open within {} seconds", OPEN_TIMEOUT.as_secs()),
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the depth camera thread stopped"),
             }
@@ -131,9 +136,16 @@ mod windows_impl {
             self.info.modes.clone()
         }
 
+        fn captured_at(&self) -> Option<Instant> {
+            self.captured
+        }
+
         fn next_frame(&mut self) -> Result<DepthFrame> {
             match self.frames.recv_timeout(FRAME_TIMEOUT) {
-                Ok(frame) => frame,
+                Ok(frame) => frame.map(|(at, frame)| {
+                    self.captured = Some(at);
+                    frame
+                }),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     bail!("no depth picture from the camera for {} seconds (is another program using it?)", FRAME_TIMEOUT.as_secs())
                 }

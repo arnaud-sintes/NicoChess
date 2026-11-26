@@ -62,8 +62,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// `captured` on a `frame` line, and the `look`, `backlog` and `gap` lines); a recording of format 3 is read as before.
 /// Format 5 added `track_interval` to `session.json`, `at` (the capture time of the picture that began it) to a `look` line,
 /// `after` (how many pictures of each view came before it) to the lines of a command, and the `analysis_gap` line: a
-/// recording of format 4 is read as before.
-pub const FORMAT: u32 = 5;
+/// recording of format 4 is read as before. Format 6 added `skew_ms` (how far in time the picture was from the one that
+/// began the look) to the pictures of a `look` line, and `pair_skew_ms` and `unpaired` to the figures of the `pipe` and
+/// `closed` lines; above all it says that the pictures of a look were chosen by their nearest capture time (`Pairing::Nearest`),
+/// not as the newest that had come (format 5 and before): a replay of every picture takes them the same way as the recording
+/// did. A `look` line also has `released` (the number of the newest picture of each view that had come to the analysis when
+/// the look was made, which a look that waited for a later picture needs to be put where it was made) and, when the analysis
+/// was asked to decide at once, `flushed`. A recording of format 5 is read as before.
+pub const FORMAT: u32 = 6;
 
 /// The memory that pictures waiting for the encoder or the disk may take, in bytes: 2 GB is about 700 pictures of
 /// 1280x720, 14 seconds of two cameras at 25 pictures a second. Only an encoder or a disk that is much too slow gets there.
@@ -481,16 +487,34 @@ impl Recorder {
     /// Notes which pictures the tracker was given together this time (`--record-all`: the pictures themselves were
     /// kept by [`source`](Self::source) as they came), with the status it was in afterwards. Call it before the events
     /// that the look led to.
-    pub fn look(&mut self, at: Instant, pictures: &[(usize, u64)], status: &'static str, tracker_at: Instant) {
+    pub fn look(
+        &mut self,
+        at: Instant,
+        pictures: &[(usize, u64, Option<f32>)],
+        status: &'static str,
+        tracker_at: Instant,
+        released: [u64; VIEWS],
+        flushed: bool,
+    ) {
         if !self.every_picture {
             return;
         }
         self.feeds += 1;
-        let list: Vec<Value> = pictures.iter().map(|(cam, seq)| json!({"cam": cam, "seq": seq})).collect();
+        // A picture that was paired with the one that began the look says how far from it in time it was captured (ms).
+        let list: Vec<Value> = pictures
+            .iter()
+            .map(|(cam, seq, skew)| match skew {
+                Some(skew) => json!({"cam": cam, "seq": seq, "skew_ms": (f64::from(*skew) * 10.0).round() / 10.0}),
+                None => json!({"cam": cam, "seq": seq}),
+            })
+            .collect();
         // The time the tracker was given is the capture time of the picture that began the look, which the lag of the
         // analysis does not change (`t` is when the look was made, and never goes back).
         let given = (tracker_at.saturating_duration_since(self.begun).as_secs_f64() * 1e6).round() / 1e6;
-        let line = json!({"t": self.seconds(at), "type": "look", "feed": self.feeds, "status": status, "at": given, "pictures": list});
+        let mut line = json!({"t": self.seconds(at), "type": "look", "feed": self.feeds, "status": status, "at": given, "pictures": list, "released": released});
+        if flushed {
+            line["flushed"] = json!(true);
+        }
         self.send(Msg::Line(line.to_string()));
     }
 
@@ -1353,7 +1377,7 @@ mod tests {
                 recorder.source(&stamped(2, n / 3, at + Duration::from_millis(20), &depth));
             }
             if n % 2 == 0 {
-                recorder.look(at + Duration::from_millis(20), &[(0, n), (1, n)], "watching", at);
+                recorder.look(at + Duration::from_millis(20), &[(0, n, None), (1, n, Some(15.0))], "watching", at, [n, n, n / 3], false);
             }
         }
         recorder.flush_gaps();
@@ -1371,7 +1395,11 @@ mod tests {
         assert!(frames.iter().all(|l| l["captured"].as_f64().is_some() && l["video"].is_string() && l.get("feed").is_none()));
         let looks: Vec<&Value> = lines.iter().filter(|l| l["type"] == "look").collect();
         assert_eq!(looks.len(), 5);
-        assert_eq!(looks[1]["pictures"], json!([{"cam": 0, "seq": 4}, {"cam": 1, "seq": 4}]));
+        assert_eq!(
+            looks[1]["pictures"],
+            json!([{"cam": 0, "seq": 4}, {"cam": 1, "seq": 4, "skew_ms": 15.0}]),
+            "how far the second picture was from the first"
+        );
         assert_eq!(looks[1]["status"], "watching");
         let closed = lines.last().unwrap();
         assert_eq!(closed["dropped"], 0);
@@ -1499,7 +1527,7 @@ mod tests {
         let mut recorder = Recorder::begin(&RecordOptions::new(dir.clone(), Duration::ZERO), meta(), begun).unwrap();
         let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([1, 2, 3])));
         recorder.source(&stamped(0, 1, begun, &image));
-        recorder.look(begun, &[(0, 1)], "watching", begun);
+        recorder.look(begun, &[(0, 1, None)], "watching", begun, [1, 0, 0], false);
         let folder = recorder.folder().to_path_buf();
         recorder.close();
         let lines = read_lines(&folder);

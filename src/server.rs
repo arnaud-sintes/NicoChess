@@ -1585,6 +1585,133 @@ mod tests {
         check_every_picture_and_replay(&events, &report, &[0, 1]);
     }
 
+    /// A camera whose first picture comes late by a fixed time (so that two such cameras are out of step), and every picture by
+    /// a pseudo-random time on top: the capture times of its pictures are jittered. The pace is a picture every 100 ms plus up
+    /// to `max_ms`, so that no picture comes later than the analysis waits for a picture of another camera (`LAG_WAIT`), which
+    /// would put the pictures in another order than their capture.
+    struct Jittery {
+        inner: Box<dyn camera::FrameSource>,
+        state: u64,
+        max_ms: u64,
+        fixed_ms: u64,
+    }
+
+    impl camera::FrameSource for Jittery {
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+        fn next_frame(&mut self) -> anyhow::Result<image::RgbImage> {
+            let frame = self.inner.next_frame()?;
+            self.state = self.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            std::thread::sleep(Duration::from_millis(std::mem::take(&mut self.fixed_ms) + (self.state >> 33) % (self.max_ms + 1)));
+            Ok(frame)
+        }
+        fn restart(&mut self) {
+            self.inner.restart();
+        }
+    }
+
+    fn jittery(factory: camera::SourceFactory, max_ms: u64, fixed_ms: u64, seed: u64) -> camera::SourceFactory {
+        Box::new(move || {
+            let inner = factory()?;
+            Ok(Box::new(Jittery { inner, state: seed, max_ms, fixed_ms }) as Box<dyn camera::FrameSource>)
+        })
+    }
+
+    #[test]
+    fn cameras_out_of_step_and_late_by_chance_are_paired_by_capture_time_and_a_replay_pairs_them_the_same() {
+        use crate::replay::{Feed, TrackerOverrides, replay_folder_with};
+        let dir = std::env::temp_dir().join(format!("nicochess-pairing-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        // Two cameras and a depth camera that see the same game; the second camera starts 35 ms late, and both are late by up
+        // to 30 ms more, each time, so that the pictures of a time are never captured together.
+        let (first, second, depth) = camera::demo_trio(Duration::from_millis(100), Duration::from_millis(600));
+        let link = crate::depthlink::DepthLink::new(depth, None);
+        link.set_offer(Some("demo depth camera".into()));
+        let record = Some(crate::record::RecordOptions::keeping_all(dir.join("recordings")));
+        let config = EngineConfig {
+            record,
+            second_fixed: true,
+            depth: Some(Arc::clone(&link)),
+            track_interval: Duration::from_millis(80),
+            ..patient()
+        };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        engine.spawn_capture_second(jittery(second, 30, 35, 7)).unwrap();
+        engine.spawn_capture(jittery(first, 30, 0, 3)).unwrap();
+        engine.spawn_depth().unwrap();
+        let rig = Rig { handler: handler(Arc::clone(&engine), 8), engine, dir };
+        calibrate_both(&rig);
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": true}"#).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
+        assert_eq!(rig.state(BOB)["game"]["moves"].as_array().unwrap().len(), 33, "every move is found, whatever the jitter");
+
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        // The recording says how far in time each picture that went with a look was from the picture that began it.
+        let looks: Vec<&Value> = events.iter().filter(|e| e["type"] == "look").collect();
+        let skews: Vec<f64> = looks
+            .iter()
+            .flat_map(|e| e["pictures"].as_array().unwrap().iter().filter_map(|p| p["skew_ms"].as_f64()))
+            .map(f64::abs)
+            .collect();
+        assert!(skews.len() > 100, "{} pictures that went with another", skews.len());
+        let (mean, max) = (skews.iter().sum::<f64>() / skews.len() as f64, skews.iter().cloned().fold(0.0, f64::max));
+        // 100 ms between pictures: a tolerance of 150 ms, and the nearest picture is usually within half an interval, and
+        // jitter and the late camera add to it.
+        assert!(max <= 150.0, "the greatest skew is {max} ms");
+        assert!(mean < 80.0, "the mean skew is {mean} ms");
+        assert!(
+            looks.iter().any(|e| e["pictures"].as_array().unwrap().iter().any(|p| p["cam"] == 2 && p["skew_ms"].is_f64())),
+            "the depth took part"
+        );
+        let closed = events.last().unwrap();
+        assert_eq!(closed["dropped"], 0);
+        let figures = &closed["pipeline"]["views"]["cam1"];
+        assert!(figures["pair_skew_ms"]["max"].as_f64().is_some_and(|m| m <= 150.0), "{figures}");
+        assert!(
+            events.iter().filter(|e| e["type"] == "pipe").any(|e| e["views"].as_array().unwrap().iter().any(|v| v["skew_ms"].is_f64()))
+        );
+
+        // A replay of the looks has them as they were; a replay of every picture makes the same looks by the same rule.
+        let as_live = replay_folder_with(&folder, &TrackerOverrides::default(), false, Feed::AsLive).unwrap();
+        assert_eq!((as_live.summary.wrong, as_live.summary.behind), (0, 0), "{}", as_live.text);
+        let live_moves: Vec<Vec<String>> = events
+            .iter()
+            .filter(|e| e["type"] == "detect")
+            .map(|e| e["moves"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect())
+            .collect();
+        assert_eq!(live_moves, as_live.detections.iter().map(|f| f.uci.clone()).collect::<Vec<_>>());
+        let named: Vec<Vec<(usize, u64)>> = looks
+            .iter()
+            .map(|e| {
+                e["pictures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| (p["cam"].as_u64().unwrap() as usize, p["seq"].as_u64().unwrap()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(as_live.looks, named);
+        let all = replay_folder_with(&folder, &TrackerOverrides::default(), false, Feed::EveryPicture).unwrap();
+        assert_eq!((all.summary.wrong, all.summary.behind), (0, 0), "{}", all.text);
+        let first_difference = named.iter().zip(&all.looks).position(|(live, replayed)| live != replayed);
+        assert_eq!(
+            (named.len(), first_difference),
+            (all.looks.len(), None),
+            "the pictures of each look are the same live and in a replay of every picture (first difference at {first_difference:?}: live {:?}, replay {:?})",
+            first_difference.map(|i| &named[i..(i + 3).min(named.len())]),
+            first_difference.map(|i| &all.looks[i..(i + 3).min(all.looks.len())])
+        );
+    }
+
     /// A camera that works for a number of pictures, and is gone after that (and cannot be opened again).
     struct Dies {
         inner: Box<dyn camera::FrameSource>,
