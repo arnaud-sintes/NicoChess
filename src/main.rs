@@ -56,9 +56,13 @@ OPTIONS:
     --record-dir <DIR>       where the recordings go             [default: recordings]
     --record-every <SECS>    time between two pictures kept while the board is quiet; while something happens
                              a few a second are kept. 0 keeps all the quiet ones  [default: 2]
-    --record-all             record, and keep every picture the detection looks at, quiet or not (with --fps 25
-                             that is several megabytes a second: for a game that must be followed again picture
-                             by picture, for example a blitz game). Use it instead of --record
+    --record-all             record, and keep EVERY picture each camera gives, the moment it is captured, whether
+                             the detection looks at it or not (the depth camera too): a game that must be followed
+                             again picture by picture, for example a blitz game. Use it instead of --record. The
+                             pictures that wait for the disk or the encoder take memory, up to --record-budget; past
+                             it some are left out, and the recording says exactly which (`gap` lines)
+    --record-budget <MB>     with --record-all: the memory for pictures that wait for the disk or the encoder
+                             [default: 2048]
     --ffmpeg <PATH>          the ffmpeg program (a portable ffmpeg.exe is enough) that writes the recorded pictures
                              as video, five to twenty times smaller than JPEG files, and reads them back for a
                              replay. Without it: the one next to the program, the one named by NICOCHESS_FFMPEG, then
@@ -68,6 +72,9 @@ OPTIONS:
                              detection again and compare it with what happened. The tuning options below
                              replace the recorded ones, to try them on real pictures
     --replay-verbose         with --replay: also list every change of the tracker's status
+    --replay-all             with --replay: feed the tracker every picture of a recording made with --record-all,
+                             one after the other at the moment it was captured, instead of the pictures it was
+                             given live (how the program will use the pictures later)
 
   Tuning the move detection:
     --stable-frames <N>      pictures in a row that must agree   [default: 3]
@@ -157,6 +164,8 @@ fn run() -> Result<()> {
     let record_every = record_every_option.unwrap_or(2.0);
     let replay: Option<PathBuf> = args.opt_value_from_str("--replay")?;
     let replay_verbose = args.contains("--replay-verbose");
+    let replay_all = args.contains("--replay-all");
+    let record_budget_mb: Option<usize> = args.opt_value_from_str("--record-budget")?;
     let ffmpeg_option: Option<PathBuf> = args.opt_value_from_str("--ffmpeg")?;
     let no_video = args.contains("--no-video");
 
@@ -174,10 +183,17 @@ fn run() -> Result<()> {
         nicochess::video::set_explicit(path.clone());
     }
     if let Some(path) = replay {
-        return replay::run(&path, &overrides, replay_verbose);
+        let feed = if replay_all { replay::Feed::EveryPicture } else { replay::Feed::AsLive };
+        return replay::run(&path, &overrides, replay_verbose, feed);
     }
-    if replay_verbose {
-        bail!("--replay-verbose goes with --replay");
+    if replay_verbose || replay_all {
+        bail!("--replay-verbose and --replay-all go with --replay");
+    }
+    if record_budget_mb.is_some() && !record_all {
+        bail!("--record-budget goes with --record-all");
+    }
+    if record_budget_mb == Some(0) {
+        bail!("--record-budget must be at least 1 (megabytes)");
     }
     if !(record_every >= 0.0 && record_every.is_finite()) {
         bail!("--record-every must be 0 or more");
@@ -275,7 +291,11 @@ fn run() -> Result<()> {
                 ),
             }
             let options = if record_all {
-                RecordOptions::keeping_all(record_dir)
+                let keeping = RecordOptions::keeping_all(record_dir);
+                match record_budget_mb {
+                    Some(mb) => keeping.with_budget(mb.saturating_mul(1 << 20)),
+                    None => keeping,
+                }
             } else {
                 RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))
             };

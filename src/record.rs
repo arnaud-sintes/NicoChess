@@ -5,29 +5,40 @@
 //!
 //! - `session.json`: how the program was set up: calibration, picture settings (of the second camera too, when
 //!   there is one), tracker settings, the position the tracker started from.
-//! - `frames/000001.jpg`, ...: the pictures the detection was given (turned and adjusted as it saw them).
-//!   One every `--record-every` seconds, and every picture while something happens: the tracker is learning,
-//!   a hand is moving, it is unsure, a move was found. With two cameras each time brings two pictures.
-//!   When an `ffmpeg` is found the pictures go instead into one video for each camera (`cam0.mkv`, `cam2.mkv`
-//!   for the depth view: see [`crate::video`]), a fifth to a twentieth of the size; a camera whose video cannot be
-//!   written goes on in JPEG files.
+//! - `frames/000001.jpg`, ...: the pictures. There are two ways to keep them, told by `every_picture` in `session.json`.
+//!   With `--record` (sampled) they are the pictures the detection was given (turned and adjusted as it saw them), one
+//!   every `--record-every` seconds and every picture while something happens (the tracker is learning, a hand is
+//!   moving, it is unsure, a move was found); with two cameras each time brings two pictures. With `--record-all`
+//!   (every picture) they are every picture each camera gave, the moment it was captured, turned but not adjusted (the
+//!   settings of `session.json` are applied again by the replay: they cannot change during a game), whether the tracker
+//!   looked at it or not; the height picture of the depth camera too, for every depth picture it could be made from.
+//!   The `look` lines say which pictures the tracker was given together. When an `ffmpeg` is found the pictures go
+//!   instead into one video for each camera (`cam0.mkv`, `cam2.mkv` for the depth view: see [`crate::video`]), a fifth
+//!   to a twentieth of the size; a camera whose video cannot be written goes on in JPEG files.
 //! - `events.jsonl`: one JSON object per line, in order, each with `t` (seconds since the recording began)
-//!   and a `type`: `frame` (the file, or the video and the number of the picture in it, the tracker's status, the
-//!   camera `cam` and the number `feed` that the pictures given together share), `video` (the first time a camera's
-//!   video is used: its file and the size of its pictures), `video_lost` (its encoder failed), `detect` (moves found,
-//!   and the position after), `unsure` (the candidates offered), `manual`, `undo`, `promotion`, `relearn`,
+//!   and a `type`: `frame` (the file, or the video and the number of the picture in it, the camera `cam`; when
+//!   sampled the tracker's status and the number `feed` that the pictures given together share; when every picture
+//!   is kept its number `seq` among the pictures of that camera, and `captured`, the moment the camera made it),
+//!   `look` (every picture kept: the pictures the tracker was given together, `[{cam, seq}]`, with the status after),
+//!   `video` (the first time a camera's video is used: its file and the size of its pictures), `video_lost` (its encoder
+//!   failed), `backlog` (the disk or the encoder is behind: half of the memory budget is taken), `gap` (pictures that
+//!   could not be kept because the budget was full: the camera, how many, the numbers and the times), `detect` (moves
+//!   found, and the position after), `unsure` (the candidates offered), `manual`, `undo`, `promotion`, `relearn`,
 //!   `calibration`, `end`, and `closed` last. Positions are FEN strings.
 //!
-//! Nothing here may disturb the game: the capture thread only hands pictures and lines to the writer threads
-//! (`try_send`, never waiting for the disk or the encoder); when they cannot keep up, pictures are dropped and
-//! counted. JPEG pictures are encoded and written by two to four threads at once (one keeps up with about 20 a second,
-//! and two cameras at 25 feeds a second give 50), the lines of `events.jsonl` are still appended in the order things
-//! happened. A failure to write is reported once on the console and the game goes on.
+//! Nothing here may disturb the game: the capture thread only hands pictures and lines to the writer threads, and
+//! never waits for the disk or the encoder. No picture is dropped for want of a place in a queue: the queues have no
+//! length, a memory budget ([`Budget`], 2 GB unless told otherwise) bounds the pictures that wait, the recorder warns at
+//! half of it, and only past it are pictures left out, counted, and marked by a `gap` line. JPEG pictures are encoded
+//! and written by two to four threads at once (one keeps up with about 20 a second, and two cameras at 25 a second
+//! give 50), the lines of `events.jsonl` are still appended in the order things happened. A failure to write is
+//! reported once on the console and the game goes on.
 
 use crate::calibration::Calibration;
 use crate::engine::encode_jpeg;
 use crate::fsutil::write_atomic;
 use crate::picture::Picture;
+use crate::stage::{Budget, Stamped, cost_of};
 use crate::tracker::TrackerConfig;
 use crate::video::{self, Push, VideoWriter};
 use anyhow::{Context, Result};
@@ -38,7 +49,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -47,16 +58,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// (`cam` and `feed` on a `frame` line, `calibration2` and `picture2` in `session.json`); a recording of format 1 is
 /// read as one made with one camera. Format 3 added the videos (`video` in `session.json`, the `video`, `video_lost`
 /// and `frame` lines that tell the video and the number of a picture instead of a file); a recording of format 2
-/// is read as before.
-pub const FORMAT: u32 = 3;
+/// is read as before. Format 4 added the recording of every picture (`every_picture` in `session.json`; `seq` and
+/// `captured` on a `frame` line, and the `look`, `backlog` and `gap` lines); a recording of format 3 is read as before.
+pub const FORMAT: u32 = 4;
 
-/// Pictures that may wait for the writer: more than this and the next ones are dropped (a picture is about a
-/// megabyte in memory), so that a slow disk costs pictures, not memory.
-pub const DEFAULT_BACKLOG: usize = 12;
-/// The same when every picture is kept: about a hundred megabytes at most, to ride out a pause of the disk.
-pub const ALL_BACKLOG: usize = 32;
-/// Lines and pictures waiting in all.
-const QUEUE: usize = 512;
+/// The memory that pictures waiting for the encoder or the disk may take, in bytes: 2 GB is about 700 pictures of
+/// 1280x720, 14 seconds of two cameras at 25 pictures a second. Only an encoder or a disk that is much too slow gets there.
+pub const DEFAULT_BUDGET: usize = 2 << 30;
+/// How often the console and the recording are told that the encoder or the disk is behind.
+const WARN_EVERY: Duration = Duration::from_secs(5);
 /// Quality of the saved pictures: the camera's own pictures are already JPEG, so a high quality adds little noise.
 const JPEG_QUALITY: u8 = 92;
 
@@ -66,19 +76,23 @@ pub struct RecordOptions {
     pub dir: PathBuf,
     /// Time between two pictures kept while nothing happens; zero keeps every picture the detection looks at.
     pub every: Duration,
-    /// How many pictures may wait for the disk before the next ones are dropped.
-    pub backlog: usize,
+    /// How much memory the pictures waiting for the disk or the encoder may take, in bytes, before the next ones are
+    /// left out (and marked by a `gap` line): see [`Budget`].
+    pub budget: usize,
     /// The least time between two pictures kept while something is going on (at 25 pictures a second a recording
     /// would be huge, and a few a second tell the story); zero keeps every picture the detection looks at.
     pub busy_every: Duration,
     /// The `ffmpeg` that writes the pictures as video; `None` keeps them as JPEG files (the program looks for one,
     /// see [`crate::video::find_ffmpeg`], and puts it here; tests leave it out).
     pub ffmpeg: Option<PathBuf>,
+    /// Every picture each camera gives is kept the moment it is captured (`--record-all`), not only those the detection
+    /// looks at; see the module documentation. The engine calls [`Recorder::source`] and [`Recorder::look`] for it.
+    pub every_picture: bool,
 }
 
 impl RecordOptions {
     pub fn new(dir: PathBuf, every: Duration) -> RecordOptions {
-        RecordOptions { dir, every, backlog: DEFAULT_BACKLOG, busy_every: Duration::from_millis(150), ffmpeg: None }
+        RecordOptions { dir, every, budget: DEFAULT_BUDGET, busy_every: Duration::from_millis(150), ffmpeg: None, every_picture: false }
     }
 
     /// The same, with the pictures going into video files through this `ffmpeg` (or JPEG files when it is `None`).
@@ -87,11 +101,17 @@ impl RecordOptions {
         self
     }
 
-    /// Every picture the detection looks at is kept, quiet or not (`--record-all`). At 25 pictures a second that is
-    /// several megabytes a second, so more of them may wait for the disk than usual before some are dropped (and
-    /// counted: the program says so when the game ends).
+    /// The same, with this much memory (in bytes) for pictures that wait.
+    pub fn with_budget(mut self, bytes: usize) -> RecordOptions {
+        self.budget = bytes;
+        self
+    }
+
+    /// Every picture each camera gives is kept, the moment it is captured, quiet or not (`--record-all`). At 25
+    /// pictures a second from two cameras that is a lot to write: the pictures that wait for the encoder or the disk take
+    /// memory up to the budget, and are only left out (and counted, and marked by a `gap` line) past it.
     pub fn keeping_all(dir: PathBuf) -> RecordOptions {
-        RecordOptions { dir, every: Duration::ZERO, backlog: ALL_BACKLOG, busy_every: Duration::ZERO, ffmpeg: None }
+        RecordOptions { dir, every: Duration::ZERO, budget: DEFAULT_BUDGET, busy_every: Duration::ZERO, ffmpeg: None, every_picture: true }
     }
 
     /// True when no picture is left out on purpose.
@@ -129,6 +149,12 @@ pub struct SessionMeta {
     /// Absent when they are JPEG files.
     #[serde(default)]
     pub video: Option<VideoMeta>,
+    /// Set when every picture of every camera was kept (`--record-all`, format 4): the pictures are turned but not adjusted
+    /// (brightness and contrast of `picture` and `picture2` are applied again at replay), a `look` line tells which of
+    /// them the tracker was given together, and a `frame` line has `seq` and `captured`. Absent for a recording made
+    /// with `--record`: its pictures are those the detection was given, as it saw them.
+    #[serde(default)]
+    pub every_picture: bool,
 }
 
 /// How the pictures were encoded.
@@ -142,16 +168,73 @@ pub struct VideoMeta {
 
 enum Msg {
     Session(Vec<u8>),
-    Frame { t: f64, camera: usize, feed: u64, image: Arc<RgbImage>, status: &'static str },
+    /// A picture to write as a JPEG file, and the fields that its `frame` line has besides the file and the camera.
+    Frame {
+        t: f64,
+        camera: usize,
+        image: Arc<RgbImage>,
+        extra: Value,
+    },
     Line(String),
+}
+
+/// Pictures of one camera that could not be kept because the budget was full, not yet told in a `gap` line.
+struct Gap {
+    count: u64,
+    first_seq: u64,
+    last_seq: u64,
+    from: f64,
+    to: f64,
+}
+
+/// The numbers of the pictures of one view that `source` has been given, as stretches of consecutive numbers (there is
+/// usually one): a picture may be offered twice, by the thread of its camera and by the look that was given it, and must be
+/// kept once.
+#[derive(Default)]
+struct Seen(Vec<(u64, u64)>);
+
+impl Seen {
+    fn contains(&self, seq: u64) -> bool {
+        self.0.iter().any(|&(first, last)| first <= seq && seq <= last)
+    }
+
+    fn insert(&mut self, seq: u64) {
+        if let Some(last) = self.0.last_mut()
+            && seq == last.1 + 1
+        {
+            last.1 = seq;
+            return;
+        }
+        self.0.push((seq, seq));
+        // Rare: a number out of order. Keep the stretches sorted and joined.
+        self.0.sort_unstable();
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(self.0.len());
+        for &(first, last) in &self.0 {
+            match joined.last_mut() {
+                Some(previous) if first <= previous.1 + 1 => previous.1 = previous.1.max(last),
+                _ => joined.push((first, last)),
+            }
+        }
+        self.0 = joined;
+    }
+}
+
+/// What `source` was given and what it kept, for each view, for the `closed` line.
+#[derive(Default, Clone, Copy)]
+struct SourceCount {
+    offered: u64,
+    kept: u64,
 }
 
 /// One recording in progress. Methods only queue work: they are safe to call with the engine's lock held.
 pub struct Recorder {
-    tx: Option<SyncSender<Msg>>,
+    tx: Option<Sender<Msg>>,
     begun: Instant,
     every: Duration,
-    backlog: usize,
+    /// The memory that pictures waiting for the encoder or the disk may take (see [`Budget`]).
+    budget: Arc<Budget>,
+    /// Every picture is kept as it is captured (see [`RecordOptions::every_picture`]).
+    every_picture: bool,
     last_saved: Option<Instant>,
     /// How many times pictures were given to the tracker (and offered here): the pictures of one such time, from the
     /// two cameras, carry the same number, so that a replay gives them to the tracker together.
@@ -167,6 +250,16 @@ pub struct Recorder {
     summary: Arc<Mutex<Option<Value>>>,
     /// The time of the last line queued, in milliseconds (see `seconds`).
     last_ms: AtomicU64,
+    /// The stretch of pictures of each view that was left out, until the next picture that was kept (or the end).
+    gaps: [Option<Gap>; VIEWS],
+    gap_lines: u64,
+    counts: [SourceCount; VIEWS],
+    seen: [Seen; VIEWS],
+    /// When the console and the recording were last told that the budget is half taken.
+    warned: Option<Instant>,
+    /// What `finalize` leaves for the last line: how many pictures each view gave and kept.
+    source_summary: Arc<Mutex<Option<Value>>>,
+    finalized: bool,
 }
 
 /// The cameras that can have a video: the cameras and the height picture of the depth camera, numbered as the engine
@@ -178,6 +271,8 @@ const VIEWS: usize = 3;
 struct Videos {
     ffmpeg: PathBuf,
     folder: PathBuf,
+    /// The room of the pictures that wait for an encoder: it is given back by the encoder.
+    budget: Arc<Budget>,
     state: Mutex<VideoState>,
 }
 
@@ -231,6 +326,8 @@ impl Recorder {
         let folder = unique_folder(&options.dir, &name)?;
         fs::create_dir_all(folder.join("frames")).with_context(|| format!("cannot create {}", folder.display()))?;
 
+        meta.every_picture = options.every_picture;
+        let budget = Budget::new(options.budget);
         // Video only when the program that writes it is there; otherwise JPEG files, and the session says so.
         let video = match &options.ffmpeg {
             Some(ffmpeg) if video::usable(ffmpeg) => {
@@ -238,6 +335,7 @@ impl Recorder {
                 Some(Arc::new(Videos {
                     ffmpeg: ffmpeg.clone(),
                     folder: folder.clone(),
+                    budget: Arc::clone(&budget),
                     state: Mutex::new(VideoState { streams: [None, None, None], jpeg: [false; VIEWS], finished: false }),
                 }))
             }
@@ -252,23 +350,31 @@ impl Recorder {
             }
         };
 
-        let (tx, rx) = sync_channel(QUEUE + options.backlog);
+        // No length: the lines are small, and the pictures that wait are bounded by the budget, not by a count.
+        let (tx, rx) = channel();
         let queued = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let writer_folder = folder.clone();
-        let (writer_queued, writer_dropped) = (Arc::clone(&queued), Arc::clone(&dropped));
-        let writer_video = video.clone();
         let summary = Arc::new(Mutex::new(None));
-        let writer_summary = Arc::clone(&summary);
+        let source_summary = Arc::new(Mutex::new(None));
+        let shared = WriterShared {
+            queued: Arc::clone(&queued),
+            dropped: Arc::clone(&dropped),
+            videos: video.clone(),
+            summary: Arc::clone(&summary),
+            source_summary: Arc::clone(&source_summary),
+            budget: Arc::clone(&budget),
+        };
         let thread = thread::Builder::new()
             .name("record".into())
-            .spawn(move || writer(writer_folder, rx, now, writer_queued, writer_dropped, writer_video, writer_summary))
+            .spawn(move || writer(writer_folder, rx, now, shared))
             .context("cannot start the recording thread")?;
         let recorder = Recorder {
             tx: Some(tx),
             begun: now,
             every: options.every,
-            backlog: options.backlog,
+            budget,
+            every_picture: options.every_picture,
             last_saved: None,
             feeds: 0,
             queued,
@@ -278,6 +384,13 @@ impl Recorder {
             video,
             summary,
             last_ms: AtomicU64::new(0),
+            gaps: [None, None, None],
+            gap_lines: 0,
+            counts: [SourceCount::default(); VIEWS],
+            seen: [Seen::default(), Seen::default(), Seen::default()],
+            warned: None,
+            source_summary,
+            finalized: false,
         };
         // Written by the writer, so that no file is written under the engine's lock.
         let bytes = serde_json::to_vec_pretty(&meta)?;
@@ -299,14 +412,134 @@ impl Recorder {
         *self.summary.lock().unwrap_or_else(PoisonError::into_inner) = Some(summary);
     }
 
+    /// Queues a message for the writer; it never waits. False when the writer is gone (counted as a drop).
     fn send(&self, msg: Msg) -> bool {
         let Some(tx) = &self.tx else { return false };
-        match tx.try_send(msg) {
+        match tx.send(msg) {
             Ok(()) => true,
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+            Err(_) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
+        }
+    }
+
+    /// True when every picture each camera gives is kept as it is captured (see [`RecordOptions::every_picture`]): the
+    /// engine then calls [`source`](Self::source) for each picture and [`look`](Self::look) for each look of the
+    /// tracker, instead of [`frames`](Self::frames).
+    pub fn records_every_picture(&self) -> bool {
+        self.every_picture
+    }
+
+    /// How much memory the pictures waiting for the disk or the encoder take now, and the most they ever took.
+    pub fn waiting_bytes(&self) -> (usize, usize) {
+        (self.budget.used(), self.budget.peak())
+    }
+
+    /// Keeps a picture as it was captured (`--record-all`): in the video of its camera, or in a JPEG file. Nothing
+    /// waits for the encoder or the disk: the picture waits in memory, up to the budget. Past it the picture is left
+    /// out, counted, and told in a `gap` line. A recording made with `--record` ignores it.
+    pub fn source(&mut self, picture: &Stamped) {
+        if !self.every_picture || picture.view >= VIEWS {
+            return;
+        }
+        let view = picture.view;
+        // A picture is kept once, whoever offers it first: the tracker is given the latest picture of each camera, which
+        // may be one that came before the recording began or that another thread has not got to yet.
+        if self.seen[view].contains(picture.seq) {
+            return;
+        }
+        self.seen[view].insert(picture.seq);
+        self.counts[view].offered += 1;
+        let t = self.seconds(picture.captured);
+        let bytes = cost_of(&picture.image);
+        if !self.budget.reserve(bytes) {
+            self.lose(view, picture.seq, t);
+            return;
+        }
+        self.counts[view].kept += 1;
+        self.close_gap(view);
+        self.warn_if_behind(t, picture.captured);
+        let captured = (picture.captured.saturating_duration_since(self.begun).as_secs_f64() * 1e6).round() / 1e6;
+        let extra = json!({"seq": picture.seq, "captured": captured});
+        self.place(t, view, &picture.image, extra);
+    }
+
+    /// True when this picture was already offered to [`source`](Self::source) (kept, or left out and told in a `gap`): the
+    /// engine does not build a copy of a picture that is already there.
+    pub fn has_picture(&self, view: usize, seq: u64) -> bool {
+        view < VIEWS && self.seen[view].contains(seq)
+    }
+
+    /// Notes which pictures the tracker was given together this time (`--record-all`: the pictures themselves were
+    /// kept by [`source`](Self::source) as they came), with the status it was in afterwards. Call it before the events
+    /// that the look led to.
+    pub fn look(&mut self, at: Instant, pictures: &[(usize, u64)], status: &'static str) {
+        if !self.every_picture {
+            return;
+        }
+        self.feeds += 1;
+        let list: Vec<Value> = pictures.iter().map(|(cam, seq)| json!({"cam": cam, "seq": seq})).collect();
+        let line = json!({"t": self.seconds(at), "type": "look", "feed": self.feeds, "status": status, "pictures": list});
+        self.send(Msg::Line(line.to_string()));
+    }
+
+    /// A picture that could not be kept because the budget was full: it joins the stretch of pictures left out.
+    fn lose(&mut self, view: usize, seq: u64, t: f64) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        match &mut self.gaps[view] {
+            Some(gap) => {
+                gap.count += 1;
+                gap.last_seq = seq;
+                gap.to = t;
+            }
+            None => self.gaps[view] = Some(Gap { count: 1, first_seq: seq, last_seq: seq, from: t, to: t }),
+        }
+    }
+
+    /// Tells the stretch of pictures of this view that was left out, if there is one: the recording says where it is not
+    /// complete. It comes before the next picture that was kept.
+    fn close_gap(&mut self, view: usize) {
+        let Some(gap) = self.gaps[view].take() else { return };
+        self.gap_lines += 1;
+        self.send(Msg::Line(
+            json!({"t": gap.to, "type": "gap", "cam": view, "count": gap.count, "first_seq": gap.first_seq, "last_seq": gap.last_seq,
+                   "from": gap.from, "to": gap.to})
+            .to_string(),
+        ));
+    }
+
+    /// Tells the stretches that are still open: at the end of the recording, before its last lines.
+    pub fn flush_gaps(&mut self) {
+        for view in 0..VIEWS {
+            self.close_gap(view);
+        }
+    }
+
+    /// When half of the budget is taken the encoder or the disk is behind: the console says so, and so does the
+    /// recording, every few seconds while it lasts.
+    fn warn_if_behind(&mut self, t: f64, at: Instant) {
+        if !self.budget.half_taken() || self.warned.is_some_and(|last| at.saturating_duration_since(last) < WARN_EVERY) {
+            return;
+        }
+        self.warned = Some(at);
+        let (used, cap) = (self.budget.used() >> 20, self.budget.cap() >> 20);
+        eprintln!(
+            "record: the disk or the encoder is behind: {used} MB of pictures wait, the limit is {cap} MB; past it pictures are left out (the recording will say where)"
+        );
+        self.send(Msg::Line(json!({"t": t, "type": "backlog", "waiting_mb": used, "limit_mb": cap}).to_string()));
+    }
+
+    /// Gives a picture whose room in the budget is taken to the video of its camera or to a JPEG file; `extra` holds the
+    /// fields of its `frame` line besides the place and the camera.
+    fn place(&self, t: f64, camera: usize, image: &Arc<RgbImage>, extra: Value) {
+        if self.keep_in_video(t, camera, image, &extra) {
+            return;
+        }
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        if !self.send(Msg::Frame { t, camera, image: Arc::clone(image), extra }) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            self.budget.release(cost_of(image));
         }
     }
 
@@ -330,28 +563,25 @@ impl Recorder {
         }
         let t = self.seconds(at);
         for (camera, image) in images {
-            if self.keep_in_video(t, *camera, image, status) {
-                self.last_saved = Some(at);
+            let view = (*camera).min(VIEWS - 1);
+            // Too much waiting (the budget is full): the pictures that would be kept are lost, told in a `gap` line,
+            // never the lines, which are small.
+            if !self.budget.reserve(cost_of(image)) {
+                self.lose(view, 0, t);
                 continue;
             }
-            // Too many waiting: the pictures that would be kept are lost, never the lines, which are small.
-            if self.queued.load(Ordering::SeqCst) >= self.backlog {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            self.queued.fetch_add(1, Ordering::SeqCst);
-            if self.send(Msg::Frame { t, camera: *camera, feed: self.feeds, image: Arc::clone(image), status }) {
-                self.last_saved = Some(at);
-            } else {
-                self.queued.fetch_sub(1, Ordering::SeqCst);
-            }
+            self.close_gap(view);
+            self.warn_if_behind(t, at);
+            self.last_saved = Some(at);
+            let extra = json!({"status": status, "feed": self.feeds});
+            self.place(t, *camera, image, extra);
         }
     }
 
     /// Hands a picture to the video of its camera, which is started at the first picture. Returns false when the picture
     /// must go in a JPEG file instead (there is no video, or the encoder failed, or the picture is of another size
-    /// than the video); true when it was taken, or lost because the encoder was too slow (and counted).
-    fn keep_in_video(&self, t: f64, camera: usize, image: &Arc<RgbImage>, status: &'static str) -> bool {
+    /// than the video); true when it was taken. Its room in the budget was taken by the caller, and goes back with it.
+    fn keep_in_video(&self, t: f64, camera: usize, image: &Arc<RgbImage>, extra: &Value) -> bool {
         let Some(videos) = &self.video else { return false };
         if camera >= VIEWS {
             return false;
@@ -370,7 +600,7 @@ impl Recorder {
                 image.width(),
                 image.height(),
                 crf,
-                self.backlog.max(video::MIN_QUEUE),
+                Arc::clone(&videos.budget),
             );
             match started {
                 Ok(writer) => {
@@ -391,14 +621,7 @@ impl Recorder {
         let Some(stream) = state.streams[camera].as_mut() else { return false };
         match stream.push(image) {
             Push::Queued(index) => {
-                self.send(Msg::Line(
-                    json!({"t": t, "type": "frame", "video": name, "index": index, "status": status, "cam": camera, "feed": self.feeds})
-                        .to_string(),
-                ));
-                true
-            }
-            Push::Full => {
-                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.send(Msg::Line(frame_line(t, camera, json!({"video": name, "index": index}), extra)));
                 true
             }
             Push::Unusable => match stream.failure() {
@@ -442,10 +665,35 @@ impl Recorder {
 
     /// Ends the recording and waits until everything is written (the engine does not wait: it drops the recorder).
     pub fn close(mut self) {
+        self.finalize();
         self.tx.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    /// What is told once, before the last lines: the stretches of pictures that were left out, and (with every picture
+    /// kept) how many pictures each view gave and how many were kept. Safe to call more than once.
+    fn finalize(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        self.flush_gaps();
+        if self.every_picture {
+            let offered: Vec<u64> = self.counts.iter().map(|c| c.offered).collect();
+            let kept: Vec<u64> = self.counts.iter().map(|c| c.kept).collect();
+            let summary = json!({"offered": offered, "kept": kept, "gap_lines": self.gap_lines, "peak_mb": self.budget.peak() >> 20});
+            *self.source_summary.lock().unwrap_or_else(PoisonError::into_inner) = Some(summary);
+        }
+    }
+}
+
+impl Drop for Recorder {
+    /// The engine drops the recorder at the end of a game, and the writer ends when it is gone: what is still to be told goes
+    /// first.
+    fn drop(&mut self) {
+        self.finalize();
     }
 }
 
@@ -465,6 +713,34 @@ struct Inbox {
     pictures: u64,
 }
 
+/// What the writer thread shares with the recorder.
+struct WriterShared {
+    /// Pictures handed over and not yet written (JPEG files).
+    queued: Arc<AtomicUsize>,
+    dropped: Arc<AtomicU64>,
+    videos: Option<Arc<Videos>>,
+    /// How the pictures got to the tracker, and what the recorder was given and kept: for the last line.
+    summary: Arc<Mutex<Option<Value>>>,
+    source_summary: Arc<Mutex<Option<Value>>>,
+    /// The room of the pictures that wait: a picture written to a file gives its room back.
+    budget: Arc<Budget>,
+}
+
+/// The line of a picture: where it is (`place`: a file, or a video and the number in it) and the fields that the way it
+/// was kept adds (`extra`).
+fn frame_line(t: f64, camera: usize, place: Value, extra: &Value) -> String {
+    let mut line = Map::new();
+    line.insert("t".into(), json!(t));
+    line.insert("type".into(), json!("frame"));
+    line.insert("cam".into(), json!(camera));
+    for part in [&place, extra] {
+        if let Value::Object(fields) = part {
+            line.extend(fields.clone());
+        }
+    }
+    Value::Object(line).to_string()
+}
+
 /// The events file, and whose turn it is to append to it.
 struct Events {
     /// The ticket that appends next.
@@ -477,15 +753,8 @@ struct Events {
 /// Several threads encode and write the pictures at the same time, which is the slow part, but a line is appended to
 /// `events.jsonl` only when every message before it has been: the file reads in the order things happened, and a
 /// `frame` line is only there once its picture is on the disk.
-fn writer(
-    folder: PathBuf,
-    rx: Receiver<Msg>,
-    begun: Instant,
-    queued: Arc<AtomicUsize>,
-    dropped: Arc<AtomicU64>,
-    videos: Option<Arc<Videos>>,
-    summary: Arc<Mutex<Option<Value>>>,
-) {
+fn writer(folder: PathBuf, rx: Receiver<Msg>, begun: Instant, shared: WriterShared) {
+    let WriterShared { queued, dropped, videos, summary, source_summary, budget } = shared;
     let file = match OpenOptions::new().create(true).append(true).open(folder.join("events.jsonl")) {
         Ok(file) => Some(file),
         Err(e) => {
@@ -539,13 +808,13 @@ fn writer(
                     }
                     None
                 }
-                Msg::Frame { t, camera, feed, image, status } => {
+                Msg::Frame { t, camera, image, extra } => {
                     let name = format!("frames/{number:06}.jpg");
+                    // Written or not (or the thread panics), the picture no longer waits afterwards.
+                    let _room = budget.giving_back(cost_of(&image));
                     let saved = encode_jpeg(&image, JPEG_QUALITY).and_then(|bytes| write_atomic(&folder.join(&name), &bytes));
                     match saved {
-                        Ok(()) => {
-                            Some(json!({"t": t, "type": "frame", "file": name, "status": status, "cam": camera, "feed": feed}).to_string())
-                        }
+                        Ok(()) => Some(frame_line(t, camera, json!({"file": name}), &extra)),
                         Err(e) => {
                             report(format!("{e:#}"));
                             None
@@ -597,6 +866,9 @@ fn writer(
     }
     if let Some(pipeline) = summary.lock().unwrap_or_else(PoisonError::into_inner).take() {
         closed["pipeline"] = pipeline;
+    }
+    if let Some(source) = source_summary.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        closed["source"] = source;
     }
     append(&mut events, &closed.to_string());
 }
@@ -753,6 +1025,7 @@ mod tests {
             calibration2: None,
             picture2: None,
             video: None,
+            every_picture: false,
         }
     }
 
@@ -825,7 +1098,7 @@ mod tests {
         let dir = temp_dir("all");
         let options = RecordOptions::keeping_all(dir.clone());
         assert!(options.keeps_all() && !RecordOptions::new(dir.clone(), Duration::ZERO).keeps_all());
-        assert!(options.backlog > DEFAULT_BACKLOG);
+        assert!(options.every_picture && !RecordOptions::new(dir.clone(), Duration::ZERO).every_picture);
         let begun = Instant::now();
         let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
         let image = Arc::new(RgbImage::from_pixel(16, 12, image::Rgb([10, 20, 30])));
@@ -845,7 +1118,7 @@ mod tests {
     #[test]
     fn pictures_written_by_several_threads_still_read_in_the_order_they_were_given() {
         let dir = temp_dir("order");
-        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) };
+        let options = RecordOptions::keeping_all(dir.clone());
         assert!(writer_threads() >= 2);
         let begun = Instant::now();
         let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
@@ -904,7 +1177,7 @@ mod tests {
         use crate::video::{PictureRef, Pictures};
         let dir = temp_dir("video");
         let ffmpeg = crate::video::tests::fake_ffmpeg();
-        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) }.with_ffmpeg(Some(ffmpeg.clone()));
+        let options = RecordOptions::keeping_all(dir.clone()).with_ffmpeg(Some(ffmpeg.clone()));
         let begun = Instant::now();
         let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
         let camera = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([200, 100, 50])));
@@ -972,8 +1245,7 @@ mod tests {
     fn a_video_that_dies_leaves_the_rest_of_the_pictures_in_files_and_the_recording_says_so() {
         // The stand-in ends at once when the path of its output has `fakedie` in it.
         let dir = temp_dir("fakedie");
-        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) }
-            .with_ffmpeg(Some(crate::video::tests::fake_ffmpeg()));
+        let options = RecordOptions::keeping_all(dir.clone()).with_ffmpeg(Some(crate::video::tests::fake_ffmpeg()));
         let begun = Instant::now();
         let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
         let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([9, 9, 9])));
@@ -1015,8 +1287,7 @@ mod tests {
     fn a_picture_that_a_video_cannot_hold_goes_into_a_file() {
         // A video needs even sizes: 15x9 is kept as a JPEG file, and no video is started for it.
         let dir = temp_dir("odd");
-        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) }
-            .with_ffmpeg(Some(crate::video::tests::fake_ffmpeg()));
+        let options = RecordOptions::keeping_all(dir.clone()).with_ffmpeg(Some(crate::video::tests::fake_ffmpeg()));
         let begun = Instant::now();
         let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
         let odd = Arc::new(RgbImage::from_pixel(15, 9, image::Rgb([1, 2, 3])));
@@ -1044,6 +1315,184 @@ mod tests {
         let session: SessionMeta = serde_json::from_slice(&fs::read(folder.join("session.json")).unwrap()).unwrap();
         assert!(session.video.is_none());
         assert!(folder.join("frames/000001.jpg").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn stamped(view: usize, seq: u64, at: Instant, image: &Arc<RgbImage>) -> Stamped {
+        Stamped { view, seq, captured: at, image: Arc::clone(image) }
+    }
+
+    #[test]
+    fn every_picture_is_kept_as_it_is_captured_and_the_looks_say_which_the_tracker_was_given() {
+        let dir = temp_dir("every");
+        let ffmpeg = crate::video::tests::fake_ffmpeg();
+        let options = RecordOptions::keeping_all(dir.clone()).with_ffmpeg(Some(ffmpeg.clone()));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        assert!(recorder.records_every_picture());
+        let a = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([200, 100, 50])));
+        let b = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([50, 100, 200])));
+        let depth = Arc::new(RgbImage::from_pixel(16, 12, image::Rgb([7, 7, 7])));
+        // Camera 0 every 40 ms, camera 1 in between, the depth now and then; the tracker looks at every other picture.
+        for n in 1..=10u64 {
+            let at = begun + Duration::from_millis(40 * n);
+            recorder.source(&stamped(0, n, at, &a));
+            recorder.source(&stamped(1, n, at + Duration::from_millis(15), &b));
+            if n % 3 == 0 {
+                recorder.source(&stamped(2, n / 3, at + Duration::from_millis(20), &depth));
+            }
+            if n % 2 == 0 {
+                recorder.look(at + Duration::from_millis(20), &[(0, n), (1, n)], "watching");
+            }
+        }
+        recorder.flush_gaps();
+        let folder = recorder.folder().to_path_buf();
+        assert_eq!(recorder.dropped(), 0);
+        recorder.close();
+
+        let lines = read_lines(&folder);
+        let frames: Vec<&Value> = lines.iter().filter(|l| l["type"] == "frame").collect();
+        assert_eq!(frames.len(), 10 + 10 + 3, "every picture of every camera is there");
+        for cam in 0..2u64 {
+            let seqs: Vec<u64> = frames.iter().filter(|l| l["cam"] == cam).map(|l| l["seq"].as_u64().unwrap()).collect();
+            assert_eq!(seqs, (1..=10).collect::<Vec<_>>(), "numbers with no hole, camera {cam}");
+        }
+        assert!(frames.iter().all(|l| l["captured"].as_f64().is_some() && l["video"].is_string() && l.get("feed").is_none()));
+        let looks: Vec<&Value> = lines.iter().filter(|l| l["type"] == "look").collect();
+        assert_eq!(looks.len(), 5);
+        assert_eq!(looks[1]["pictures"], json!([{"cam": 0, "seq": 4}, {"cam": 1, "seq": 4}]));
+        assert_eq!(looks[1]["status"], "watching");
+        let closed = lines.last().unwrap();
+        assert_eq!(closed["dropped"], 0);
+        assert_eq!(closed["source"]["offered"], json!([10, 10, 3]));
+        assert_eq!(closed["source"]["kept"], json!([10, 10, 3]));
+        assert_eq!(closed["source"]["gap_lines"], 0);
+        assert!(lines.iter().all(|l| l["type"] != "gap" && l["type"] != "backlog"));
+        let session: SessionMeta = serde_json::from_slice(&fs::read(folder.join("session.json")).unwrap()).unwrap();
+        assert!(session.every_picture && session.format == FORMAT);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pictures_that_do_not_fit_the_budget_are_left_out_counted_and_told_in_gap_lines() {
+        let dir = temp_dir("budget");
+        let picture = Arc::new(RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x * 7 + y * 3) as u8, (x ^ y) as u8, (x * y) as u8])));
+        // Room for three pictures: the writers cannot keep up with a loop that offers them as fast as it runs.
+        let options = RecordOptions::keeping_all(dir.clone()).with_budget(3 * cost_of(&picture));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        let offered = 60u64;
+        for n in 1..=offered {
+            recorder.source(&stamped(0, n, begun + Duration::from_millis(40 * n), &picture));
+        }
+        let dropped = recorder.dropped();
+        assert!(dropped > 0, "nothing could be kept at that pace with room for three");
+        recorder.wait_idle();
+        // Once the writers are done there is room again: the next picture is kept, which closes the stretch before it.
+        let last = offered + 1;
+        recorder.source(&stamped(0, last, begun + Duration::from_millis(40 * last), &picture));
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+
+        let lines = read_lines(&folder);
+        let kept: Vec<u64> = lines.iter().filter(|l| l["type"] == "frame").map(|l| l["seq"].as_u64().unwrap()).collect();
+        let gaps: Vec<&Value> = lines.iter().filter(|l| l["type"] == "gap").collect();
+        assert!(!gaps.is_empty());
+        // Every number is either a picture that was kept or in a gap: nothing disappears without a word.
+        let mut told: Vec<u64> = kept.clone();
+        for gap in &gaps {
+            assert_eq!(gap["cam"], 0);
+            let (first, count) = (gap["first_seq"].as_u64().unwrap(), gap["count"].as_u64().unwrap());
+            assert!(gap["from"].as_f64().unwrap() <= gap["to"].as_f64().unwrap());
+            told.extend(first..first + count);
+        }
+        told.sort_unstable();
+        assert_eq!(told, (1..=last).collect::<Vec<_>>(), "kept {kept:?}, gaps {gaps:?}");
+        let closed = lines.last().unwrap();
+        assert_eq!(closed["dropped"], gaps.iter().map(|g| g["count"].as_u64().unwrap()).sum::<u64>());
+        assert_eq!(closed["source"]["offered"][0], last);
+        assert_eq!(closed["source"]["kept"][0].as_u64().unwrap() + closed["dropped"].as_u64().unwrap(), last);
+        assert!(closed["source"]["gap_lines"].as_u64().unwrap() >= 1);
+        // Half of the budget was taken on the way: the recording said so.
+        assert!(lines.iter().any(|l| l["type"] == "backlog" && l["limit_mb"].is_u64()), "{lines:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stretch_left_out_at_the_very_end_is_told_before_the_last_line() {
+        let dir = temp_dir("budget-end");
+        let picture = Arc::new(RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x * 5 + y) as u8, (x ^ y) as u8, (x + y) as u8])));
+        let options = RecordOptions::keeping_all(dir.clone()).with_budget(cost_of(&picture));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        for n in 1..=30u64 {
+            recorder.source(&stamped(0, n, begun + Duration::from_millis(40 * n), &picture));
+        }
+        let folder = recorder.folder().to_path_buf();
+        // No explicit flush: the engine drops the recorder at the end of a game.
+        drop(recorder);
+        wait_for_closed(&folder);
+        let lines = read_lines(&folder);
+        assert_eq!(lines.last().unwrap()["type"], "closed");
+        let kept = lines.iter().filter(|l| l["type"] == "frame").count() as u64;
+        let gap_total: u64 = lines.iter().filter(|l| l["type"] == "gap").map(|l| l["count"].as_u64().unwrap()).sum();
+        assert_eq!(kept + gap_total, 30, "{lines:?}");
+        assert!(gap_total > 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn wait_for_closed(folder: &Path) {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(30) {
+            if fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|t| t.contains("\"type\":\"closed\"")) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the recording was not closed");
+    }
+
+    #[test]
+    fn a_picture_offered_twice_is_kept_once() {
+        let mut seen = Seen::default();
+        for seq in [5, 6, 7, 9, 8, 3] {
+            seen.insert(seq);
+        }
+        assert_eq!(seen.0, vec![(3, 3), (5, 9)], "stretches of consecutive numbers, joined when a number fills a hole");
+        assert!(seen.contains(7) && seen.contains(3) && !seen.contains(4) && !seen.contains(10));
+
+        let dir = temp_dir("twice-offered");
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&RecordOptions::keeping_all(dir.clone()), meta(), begun).unwrap();
+        let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([1, 2, 3])));
+        assert!(!recorder.has_picture(0, 1));
+        // The thread of the camera, then a look that was given the same picture, then the next picture.
+        recorder.source(&stamped(0, 1, begun, &image));
+        assert!(recorder.has_picture(0, 1));
+        recorder.source(&stamped(0, 1, begun, &image));
+        recorder.source(&stamped(0, 2, begun + Duration::from_millis(40), &image));
+        recorder.wait_idle();
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let lines = read_lines(&folder);
+        let seqs: Vec<u64> = lines.iter().filter(|l| l["type"] == "frame").map(|l| l["seq"].as_u64().unwrap()).collect();
+        assert_eq!(seqs, [1, 2]);
+        assert_eq!(lines.last().unwrap()["source"]["offered"][0], 2);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_recording_made_with_record_ignores_source_and_look() {
+        let dir = temp_dir("sampled-ignores");
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&RecordOptions::new(dir.clone(), Duration::ZERO), meta(), begun).unwrap();
+        let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([1, 2, 3])));
+        recorder.source(&stamped(0, 1, begun, &image));
+        recorder.look(begun, &[(0, 1)], "watching");
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let lines = read_lines(&folder);
+        assert_eq!(lines.len(), 1, "only the closing line: {lines:?}");
         fs::remove_dir_all(&dir).ok();
     }
 

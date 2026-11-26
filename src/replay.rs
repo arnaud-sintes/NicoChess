@@ -18,7 +18,7 @@ use crate::video::{PictureRef, Pictures};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use shakmaty::Move;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -194,8 +194,24 @@ fn sans_of(before: &shakmaty::Chess, moves: &[Move]) -> String {
     out.join(" ")
 }
 
-/// Replays one recording (a folder with `session.json`).
+/// What a replay feeds the tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Feed {
+    /// As it was: the pictures that the tracker was given together, at the times it was given them (the default).
+    #[default]
+    AsLive,
+    /// Every picture that was recorded, one after the other in the order they were captured, each at the moment it was
+    /// captured (`--replay-all`; a recording that kept only some of the pictures, made with `--record`, replays as it was).
+    EveryPicture,
+}
+
+/// Replays one recording (a folder with `session.json`), as the tracker saw it live.
 pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool) -> Result<Report> {
+    replay_folder_with(folder, overrides, verbose, Feed::AsLive)
+}
+
+/// Replays one recording, feeding the tracker as `feed` says.
+pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: bool, feed: Feed) -> Result<Report> {
     let session_path = folder.join("session.json");
     let meta: SessionMeta =
         serde_json::from_slice(&std::fs::read(&session_path).with_context(|| format!("cannot read {}", session_path.display()))?)
@@ -213,7 +229,35 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     // A recording in video needs ffmpeg: say so before anything else.
     pictures.require_ffmpeg_for_videos()?;
     let mut unreadable = 0usize;
+    // A recording of every picture: the pictures are told one by one by `frame` lines with a number (`seq`), and the `look`
+    // lines name the ones that the tracker was given together. They are found before anything is replayed, since a look can
+    // come before the line of a picture that another thread was still handing over (the depth view).
+    let every_picture = meta.every_picture;
+    let mut kept: HashMap<(usize, u64), PictureRef> = HashMap::new();
+    let mut events = events;
+    if every_picture {
+        let mut rest = Vec::with_capacity(events.len());
+        for mut event in events {
+            if event.kind == "frame"
+                && let (Some(cam), Some(seq), Some(picture)) =
+                    (event.data["cam"].as_u64(), event.data["seq"].as_u64(), PictureRef::of_event(&event.data))
+            {
+                kept.insert((cam as usize, seq), picture);
+                if feed == Feed::EveryPicture {
+                    event.kind = "source".to_string();
+                    rest.push(event);
+                }
+                continue;
+            }
+            rest.push(event);
+        }
+        events = rest;
+    }
     let events = group_pictures(events);
+    // Brightness and contrast are applied to the pictures of a recording of every picture, as the engine did live.
+    let adjusting = [Some(meta.picture), meta.picture2, None];
+    let mut missing = 0usize;
+    let mut last_fed = 0.0f64;
 
     // Every position the game was in, according to the recording.
     let mut real: HashSet<String> = HashSet::new();
@@ -253,6 +297,18 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
         config.max_plies,
         if overrides.describe().is_empty() { " (as recorded)".to_string() } else { format!("  (changed: {})", overrides.describe()) }
     );
+    if every_picture {
+        let _ = writeln!(
+            text,
+            "  every picture of every camera was recorded ({} of them); replayed as {}",
+            kept.len(),
+            if feed == Feed::EveryPicture {
+                "every picture, one after the other, at the moment it was captured"
+            } else {
+                "the tracker saw them live: the pictures it was given together, at the times it was given them"
+            }
+        );
+    }
     let _ = writeln!(text);
 
     let mut summary = Summary::default();
@@ -261,7 +317,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     let mut last_file = String::new();
     let mut last_status = String::new();
     for event in &events {
-        let now = base + Duration::from_secs_f64(event.t.max(0.0));
+        let mut now = base + Duration::from_secs_f64(event.t.max(0.0));
         match event.kind.as_str() {
             "views" => {
                 // Which cameras gave pictures from now on (see the engine).
@@ -271,12 +327,43 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                     }
                 }
             }
-            "frame" => {
+            // A look of the tracker, in a recording of every picture: the pictures it was given together. With
+            // `--replay-all` the looks are not followed: every picture is fed as it was captured.
+            "look" if feed == Feed::EveryPicture => {}
+            "frame" | "look" | "source" => {
                 // The pictures that were given to the tracker together: one per camera.
-                let files: Vec<(usize, PictureRef)> = event.data["files"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|f| Some((f["cam"].as_u64()? as usize, PictureRef::of_event(f)?))).collect())
-                    .unwrap_or_default();
+                let files: Vec<(usize, PictureRef)> = match event.kind.as_str() {
+                    "look" => {
+                        let named: Vec<(usize, u64)> = event.data["pictures"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|p| Some((p["cam"].as_u64()? as usize, p["seq"].as_u64()?))).collect())
+                            .unwrap_or_default();
+                        let mut files = Vec::new();
+                        for key in named {
+                            match kept.get(&key) {
+                                Some(picture) => files.push((key.0, picture.clone())),
+                                // Left out of the recording (the budget was full), or the depth picture had no flat surface
+                                // to be made from: the tracker was given it live, the replay cannot give it.
+                                None => missing += 1,
+                            }
+                        }
+                        files
+                    }
+                    "source" => {
+                        // One picture, at the moment it was captured, never before the one fed last.
+                        let captured = event.data["captured"].as_f64().unwrap_or(event.t);
+                        last_fed = last_fed.max(captured);
+                        now = base + Duration::from_secs_f64(last_fed.max(0.0));
+                        match (event.data["cam"].as_u64(), PictureRef::of_event(&event.data)) {
+                            (Some(cam), Some(picture)) => vec![(cam as usize, picture)],
+                            _ => Vec::new(),
+                        }
+                    }
+                    _ => event.data["files"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|f| Some((f["cam"].as_u64()? as usize, PictureRef::of_event(f)?))).collect())
+                        .unwrap_or_default(),
+                };
                 // The two cameras, and the height picture of a depth camera after them.
                 let mut images: Vec<Option<image::RgbImage>> = vec![None; 3];
                 for (camera, picture) in &files {
@@ -298,6 +385,12 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                         Err(e) => return Err(e),
                     };
                     if let Some(place) = images.get_mut(*camera) {
+                        // The pictures of a recording of every picture are as the camera gave them, turned: the tracker
+                        // was given them with brightness and contrast applied, and so it is now.
+                        let image = match adjusting.get(*camera).copied().flatten() {
+                            Some(settings) if every_picture => settings.adjust(&image).unwrap_or(image),
+                            _ => image,
+                        };
                         *place = Some(image);
                     }
                 }
@@ -423,6 +516,13 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
             "end" => {
                 let _ = writeln!(text, "{:>8.1}s  game over: {} {}", event.t, event.text("result"), event.text("reason"));
             }
+            "gap" => {
+                let _ = writeln!(
+                    text,
+                    "{:>8.1}s  the recording is not complete here: {} pictures of camera {} were left out (numbers {} to {}; the disk or the encoder fell behind past the memory limit)",
+                    event.t, event.data["count"], event.data["cam"], event.data["first_seq"], event.data["last_seq"]
+                );
+            }
             "closed" => {
                 let dropped = event.data["dropped"].as_u64().unwrap_or(0);
                 if dropped > 0 {
@@ -440,6 +540,12 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     let _ = writeln!(text);
     if unreadable > 0 {
         let _ = writeln!(text, "{unreadable} pictures of the videos could not be read and were left out.");
+    }
+    if missing > 0 {
+        let _ = writeln!(
+            text,
+            "{missing} pictures that the tracker was given live are not in the recording (left out by a full budget, or a depth picture with no flat surface in it)."
+        );
     }
     let _ = writeln!(text, "{} pictures replayed; the replay ends in {}.", summary.pictures, fen_of(tracker.position()));
     let _ = writeln!(
@@ -492,11 +598,11 @@ fn checkpoint(tracker: &mut Tracker, fen: &str) -> Result<bool> {
 }
 
 /// Replays a recording folder, or every recording in a folder that holds some. Prints the reports.
-pub fn run(path: &Path, overrides: &TrackerOverrides, verbose: bool) -> Result<()> {
+pub fn run(path: &Path, overrides: &TrackerOverrides, verbose: bool, feed: Feed) -> Result<()> {
     let folders = recordings_in(path)?;
     let mut total = Summary::default();
     for folder in &folders {
-        let report = replay_folder(folder, overrides, verbose)?;
+        let report = replay_folder_with(folder, overrides, verbose, feed)?;
         print!("{}", report.text);
         println!();
         total.pictures += report.summary.pictures;
@@ -565,6 +671,8 @@ mod tests {
         recorder: Recorder,
         begun: Instant,
         n: u32,
+        /// The number of the last picture given to `source`.
+        seq: u64,
     }
 
     impl Session {
@@ -590,11 +698,53 @@ mod tests {
                 calibration2: None,
                 picture2: None,
                 video: None,
+                every_picture: false,
             };
             let begun = Instant::now();
-            // A test camera is faster than any disk: nothing may be dropped.
-            let options = RecordOptions { backlog: 100_000, ffmpeg, ..RecordOptions::new(dir.to_path_buf(), Duration::ZERO) };
-            Session { recorder: Recorder::begin(&options, meta, begun).unwrap(), begun, n: 0 }
+            // A test camera is faster than any disk: nothing may be dropped (the budget is far from being reached).
+            let options = RecordOptions { ffmpeg, ..RecordOptions::new(dir.to_path_buf(), Duration::ZERO) };
+            Session { recorder: Recorder::begin(&options, meta, begun).unwrap(), begun, n: 0, seq: 0 }
+        }
+
+        /// A recording of every picture: the pictures are given to `source` as they come, and the tracker looks at
+        /// one of every `look_every` of them (`show_captured`).
+        fn every_picture(dir: &Path, picture: Picture) -> Session {
+            let meta = SessionMeta {
+                format: FORMAT,
+                program: "test".into(),
+                started_utc: String::new(),
+                started_local: None,
+                source: "synthetic".into(),
+                game_id: "test".into(),
+                start_fen: fen_of(&Chess::default()),
+                resumed_at: 0.0,
+                record_every: 0.0,
+                tracker: TrackerConfig::default(),
+                calibration: Some(synthetic::corners()),
+                picture,
+                calibration2: None,
+                picture2: None,
+                video: None,
+                every_picture: true,
+            };
+            let begun = Instant::now();
+            let options = RecordOptions::keeping_all(dir.to_path_buf());
+            Session { recorder: Recorder::begin(&options, meta, begun).unwrap(), begun, n: 0, seq: 0 }
+        }
+
+        /// `times` pictures of the board as it is, every one kept as captured; the tracker looks at every `look_every`-th.
+        fn show_captured(&mut self, grid: &PieceGrid, times: usize, look_every: usize) {
+            let image: Arc<RgbImage> = Arc::new(synthetic::frame_from_grid(grid));
+            for i in 0..times {
+                self.n += 1;
+                self.seq += 1;
+                let at = self.at();
+                self.recorder.source(&crate::stage::Stamped { view: 0, seq: self.seq, captured: at, image: Arc::clone(&image) });
+                if i % look_every == 0 {
+                    self.recorder.look(at, &[(0, self.seq)], "watching");
+                }
+                self.recorder.wait_idle();
+            }
         }
 
         fn at(&self) -> Instant {
@@ -680,6 +830,57 @@ mod tests {
         assert_eq!((report.summary.found, report.summary.wrong, report.summary.behind), (1, 0, 0), "{}", report.text);
         assert!(report.text.contains("replay found e4"), "{}", report.text);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_recording_of_every_picture_replays_as_the_tracker_saw_it_or_picture_by_picture() {
+        let dir = scratch("every");
+        let steps = synthetic::game_steps(&["e4", "e5"]);
+        let fens = fens_after(&["e4", "e5"]);
+        let mut session = Session::every_picture(&dir, Picture::default());
+        // 14 pictures of the start position and 8 of e4 are captured; the tracker looks at every second one.
+        session.show_captured(&synthetic::start_grid(), 14, 2);
+        session.show_captured(&steps[0].after, 8, 2);
+        session.note("detect", json!({"moves": ["e2e4"], "san": ["e4"], "fen": fens[1]}));
+        // A look that names a picture the recording does not have (it was left out, or never made).
+        session.note("look", json!({"feed": 99, "status": "watching", "pictures": [{"cam": 0, "seq": 999}]}));
+        session.note("end", json!({"result": "*", "reason": "abandoned", "fen": fens[1]}));
+        let folder = session.recorder.folder().to_path_buf();
+        session.recorder.close();
+
+        // As it was: the pictures that the looks name.
+        let live = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        assert_eq!(live.summary.pictures, 7 + 4, "{}", live.text);
+        assert_eq!((live.summary.found, live.summary.wrong, live.summary.behind), (1, 0, 0), "{}", live.text);
+        assert!(live.text.contains("1 pictures that the tracker was given live are not in the recording"), "{}", live.text);
+        assert!(live.text.contains("every picture of every camera was recorded (22 of them)"), "{}", live.text);
+        // Picture by picture: every one that was captured.
+        let all = replay_folder_with(&folder, &TrackerOverrides::default(), false, Feed::EveryPicture).unwrap();
+        assert_eq!(all.summary.pictures, 22, "{}", all.text);
+        assert_eq!((all.summary.found, all.summary.wrong, all.summary.behind), (1, 0, 0), "{}", all.text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_brightness_and_contrast_of_the_session_are_applied_again_to_the_pictures_of_a_recording_of_every_picture() {
+        // The pictures are kept as the camera gave them (turned only): the tracker saw them adjusted. With a brightness
+        // that whitens everything the board cannot be read, so nothing is found; with none, e4 is.
+        let steps = synthetic::game_steps(&["e4"]);
+        let fens = fens_after(&["e4"]);
+        let mut found = Vec::new();
+        for (name, picture) in [("plain", Picture::default()), ("white", Picture { brightness: 255.0, ..Picture::default() })] {
+            let dir = scratch(&format!("adjust-{name}"));
+            let mut session = Session::every_picture(&dir, picture);
+            session.show_captured(&synthetic::start_grid(), 8, 1);
+            session.show_captured(&steps[0].after, 6, 1);
+            session.note("detect", json!({"moves": ["e2e4"], "san": ["e4"], "fen": fens[1]}));
+            let folder = session.recorder.folder().to_path_buf();
+            session.recorder.close();
+            let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+            found.push(report.summary.found);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        assert_eq!(found, [1, 0], "found with the plain picture and with a brightness that whitens everything");
     }
 
     #[test]

@@ -15,6 +15,7 @@
 //! Where `ffmpeg` is looked for, in this order: `--ffmpeg <path>`, the variable `NICOCHESS_FFMPEG`, next to the program,
 //! then the folders of `PATH`.
 
+use crate::stage::{Budget, cost_of};
 use anyhow::{Context, Result, bail};
 use image::RgbImage;
 use serde_json::Value;
@@ -24,7 +25,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 
@@ -39,8 +40,6 @@ pub const CAMERA_CRF: u32 = 23;
 pub const DEPTH_CRF: u32 = 23;
 /// The extension of the video files.
 pub const FILE_EXTENSION: &str = "mkv";
-/// The fewest pictures that may wait for the encoder of one video.
-pub const MIN_QUEUE: usize = 8;
 /// The rate the video says it has. Only a label: the time of each picture comes from the events.
 const NOMINAL_FPS: u32 = 25;
 /// A keyframe about every two seconds of the video (the pictures are read in order, so this only bounds the cost of
@@ -194,16 +193,27 @@ impl Sink {
 }
 
 /// What the encoder thread and the recorder tell each other about one video.
-#[derive(Default)]
 struct Shared {
     /// Pictures written to the encoder, and pictures that were accepted but could not be (the encoder died).
     written: AtomicU64,
     lost: AtomicU64,
     failed: AtomicBool,
     reason: Mutex<String>,
+    /// The room of the pictures that wait for the encoder: it gives it back for each picture it is done with.
+    budget: Arc<Budget>,
 }
 
 impl Shared {
+    fn new(budget: Arc<Budget>) -> Shared {
+        Shared {
+            written: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            failed: AtomicBool::new(false),
+            reason: Mutex::new(String::new()),
+            budget,
+        }
+    }
+
     fn fail(&self, reason: String) {
         let mut text = self.reason.lock().unwrap_or_else(PoisonError::into_inner);
         if !self.failed.swap(true, Ordering::SeqCst) {
@@ -215,10 +225,9 @@ impl Shared {
 /// The answer of [`VideoWriter::push`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Push {
-    /// Taken: it is the picture with this number in the video.
+    /// Taken: it is the picture with this number in the video. It waits for the encoder as long as it takes: the queue has
+    /// no length, the caller's [`Budget`] is what bounds the pictures that wait.
     Queued(u64),
-    /// The encoder is too slow: this picture is lost (the caller counts it).
-    Full,
     /// The encoder is gone (or this picture is of another size than the video): this picture and the next ones must
     /// go elsewhere.
     Unusable,
@@ -226,7 +235,7 @@ pub enum Push {
 
 /// One video being written: a thread feeds the pictures to an `ffmpeg` process.
 pub struct VideoWriter {
-    tx: Option<SyncSender<Arc<RgbImage>>>,
+    tx: Option<Sender<Arc<RgbImage>>>,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     width: u32,
@@ -248,14 +257,23 @@ pub struct Totals {
 
 impl VideoWriter {
     /// Starts `ffmpeg` (in a thread of its own, so that the caller never waits for the process to start) to write the
-    /// pictures of `width` x `height` into `file`. Its messages go to `log`, which is removed if there are none. At most
-    /// `queue` pictures wait for the encoder: past that, [`push`](Self::push) says `Full`.
-    pub fn start(ffmpeg: &Path, file: PathBuf, log: PathBuf, width: u32, height: u32, crf: u32, queue: usize) -> Result<VideoWriter> {
+    /// pictures of `width` x `height` into `file`. Its messages go to `log`, which is removed if there are none. The
+    /// pictures wait for the encoder in a queue with no length; the caller took their room in `budget` before handing
+    /// them over, and the encoder gives it back for each one it is done with (written, or lost).
+    pub fn start(
+        ffmpeg: &Path,
+        file: PathBuf,
+        log: PathBuf,
+        width: u32,
+        height: u32,
+        crf: u32,
+        budget: Arc<Budget>,
+    ) -> Result<VideoWriter> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("a video needs even sizes, not {width}x{height}");
         }
-        let (tx, rx) = sync_channel::<Arc<RgbImage>>(queue.max(1));
-        let shared = Arc::new(Shared::default());
+        let (tx, rx) = channel::<Arc<RgbImage>>();
+        let shared = Arc::new(Shared::new(budget));
         let thread = thread::Builder::new()
             .name("video".into())
             .spawn({
@@ -267,19 +285,19 @@ impl VideoWriter {
         Ok(VideoWriter { tx: Some(tx), shared, thread: Some(thread), width, height, queued: 0 })
     }
 
-    /// Hands one picture to the encoder, without waiting.
+    /// Hands one picture to the encoder, without waiting. Its room in the budget was taken by the caller, and is given back
+    /// by the encoder; when the picture is not taken (`Unusable`) the caller keeps it.
     pub fn push(&mut self, image: &Arc<RgbImage>) -> Push {
         if self.shared.failed.load(Ordering::SeqCst) || (image.width(), image.height()) != (self.width, self.height) {
             return Push::Unusable;
         }
         let Some(tx) = &self.tx else { return Push::Unusable };
-        match tx.try_send(Arc::clone(image)) {
+        match tx.send(Arc::clone(image)) {
             Ok(()) => {
                 self.queued += 1;
                 Push::Queued(self.queued - 1)
             }
-            Err(TrySendError::Full(_)) => Push::Full,
-            Err(TrySendError::Disconnected(_)) => Push::Unusable,
+            Err(_) => Push::Unusable,
         }
     }
 
@@ -318,6 +336,7 @@ fn encode(
     rx: std::sync::mpsc::Receiver<Arc<RgbImage>>,
     shared: &Shared,
 ) {
+    let budget = &shared.budget;
     let mut sink = match Sink::open(ffmpeg, file, log, (width, height), crf) {
         Ok(sink) => Some(sink),
         Err(e) => {
@@ -326,6 +345,8 @@ fn encode(
         }
     };
     for image in rx.iter() {
+        // Written or lost, the picture no longer waits: its room in the budget is free again.
+        let _release = budget.giving_back(cost_of(&image));
         match sink.as_mut() {
             Some(sink) if !shared.failed.load(Ordering::SeqCst) => match sink.write(image.as_raw()) {
                 Ok(()) => {
@@ -532,10 +553,33 @@ pub mod tests {
         Arc::new(RgbImage::from_fn(16, 8, |x, y| image::Rgb([seed.wrapping_add(x as u8 * 3), seed.wrapping_add(y as u8 * 5), seed])))
     }
 
+    /// A budget that nothing in a test comes near.
+    fn big_budget() -> Arc<Budget> {
+        Budget::new(1 << 30)
+    }
+
+    #[test]
+    fn the_encoder_gives_back_the_room_of_every_picture_it_is_done_with() {
+        let dir = scratch("budget");
+        let budget = Budget::new(1 << 20);
+        let mut writer =
+            VideoWriter::start(&fake_ffmpeg(), dir.join("cam0.mkv"), dir.join("cam0.log"), 16, 8, 20, Arc::clone(&budget)).unwrap();
+        for i in 0..6 {
+            let p = picture(i);
+            assert!(budget.reserve(cost_of(&p)));
+            assert!(matches!(writer.push(&p), Push::Queued(_)));
+        }
+        let totals = writer.finish();
+        assert_eq!(totals.written, 6);
+        assert_eq!(budget.used(), 0, "nothing waits any more");
+        assert_eq!(budget.peak() % cost_of(&picture(0)), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn pictures_written_through_the_encoder_read_back_in_order_and_by_number() {
         let dir = scratch("roundtrip");
-        let mut writer = VideoWriter::start(&fake_ffmpeg(), dir.join("cam0.mkv"), dir.join("cam0.log"), 16, 8, 20, 8).unwrap();
+        let mut writer = VideoWriter::start(&fake_ffmpeg(), dir.join("cam0.mkv"), dir.join("cam0.log"), 16, 8, 20, big_budget()).unwrap();
         let pictures: Vec<_> = (0..5).map(|i| picture(i * 40)).collect();
         for (i, p) in pictures.iter().enumerate() {
             assert_eq!(writer.push(p), Push::Queued(i as u64));
@@ -559,8 +603,9 @@ pub mod tests {
     #[test]
     fn a_video_needs_even_sizes_and_a_missing_program_loses_the_pictures_it_was_given_and_says_why() {
         let dir = scratch("failure");
-        assert!(VideoWriter::start(Path::new("x"), dir.join("a.mkv"), dir.join("a.log"), 15, 8, 20, 2).is_err());
-        let mut writer = VideoWriter::start(&dir.join("no-such-ffmpeg"), dir.join("a.mkv"), dir.join("a.log"), 16, 8, 20, 4).unwrap();
+        assert!(VideoWriter::start(Path::new("x"), dir.join("a.mkv"), dir.join("a.log"), 15, 8, 20, big_budget()).is_err());
+        let mut writer =
+            VideoWriter::start(&dir.join("no-such-ffmpeg"), dir.join("a.mkv"), dir.join("a.log"), 16, 8, 20, big_budget()).unwrap();
         let image = picture(1);
         let mut accepted = 0;
         let started = std::time::Instant::now();
@@ -594,7 +639,8 @@ pub mod tests {
     fn a_real_ffmpeg_writes_a_video_that_reads_back_close_to_the_pictures() {
         let Some(ffmpeg) = std::env::var_os("NICOCHESS_FFMPEG").map(PathBuf::from) else { panic!("set NICOCHESS_FFMPEG to an ffmpeg") };
         let dir = scratch("real");
-        let mut writer = VideoWriter::start(&ffmpeg, dir.join("cam0.mkv"), dir.join("cam0.log"), 320, 240, CAMERA_CRF, 16).unwrap();
+        let mut writer =
+            VideoWriter::start(&ffmpeg, dir.join("cam0.mkv"), dir.join("cam0.log"), 320, 240, CAMERA_CRF, big_budget()).unwrap();
         let pictures: Vec<Arc<RgbImage>> = (0..30u32)
             .map(|i| {
                 Arc::new(RgbImage::from_fn(320, 240, |x, y| {
@@ -603,9 +649,7 @@ pub mod tests {
             })
             .collect();
         for p in &pictures {
-            while writer.push(p) == Push::Full {
-                thread::sleep(std::time::Duration::from_millis(5));
-            }
+            assert!(matches!(writer.push(p), Push::Queued(_)));
         }
         let totals = writer.finish();
         assert_eq!((totals.written, totals.lost, totals.failure), (30, 0, None));

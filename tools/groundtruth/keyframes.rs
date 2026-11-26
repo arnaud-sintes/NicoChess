@@ -13,6 +13,10 @@
 //! A recording made with video (`cam0.mkv`, see `src/video.rs`) is read through `ffmpeg`: give it with `--ffmpeg
 //! <path>`, or put it on PATH or in NICOCHESS_FFMPEG.
 //!
+//! A recording made with `--record-all` has every picture the camera gave (`frame` lines with `seq` and `captured`), not
+//! only those the tracker looked at: the still stretches are found among all of them, at the moment they were captured,
+//! and the tracker's status shown in the index is the one of its latest look before the picture.
+//!
 //! Run: `cargo run --release --example keyframes -- <recording> <output folder> [--px 80] [--still 6] [--frames 4]
 //! [--square 9] [--side] [--camera 0] [--ffmpeg <path>]`
 
@@ -21,6 +25,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ExtendedColorType, GrayImage, ImageEncoder, Luma, Rgb, RgbImage};
 use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
 use nicochess::calibration::Calibration;
+use nicochess::picture::Picture;
 use nicochess::record::SessionMeta;
 use nicochess::video::{PictureRef, Pictures};
 use serde_json::{Value, json};
@@ -203,6 +208,16 @@ fn read_events(path: &Path) -> Result<Vec<Value>> {
     Ok(text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
 }
 
+/// A picture of the recording, with brightness and contrast applied when the recording keeps the pictures as the camera gave
+/// them (`session.every_picture`).
+fn load_adjusted(pictures: &mut Pictures, picture: &PictureRef, adjust: Option<Picture>) -> Result<RgbImage> {
+    let image = pictures.load(picture)?;
+    Ok(match adjust {
+        Some(settings) => settings.adjust(&image).unwrap_or(image),
+        None => image,
+    })
+}
+
 fn corners_of(value: &Value) -> Option<Calibration> {
     let corners = value.get("corners")?.as_array()?;
     let mut out = [[0.0f32; 2]; 4];
@@ -236,6 +251,11 @@ fn main() -> Result<()> {
     let mut calibration = session.calibration.context("the recording has no calibration")?;
     let mut shots: Vec<Shot> = Vec::new();
     let mut pictures = Pictures::new(&o.recording);
+    // With every picture kept (`--record-all`) the pictures are as the camera gave them, turned: the brightness and the
+    // contrast of the session are applied, as the tracker saw them, and the status comes from the looks of the tracker.
+    let adjust: Option<Picture> =
+        if session.every_picture { if o.camera == 0 { Some(session.picture) } else { session.picture2 } } else { None };
+    let mut look_status = String::new();
     for e in &events {
         match e["type"].as_str() {
             Some("calibration") if e["cam"].as_i64() == Some(o.camera) => {
@@ -243,14 +263,16 @@ fn main() -> Result<()> {
                     calibration = c;
                 }
             }
+            Some("look") => look_status = e["status"].as_str().unwrap_or_default().to_string(),
             Some("frame") if e["cam"].as_i64() == Some(o.camera) => {
                 if let Some(picture) = PictureRef::of_event(e) {
                     shots.push(Shot {
-                        t: e["t"].as_f64().unwrap_or(0.0),
+                        // The moment the camera made the picture, when the recording says it.
+                        t: e["captured"].as_f64().or_else(|| e["t"].as_f64()).unwrap_or(0.0),
                         file: picture.name(),
                         picture,
                         feed: e["feed"].as_i64().unwrap_or(0),
-                        status: e["status"].as_str().unwrap_or_default().to_string(),
+                        status: e["status"].as_str().map_or_else(|| look_status.clone(), str::to_string),
                         calibration,
                     });
                 }
@@ -271,7 +293,7 @@ fn main() -> Result<()> {
     let mut previous: Option<GrayImage> = None;
     let mut csv = String::from("t,status,motion\n");
     for (i, shot) in shots.iter().enumerate() {
-        let image = pictures.load(&shot.picture)?;
+        let image = load_adjusted(&mut pictures, &shot.picture, adjust)?;
         let scan = grey(&warp(&image, &shot.calibration, SCAN_PX, 0).context("the corners do not define a board")?);
         if let Some(p) = &previous {
             motion[i] = square_changes(p, &scan).into_iter().fold(0.0, f32::max);
@@ -310,7 +332,7 @@ fn main() -> Result<()> {
     for (s, e) in &stretches {
         let i = (s + e) / 2;
         let shot = &shots[i];
-        let image = pictures.load(&shot.picture)?;
+        let image = load_adjusted(&mut pictures, &shot.picture, adjust)?;
         let scan = grey(&warp(&image, &shot.calibration, SCAN_PX, 0).context("bad corners")?);
         let mut strongest: Vec<(String, f32)> = Vec::new();
         let (changed, since) = match &last_kept {
@@ -352,7 +374,12 @@ fn main() -> Result<()> {
             .iter()
             .filter(|ev| {
                 let t = ev["t"].as_f64().unwrap_or(-1.0);
-                t > since && t <= shot.t && !matches!(ev["type"].as_str(), Some("frame" | "views" | "calibration" | "closed"))
+                t > since
+                    && t <= shot.t
+                    && !matches!(
+                        ev["type"].as_str(),
+                        Some("frame" | "views" | "calibration" | "closed" | "look" | "pipe" | "backlog" | "video")
+                    )
             })
             .map(short)
             .collect();

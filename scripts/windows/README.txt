@@ -47,11 +47,13 @@ The pictures show whatever the camera sees, so look at a few before sending a fo
 Nothing is sent anywhere by the program. Expect a few hundred MB per hour of play at
 1280x720: delete the folders you no longer need. To send one, zip its folder.
 
-"Start NicoChess (record all).bat" keeps every picture the program looks at (25 a second),
-also while the board is quiet: for a fast game (blitz) that has to be followed again picture
-by picture. It takes several megabytes a second on the disk, so use it for one game at a time
-and delete the folder afterwards. If the disk cannot keep up, the program says how many
-pictures were left out when the game ends.
+"Start NicoChess (record all).bat" keeps every picture each camera gives (25 a second), the
+depth camera's too, also while the board is quiet and whether the program looks at it or not:
+for a fast game (blitz) that has to be followed again picture by picture. It takes several
+megabytes a second on the disk as JPEG files (much less as video, see below), so use it for one
+game at a time and delete the folder afterwards. Pictures wait in memory (up to 2 GB) when the
+disk or the encoder is slow; only if that is not enough are some left out, and the program says
+how many when the game ends, and the recording says where.
 
 Smaller recordings (optional): with ffmpeg.exe in this folder, next to nicochess.exe, the
 pictures are kept as one video for each camera, 20 times smaller than JPEG files. ffmpeg is not

@@ -3,9 +3,10 @@ setlocal
 title NicoChess (recording every picture)
 cd /d "%~dp0"
 
-rem The same as "Start NicoChess (record).bat", but every picture the program looks at is kept (25 a second), also
-rem while the board is quiet. For a game that must be followed again picture by picture, a blitz game for example.
-rem This takes several megabytes a second on the disk: delete the recordings you no longer need.
+rem The same as "Start NicoChess (record).bat", but every picture each camera gives is kept (25 a second), also
+rem while the board is quiet and whether the program looks at it or not. For a game that must be followed again
+rem picture by picture, a blitz game for example. As JPEG files this takes several megabytes a second on the disk
+rem (much less with an ffmpeg.exe next to nicochess.exe): delete the recordings you no longer need.
 rem Camera number: Start NicoChess (record all).bat 1
 set CAMERA=%~1
 if "%CAMERA%"=="" set CAMERA=0

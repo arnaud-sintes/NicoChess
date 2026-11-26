@@ -15,6 +15,7 @@ use crate::picture::{self, Picture};
 use crate::pipeline::{Fed, Pipe};
 use crate::record::{RecordOptions, Recorder, SessionMeta};
 use crate::roles::{self, Role, Roles};
+use crate::stage::Stamped;
 use crate::store::{Store, Summary};
 use crate::tracker::{Candidate, Detection, Doubt, Status, Tracker, TrackerConfig};
 use anyhow::Result;
@@ -408,6 +409,10 @@ struct Slot {
     calibration_path: PathBuf,
     picture_path: PathBuf,
     stats: Mutex<Stats>,
+    /// The pictures this camera gave since the program started (a camera that was closed and opened again goes on
+    /// counting): the number of each picture, stamped before anything else is done to it. A hole in the numbers of a
+    /// recording is a picture that was lost.
+    captures: AtomicU64,
 }
 
 impl Slot {
@@ -420,6 +425,7 @@ impl Slot {
             calibration_path,
             picture_path,
             stats: Mutex::new(Stats::default()),
+            captures: AtomicU64::new(0),
         }
     }
 }
@@ -786,7 +792,10 @@ impl Engine {
                         && link.generation() == generation
                     {
                         match source.next_frame() {
-                            Ok(frame) => link.publish(&frame),
+                            Ok(frame) => {
+                                link.publish(&frame);
+                                self.record_depth_picture(link);
+                            }
                             Err(e) => {
                                 eprintln!("depth: {e:#}");
                                 link.set_error(Some(format!("{e:#}")));
@@ -813,6 +822,25 @@ impl Engine {
             if self.camera_is_wanted() && link.wanted() && link.generation() == generation {
                 thread::sleep(CAMERA_RETRY);
             }
+        }
+    }
+
+    /// With `--record-all` the height picture of every depth picture is kept, as the colour pictures are (the tracker
+    /// only looks at the latest one when it looks). The plane of the board takes a few milliseconds to find: that is done
+    /// here, on the depth thread, and not under the lock.
+    fn record_depth_picture(&self, link: &DepthLink) {
+        let rotation = {
+            let inner = self.inner.grab();
+            match &inner.recorder {
+                Some(recorder) if recorder.records_every_picture() => inner.cams[0].picture.rotation,
+                _ => return,
+            }
+        };
+        let Some(stamp) = link.fresh() else { return };
+        let Some(image) = link.height_picture_of(&stamp, rotation) else { return };
+        let mut inner = self.inner.grab();
+        if let Some(recorder) = inner.recorder.as_mut() {
+            recorder.source(&Stamped { view: DEPTH_VIEW, seq: stamp.seq, captured: stamp.at, image: Arc::new(image) });
         }
     }
 
@@ -987,7 +1015,8 @@ impl Engine {
     fn on_frame(&self, cam: usize, image: RgbImage, arrival: Arrival) {
         let started = Instant::now();
         let slot = &self.slots[cam];
-        let seq = slot.frame.read_ok().as_ref().map_or(1, |l| l.seq + 1);
+        // The picture is numbered before anything is done to it (the number is also the one the recording gives it).
+        let seq = slot.captures.fetch_add(1, Ordering::SeqCst) + 1;
         let picture = self.inner.grab().cams[cam].picture;
         let raw = picture.rotate(image);
         let adjusted = picture.adjust(&raw);
@@ -1018,6 +1047,11 @@ impl Engine {
         let inner = &mut *guard;
         let mut changed = inner.cams[cam].camera_error.take().is_some();
         inner.cams[cam].last_frame = Some(now);
+        // With `--record-all` the picture is kept as it came, whether or not the tracker looks at it (the recorder only
+        // queues it: nothing waits for the encoder or the disk here).
+        if let Some(recorder) = inner.recorder.as_mut() {
+            recorder.source(&Stamped { view: cam, seq, captured: arrival.captured, image: Arc::clone(&latest.raw) });
+        }
         let playing = inner.mode == Mode::Playing;
         if playing {
             inner.pipe.arrival(cam, arrival.captured, arrival.waited);
@@ -1165,7 +1199,26 @@ impl Engine {
             if let Some(recorder) = inner.recorder.as_mut() {
                 // Every look is noted, also when the picture itself is not kept: the lag is wanted at all times.
                 recorder.event(now, "pipe", feed_note.json());
-                if keep_picture {
+                if recorder.records_every_picture() {
+                    // Every picture was kept as it came: the recording only says which of them this look was given. The
+                    // tracker is given the latest picture of each camera, which may be one that came before the recording
+                    // began, or that the thread of its camera has not handed over yet: it is kept now if it is not (a
+                    // picture is kept once, whoever offers it first).
+                    let mut given: Vec<(usize, u64)> = Vec::with_capacity(fed.len() + 1);
+                    for (c, frame) in &fed {
+                        recorder.source(&Stamped { view: *c, seq: frame.seq, captured: frame.captured, image: Arc::clone(&frame.raw) });
+                        given.push((*c, frame.seq));
+                    }
+                    if let Some((seq, picture)) = &depth_given {
+                        // The depth thread keeps the height picture of every depth picture; this one may not be there yet.
+                        if !recorder.has_picture(DEPTH_VIEW, *seq) {
+                            let captured = seen.iter().find(|f| f.view == DEPTH_VIEW).map_or(now, |f| f.captured);
+                            recorder.source(&Stamped { view: DEPTH_VIEW, seq: *seq, captured, image: Arc::new(picture.clone()) });
+                        }
+                        given.push((DEPTH_VIEW, *seq));
+                    }
+                    recorder.look(now, &given, status_name(status));
+                } else if keep_picture {
                     let mut pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|(c, frame)| (*c, Arc::clone(&frame.image))).collect();
                     if let Some((_, picture)) = &depth_given {
                         pictures.push((DEPTH_VIEW, Arc::new(picture.clone())));
@@ -2186,6 +2239,7 @@ impl Engine {
             calibration2: if self.second_enabled() { inner.cams[1].calibration } else { None },
             picture2: self.second_enabled().then_some(inner.cams[1].picture),
             video: None,
+            every_picture: false,
         };
         inner.recorder = match Recorder::begin(options, meta, Instant::now()) {
             Ok(recorder) => {
@@ -2212,12 +2266,17 @@ impl Engine {
         if inner.mode == Mode::Playing {
             return;
         }
-        let Some(recorder) = inner.recorder.take() else { return };
+        let Some(mut recorder) = inner.recorder.take() else { return };
         recorder.set_summary(inner.pipe.summary());
+        // The stretches of pictures that were left out (a budget that was full) are told before the end of the game.
+        recorder.flush_gaps();
         let (result, reason) = inner.game.as_ref().map_or((None, None), |g| (g.result.clone(), g.termination.clone()));
         recorder.event(Instant::now(), "end", json!({"result": result, "reason": reason, "fen": game::fen_of(inner.tracker.position())}));
         if recorder.dropped() > 0 {
-            eprintln!("record: {} pictures could not be kept, the disk or the encoding was too slow", recorder.dropped());
+            eprintln!(
+                "record: {} pictures could not be kept: the disk or the encoder fell behind past the memory limit (`gap` lines of the recording say where)",
+                recorder.dropped()
+            );
         }
         eprintln!("record: saved in {}", recorder.folder().display());
     }

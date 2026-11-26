@@ -67,6 +67,19 @@ level (3.5 at most), and the flicker of that mean from one picture to the next i
   video at crf 20 (35 MB at crf 23). The game 13-21-41 (4009 + 729 pictures, 206 s) is 1.0 GB as JPEG, and 134 MB at
   crf 20 / 18 (54 MB at crf 23).
 
+## With `--record-all`: every picture, and a replay that is the live game again
+
+With `--record-all` the recorder keeps every picture each camera gives (and the height picture of every depth picture),
+the moment it is captured, not only those the tracker looks at: ENVIRONMENT.md "Record and replay". The queues in front
+of the encoders have no length and are bounded by a memory budget (2 GB, `--record-budget`), so a slow encoder or disk
+makes pictures wait, never get lost, until the budget is full. Measured on the demo (a synthetic game of 33 moves,
+two cameras and a depth camera at 25 pictures a second, 36 s, through the downloaded `ffmpeg`): 886, 887 and 885
+pictures kept, no hole in their numbers, `dropped` 0, nothing waiting for more than 10 MB at a time; and, for 25 s of the
+same game, the program used 6.4 s of CPU and `ffmpeg` 6.0 s, against 5.8 s and 5.4 s for the recorder that only kept the
+pictures the tracker looked at (which kept 593, 517 and 601 pictures of the three views in that time, against 622,
+621 and 621). A replay of the JPEG recording as the tracker saw it found the same 33 moves as the live run; the replay
+of the video recording (crf 23) found 32 of the 33 (the castling), because the video is lossy.
+
 ## What these numbers do not tell
 
 - The pictures that were encoded were JPEG at quality 92 already (what the recordings hold), not the camera's own

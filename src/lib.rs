@@ -40,6 +40,7 @@ pub mod record;
 pub mod replay;
 pub mod roles;
 pub mod server;
+pub mod stage;
 pub mod store;
 pub mod synthetic;
 pub mod tracker;

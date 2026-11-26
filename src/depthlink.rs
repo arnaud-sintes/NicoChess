@@ -400,10 +400,17 @@ impl DepthLink {
         if new_only && stamp.seq == self.fed.load(Ordering::SeqCst) {
             return None;
         }
+        let picture = self.height_picture_of(&stamp, rotation)?;
+        Some((stamp.seq, picture))
+    }
+
+    /// The height picture of this depth picture, turned as the colour picture is: what the tracker is given, and what a
+    /// recording keeps of every depth picture. `None` when there is no flat surface in it.
+    pub fn height_picture_of(&self, stamp: &DepthStamp, rotation: u16) -> Option<RgbImage> {
         let frame = stamp.frame.rotated(rotation);
         let calibration = self.calibration();
         let plane = Plane::fit(&frame, calibration.as_ref().map(|c| &c.corners))?;
-        Some((stamp.seq, depth::height_picture(&frame, &plane)))
+        Some(depth::height_picture(&frame, &plane))
     }
 
     /// The tracker was given the depth picture with this number.

@@ -40,6 +40,13 @@ On a recording without `pipe` lines it says so and shows only the pictures that 
 `legal --play` plays the moves (UCI) from the position and prints their SAN and the position after them; it refuses a move
 that is not legal, so a reader cannot write an impossible sequence.
 
+A recording made with `--record-all` (format 4) has every picture each camera gave, numbered `seq` and stamped `captured`,
+as the camera gave them (turned, not adjusted): `keyframes` applies the brightness and contrast of the session as the
+tracker saw them, finds the still stretches among all the pictures at the moment they were captured, and takes the
+tracker's status from its `look` lines; `compare` takes the unsure stretches from the `look` lines too, and `compare
+--replay` replays it as the tracker saw it live. Such a recording has no hole in its numbers unless a `gap` line says so,
+so its replay is faithful: on the demo (33 moves) the replay of JPEG files finds the same 33 moves as the live run.
+
 A recording made with video (`cam0.mkv` instead of `frames/`, see ENVIRONMENT.md, "Recording as video") is read through
 `ffmpeg`, which must be found (`--ffmpeg <path>` on `keyframes`, or `NICOCHESS_FFMPEG`, or next to the program, or on
 PATH); `compare --replay` reads it the same way. The `index.json` then names a picture as `cam0.mkv#1234` (the video and the
@@ -85,8 +92,10 @@ game, and watch the numbers go to the truth. What the replay is *put* on (it fol
 had a move the replay had not found, the replay is set to the live position, as a person typing it would) is not counted as
 found, so those moves show as `missed`. A limit: the replay is put on the *live* positions, not the truth's, so after a
 live mistake it carries the same mistake; making the replay follow the truth is not done yet. And the recorded pictures
-may have gaps (five of the six recordings of 2026-11-24 lost about half of them, before the recorder got several writers), so a replay of those can miss moves that the live run
-saw: on `2026-11-24_13-36-23`, whose live run found all 27 moves, a replay found 23.
+of a recording made before `--record-all` kept every picture may have gaps (five of the six recordings of 2026-11-24
+lost about half of them, before the recorder got several writers and the queues were bounded by memory), so a replay of
+those can miss moves that the live run saw: on `2026-11-24_13-36-23`, whose live run found all 27 moves, a replay found
+23. Record new games with `--record-all`.
 
 `keyframes` writes into the output folder (keep it outside the repository):
 

@@ -84,7 +84,9 @@ fn read_recorded(folder: &Path) -> Result<Recorded> {
         let Ok(e) = serde_json::from_str::<Value>(line) else { continue };
         let (Some(t), Some(kind)) = (e["t"].as_f64(), e["type"].as_str()) else { continue };
         match kind {
-            "frame" => {
+            // The status of the tracker comes with the pictures it was given (a recording made with `--record`), or with its
+            // looks (`--record-all`, whose `frame` lines do not have one).
+            "frame" | "look" if e.get("status").is_some() => {
                 if e["status"].as_str() == Some("unsure") {
                     open = Some((open.map_or(t, |o| o.0), t));
                 } else if let Some((from, last)) = open.take() {

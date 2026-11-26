@@ -120,14 +120,18 @@ fn main() {
             }
             "frame" => {
                 // One look gives one `feed` number to all its pictures.
+                // (With every picture kept, `--record-all`, a `frame` line is a picture of the camera, numbered `seq` and
+                // stamped `captured`, not a look: every one counts.)
                 let feed = event["feed"].as_u64();
-                if event["cam"].as_u64().unwrap_or(0) == 0 && feed != last_feed_number {
+                let every = event.get("seq").is_some();
+                if event["cam"].as_u64().unwrap_or(0) == 0 && (every || feed != last_feed_number) {
                     last_feed_number = feed;
                     w.kept += 1;
+                    let at = event["captured"].as_f64().unwrap_or(t);
                     if let Some(last) = last_kept {
-                        w.kept_gap_max = w.kept_gap_max.max((t - last) * 1000.0);
+                        w.kept_gap_max = w.kept_gap_max.max((at - last) * 1000.0);
                     }
-                    last_kept = Some(t);
+                    last_kept = Some(at);
                 }
             }
             "detect" => w.moves += event["moves"].as_array().map_or(1, |m| m.len() as u64),
@@ -142,7 +146,7 @@ fn main() {
         println!("This recording has no `pipe` lines: it was made before the pipeline figures existed (or not while playing).");
         println!("What the `frame` lines say: pictures of camera 1 that were kept, and the longest gap between two of them.");
         println!(
-            "With --record-all every picture the tracker looked at is kept, so these are its looks; otherwise the gaps are the recording's."
+            "A recording made with --record-all has every picture the camera gave, so its gaps are the camera's; one made with --record only has some of them."
         );
         println!();
         println!("{:>8} {:>6} {:>7} {:>10} {:>6} {:>7}", "from s", "kept", "per s", "max gap ms", "moves", "unsure");

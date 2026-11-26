@@ -497,12 +497,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::open(&dir.join("games")).unwrap();
-        // Every picture, and none dropped whatever the load of the machine running the tests.
-        let record = record.then(|| crate::record::RecordOptions {
-            backlog: 100_000,
-            busy_every: Duration::ZERO,
-            ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
-        });
+        // Every picture each camera gives, and none dropped whatever the load of the machine running the tests (the budget
+        // is far from being reached).
+        let record = record.then(|| crate::record::RecordOptions::keeping_all(dir.join("recordings")));
         let engine = Engine::new(EngineConfig { record, tracker, ..patient() }, store, dir.join("calibration.json"), None);
         engine.spawn_capture(camera::factory(source, frame_interval)).unwrap();
         let handler = handler(Arc::clone(&engine), 8);
@@ -1057,6 +1054,62 @@ mod tests {
         assert_eq!(state["game"]["over"], false);
     }
 
+    /// What a recording of every picture must show, for the cameras `cameras`: the pictures of each camera are numbered with
+    /// no hole, none was dropped or left out, every look names pictures that are there, and a replay of it finds exactly
+    /// what the program found live (the same moves in the same order, at the same looks give or take the clock of the
+    /// replay, which is rounded to the millisecond where the live one is not).
+    fn check_every_picture_and_replay(events: &[Value], report: &crate::replay::Report, cameras: &[u64]) {
+        let kind = |e: &Value| e["type"].as_str().unwrap().to_string();
+        let mut held = std::collections::HashSet::new();
+        for cam in cameras {
+            let seqs: Vec<u64> =
+                events.iter().filter(|e| kind(e) == "frame" && e["cam"] == *cam).map(|e| e["seq"].as_u64().unwrap()).collect();
+            assert!(seqs.len() > 30, "camera {cam}: {} pictures", seqs.len());
+            // (A picture that came before the recording began is kept when the tracker is first given it, so it may come
+            // after the pictures that follow it: look at the numbers in order.)
+            let mut sorted = seqs.clone();
+            sorted.sort_unstable();
+            assert!(sorted.windows(2).all(|w| w[1] == w[0] + 1), "camera {cam}: a hole in the numbers of its pictures: {sorted:?}");
+            held.extend(seqs.iter().map(|s| (*cam, *s)));
+        }
+        assert!(events.iter().all(|e| kind(e) != "gap" && kind(e) != "backlog"), "nothing was left out");
+        let closed = events.last().unwrap();
+        assert_eq!(closed["dropped"], 0);
+        for (i, cam) in cameras.iter().enumerate() {
+            let kept = events.iter().filter(|e| kind(e) == "frame" && e["cam"] == *cam).count() as u64;
+            assert_eq!(closed["source"]["kept"][*cam as usize].as_u64(), Some(kept), "{}", closed["source"]);
+            assert_eq!(closed["source"]["offered"][*cam as usize], closed["source"]["kept"][*cam as usize], "camera {i}: all kept");
+        }
+        // The pictures that a look was given are all in the recording.
+        let mut looks = 0;
+        for look in events.iter().filter(|e| kind(e) == "look") {
+            looks += 1;
+            for picture in look["pictures"].as_array().unwrap() {
+                let key = (picture["cam"].as_u64().unwrap(), picture["seq"].as_u64().unwrap());
+                assert!(held.contains(&key), "the look at t={} names a picture that is not there: {picture}", look["t"]);
+            }
+        }
+        assert!(looks >= 33, "{looks} looks");
+        assert_eq!(report.summary.behind, 0, "{}", report.text);
+        assert_eq!(report.summary.wrong, 0, "{}", report.text);
+        // The same moves, in the same order.
+        let live: Vec<(f64, Vec<String>)> = events
+            .iter()
+            .filter(|e| kind(e) == "detect")
+            .map(|e| (e["t"].as_f64().unwrap(), e["moves"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect()))
+            .collect();
+        let replayed: Vec<(f64, Vec<String>)> = report.detections.iter().map(|f| (f.t, f.uci.clone())).collect();
+        assert_eq!(
+            live.iter().map(|(_, m)| m.clone()).collect::<Vec<_>>(),
+            replayed.iter().map(|(_, m)| m.clone()).collect::<Vec<_>>(),
+            "the replay finds the moves the program found, in the same order\n{}",
+            report.text
+        );
+        for ((live_t, _), (replayed_t, moves)) in live.iter().zip(&replayed) {
+            assert!((live_t - replayed_t).abs() < 0.25, "{moves:?}: live at {live_t} s, replayed at {replayed_t} s");
+        }
+    }
+
     #[test]
     fn a_recorded_game_is_kept_in_a_folder_and_a_replay_of_it_finds_the_same_moves() {
         use crate::replay::{TrackerOverrides, replay_folder};
@@ -1115,6 +1168,16 @@ mod tests {
         assert_eq!(report.summary.behind, 0, "{}", report.text);
         assert_eq!((report.summary.live_typed, report.summary.live_undone), (0, 0));
         assert!(report.summary.found > 0 && report.summary.pictures >= 33, "{}", report.text);
+        // Every picture the camera gave is in the recording, and the replay is the live game again.
+        assert!(session.every_picture && session.format == crate::record::FORMAT);
+        check_every_picture_and_replay(&events, &report, &[0]);
+        // Fed every picture one after the other, as the analysis will take them, the game is found as well.
+        let all =
+            crate::replay::replay_folder_with(&folder, &TrackerOverrides::default(), false, crate::replay::Feed::EveryPicture).unwrap();
+        assert_eq!(all.summary.wrong, 0, "{}", all.text);
+        // (Here the tracker looks at every picture of the one camera, so the two replays feed the same number.)
+        assert!(all.summary.pictures >= report.summary.pictures, "{} against {}", all.summary.pictures, report.summary.pictures);
+        assert!(all.summary.found >= 20, "{}", all.text);
     }
 
     #[test]
@@ -1138,8 +1201,10 @@ mod tests {
             std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         // What the people did: not the pictures, nor the notes of the program (which cameras took part, and that the
         // tracker was unsure: the synthetic board never changes, so it may well say so between the moves typed).
-        let people: Vec<&Value> =
-            events.iter().filter(|e| !["frame", "pipe", "views", "unsure", "closed"].contains(&e["type"].as_str().unwrap_or(""))).collect();
+        let people: Vec<&Value> = events
+            .iter()
+            .filter(|e| !["frame", "look", "pipe", "views", "unsure", "closed"].contains(&e["type"].as_str().unwrap_or("")))
+            .collect();
         let kinds: Vec<&str> = people.iter().map(|e| e["type"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["manual", "manual", "undo", "end"], "{people:?}");
         assert_eq!(people[0]["text"], "e2e4");
@@ -1333,11 +1398,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let store = Store::open(&dir.join("games")).unwrap();
-        let record = record.then(|| crate::record::RecordOptions {
-            backlog: 100_000,
-            busy_every: Duration::ZERO,
-            ..crate::record::RecordOptions::new(dir.join("recordings"), Duration::ZERO)
-        });
+        let record = record.then(|| crate::record::RecordOptions::keeping_all(dir.join("recordings")));
         let config = EngineConfig { record, second_fixed: true, track_interval: Duration::from_millis(80), ..patient() };
         let engine = Engine::new(config, store, dir.join("calibration.json"), None);
         let (first, second) = camera::demo_pair(Duration::from_millis(100), move_interval);
@@ -1401,9 +1462,17 @@ mod tests {
             std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         let frames: Vec<&Value> = events.iter().filter(|e| e["type"] == "frame").collect();
         assert!(frames.iter().any(|e| e["cam"] == 0) && frames.iter().any(|e| e["cam"] == 1));
-        assert!(frames.iter().all(|e| e["feed"].is_u64()));
-        let together = frames.windows(2).filter(|w| w[0]["feed"] == w[1]["feed"] && w[0]["cam"] != w[1]["cam"]).count();
-        assert!(together > 5, "the two pictures of a time carry one number: {together}");
+        assert!(frames.iter().all(|e| e["seq"].is_u64() && e["captured"].is_f64()), "every picture is numbered and stamped");
+        // The looks of the tracker name the pictures of both cameras that it was given together.
+        let together = events
+            .iter()
+            .filter(|e| e["type"] == "look")
+            .filter(|e| {
+                let cams: Vec<u64> = e["pictures"].as_array().unwrap().iter().map(|p| p["cam"].as_u64().unwrap()).collect();
+                cams.contains(&0) && cams.contains(&1)
+            })
+            .count();
+        assert!(together > 5, "the two pictures of a time are given together: {together}");
         assert!(events.iter().any(|e| e["type"] == "views"), "which cameras took part is noted");
         let session: crate::record::SessionMeta = serde_json::from_slice(&std::fs::read(folder.join("session.json")).unwrap()).unwrap();
         assert_eq!(session.calibration2.map(|c| c.corners), Some(synthetic::second_corners().corners));
@@ -1411,6 +1480,7 @@ mod tests {
         let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
         assert_eq!((report.summary.wrong, report.summary.behind), (0, 0), "{}", report.text);
         assert!(report.summary.found > 0 && report.summary.pictures >= 66, "{}", report.text);
+        check_every_picture_and_replay(&events, &report, &[0, 1]);
     }
 
     /// A camera that works for a number of pictures, and is gone after that (and cannot be opened again).
@@ -1754,6 +1824,75 @@ mod tests {
         assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": false}"#).0, 200);
         wait_for("the depth to be left out", || rig.state(ALICE)["depth"]["in_use"] == false);
         assert_eq!(rig.state(ALICE)["tracker"]["status"], "watching");
+    }
+
+    #[test]
+    fn a_recording_of_every_picture_keeps_the_pictures_of_the_depth_camera_and_the_looks_name_them() {
+        use crate::replay::{TrackerOverrides, replay_folder};
+        let dir = std::env::temp_dir().join(format!("nicochess-depth-record-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let guess = crate::depth::guess_corners(&synthetic::corners(), (synthetic::WIDTH, synthetic::HEIGHT), (480, 360), 69.4, 63.4);
+        let truth = guess.map(|c| [c[0] + 12.0, c[1] - 8.0]);
+        let mut occupied = [false; 64];
+        let mut black = [false; 64];
+        for square in 0..64 {
+            occupied[square] = !(16..48).contains(&square);
+            black[square] = square >= 48;
+        }
+        let factory: crate::depthlink::DepthFactory = Box::new(move |_, _| {
+            Ok(Box::new(FakeDepth { pictures: 0, corners: truth, occupied, black }) as Box<dyn crate::depthlink::DepthSource>)
+        });
+        let link = crate::depthlink::DepthLink::new(factory, Some(dir.join("depth.json")));
+        link.set_offer(Some("Fake Depth".into()));
+        let record = Some(crate::record::RecordOptions::keeping_all(dir.join("recordings")));
+        let config = EngineConfig { depth: Some(Arc::clone(&link)), record, track_interval: Duration::from_millis(100), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        engine.spawn_capture(camera::factory(SourceSpec::Synthetic, Duration::from_millis(20))).unwrap();
+        engine.spawn_depth().unwrap();
+        let handler = handler(Arc::clone(&engine), 8);
+        let rig = Rig { engine, handler, dir };
+
+        rig.state(ALICE);
+        assert_eq!(rig.call("POST", "/api/depth", ALICE, r#"{"on": true}"#).0, 200);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("the depth to be used", || {
+            let state = rig.state(ALICE);
+            state["depth"]["in_use"] == true && state["tracker"]["status"] == "watching"
+        });
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"0-1","reason":"resignation"}"#).0, 200);
+
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let depth: Vec<u64> = events.iter().filter(|e| e["type"] == "frame" && e["cam"] == 2).map(|e| e["seq"].as_u64().unwrap()).collect();
+        assert!(depth.len() > 10, "the height picture of every depth picture is kept: {} of them", depth.len());
+        let mut unique = depth.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), depth.len(), "each is kept once, whether the depth thread or a look was first");
+        let closed = events.last().unwrap();
+        assert_eq!(closed["dropped"], 0);
+        assert_eq!(closed["source"]["kept"][2].as_u64(), Some(depth.len() as u64), "{}", closed["source"]);
+        // The pictures that the looks give to the depth view are all there.
+        let named: Vec<u64> = events
+            .iter()
+            .filter(|e| e["type"] == "look")
+            .flat_map(|e| e["pictures"].as_array().unwrap().iter().filter(|p| p["cam"] == 2).map(|p| p["seq"].as_u64().unwrap()))
+            .collect();
+        assert!(!named.is_empty(), "the tracker was given depth pictures");
+        assert!(named.iter().all(|s| depth.contains(s)), "{named:?} against {depth:?}");
+        // And the recording can be replayed with them.
+        let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        assert!(report.summary.pictures > 10 && report.summary.wrong == 0, "{}", report.text);
+        assert!(!report.text.contains("not in the recording"), "{}", report.text);
     }
 
     #[test]
