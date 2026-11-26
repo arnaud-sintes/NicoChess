@@ -119,8 +119,10 @@ status and every list of candidates. Open the picture files named in the report 
 
 Limits: a replay sees only the pictures that were kept, so with the default spacing it follows the live run closely
 only around moves (where a few pictures a second are kept); use `--record-all` for a faithful replay of a short session. A
-move that the people undid after the program found it counts as played. When the disk is too slow, pictures are
-dropped (the end of the replay report says so) and the game is never delayed. Recordings show whatever the camera
+move that the people undid after the program found it counts as played. When the disk or the encoding of the
+pictures is too slow, pictures are dropped (the end of the replay report says so) and the game is never delayed.
+Two to four threads encode and write the pictures (0.11.1 had one, and `--record-all` lost about half of the
+pictures with two cameras, the depth view first); not yet confirmed by a live run. Recordings show whatever the camera
 sees: they stay on the PC, and look at them before sending them anywhere.
 
 ## Test

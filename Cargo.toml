@@ -39,6 +39,16 @@ nokhwa = { version = "0.10.11", default-features = false, features = ["input-msm
 # built for nokhwa, so it adds nothing to the program but the code that uses it.
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
 
+# Tools for reading a real game from the pictures of a recording (tools/groundtruth/README.md). Examples are built only
+# on request, never shipped.
+[[example]]
+name = "keyframes"
+path = "tools/groundtruth/keyframes.rs"
+
+[[example]]
+name = "legal"
+path = "tools/groundtruth/legal.rs"
+
 # The tests play whole games on synthetic pictures, which takes minutes when nothing is optimised (and then times out on a
 # small CI machine). A little optimisation makes them several times faster; the programs that are shipped use `release`.
 [profile.test]

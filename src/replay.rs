@@ -375,7 +375,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                 if dropped > 0 {
                     let _ = writeln!(
                         text,
-                        "{:>8.1}s  note: {dropped} pictures or lines were dropped while recording (the disk was too slow)",
+                        "{:>8.1}s  note: {dropped} pictures or lines were dropped while recording (the disk or the encoding was too slow)",
                         event.t
                     );
                 }

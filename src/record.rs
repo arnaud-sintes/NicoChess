@@ -14,8 +14,10 @@
 //!   `unsure` (the candidates offered), `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, and
 //!   `closed` last. Positions are FEN strings.
 //!
-//! Nothing here may disturb the game: the capture thread only hands pictures and lines to a writer thread
-//! (`try_send`, never waiting for the disk); when the disk cannot keep up, pictures are dropped and counted.
+//! Nothing here may disturb the game: the capture thread only hands pictures and lines to the writer threads
+//! (`try_send`, never waiting for the disk); when they cannot keep up, pictures are dropped and counted. Pictures are
+//! encoded and written by two to four threads at once (one keeps up with about 20 a second, and two cameras at 25
+//! feeds a second give 50), the lines of `events.jsonl` are still appended in the order things happened.
 //! A failure to write is reported once on the console and the game goes on.
 
 use crate::calibration::Calibration;
@@ -30,9 +32,9 @@ use serde_json::{Map, Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -252,26 +254,55 @@ impl Recorder {
     }
 }
 
-/// The writer thread keeps what it is given in the folder, in order. It ends when the recorder is dropped.
+/// How many threads encode and write pictures at once. One thread keeps up with about 20 pictures a second at best
+/// (encoding a 1280x720 picture and flushing the file take 20 to 45 ms), and with two cameras every picture the tracker
+/// looks at is two pictures: 0.11.1 lost half of the pictures of `--record-all` that way.
+fn writer_threads() -> usize {
+    thread::available_parallelism().map_or(2, |n| n.get()).clamp(2, 4)
+}
+
+/// What the writer threads share. A message is taken together with its ticket, so that tickets follow the order in
+/// which the messages were queued.
+struct Inbox {
+    rx: Receiver<Msg>,
+    /// Tickets given so far, and pictures numbered so far.
+    tickets: u64,
+    pictures: u64,
+}
+
+/// The events file, and whose turn it is to append to it.
+struct Events {
+    /// The ticket that appends next.
+    turn: u64,
+    file: Option<std::fs::File>,
+}
+
+/// The writer keeps what it is given in the folder, in order. It ends when the recorder is dropped.
+///
+/// Several threads encode and write the pictures at the same time, which is the slow part, but a line is appended to
+/// `events.jsonl` only when every message before it has been: the file reads in the order things happened, and a
+/// `frame` line is only there once its picture is on the disk.
 fn writer(folder: PathBuf, rx: Receiver<Msg>, begun: Instant, queued: Arc<AtomicUsize>, dropped: Arc<AtomicU64>) {
-    let mut events = match OpenOptions::new().create(true).append(true).open(folder.join("events.jsonl")) {
+    let file = match OpenOptions::new().create(true).append(true).open(folder.join("events.jsonl")) {
         Ok(file) => Some(file),
         Err(e) => {
             eprintln!("record: cannot write {}: {e}; this recording will be incomplete", folder.join("events.jsonl").display());
             None
         }
     };
-    let mut reported = false;
-    let mut report = |what: String| {
+    let reported = AtomicBool::new(false);
+    let report = |what: String| {
         // Once: a full disk would otherwise fill the console as fast as the pictures come.
-        if !reported {
-            reported = true;
+        if !reported.swap(true, Ordering::Relaxed) {
             eprintln!("record: {what}; the game goes on, the recording will be incomplete");
         }
     };
+    let inbox = Mutex::new(Inbox { rx, tickets: 0, pictures: 0 });
+    let events = Mutex::new(Events { turn: 0, file });
+    let turn_changed = Condvar::new();
     // Appending is the one write that is not atomic: a line cut short by a power loss is skipped by the replay.
-    let mut append = |line: &str, report: &mut dyn FnMut(String)| {
-        if let Some(file) = events.as_mut() {
+    let append = |events: &mut Events, line: &str| {
+        if let Some(file) = events.file.as_mut() {
             let mut bytes = Vec::with_capacity(line.len() + 1);
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
@@ -280,32 +311,75 @@ fn writer(folder: PathBuf, rx: Receiver<Msg>, begun: Instant, queued: Arc<Atomic
             }
         }
     };
-    let mut n = 0u64;
-    for msg in rx {
-        match msg {
-            Msg::Session(bytes) => {
-                if let Err(e) = write_atomic(&folder.join("session.json"), &bytes) {
-                    report(format!("{e:#}"));
+    let work = || {
+        loop {
+            let (msg, ticket, number) = {
+                let mut inbox = inbox.lock().unwrap_or_else(PoisonError::into_inner);
+                let Ok(msg) = inbox.rx.recv() else { break };
+                let ticket = inbox.tickets;
+                inbox.tickets += 1;
+                let number = if matches!(msg, Msg::Frame { .. }) {
+                    inbox.pictures += 1;
+                    inbox.pictures
+                } else {
+                    0
+                };
+                (msg, ticket, number)
+            };
+            let is_frame = matches!(msg, Msg::Frame { .. });
+            // The slow part, with the other threads doing theirs. A panic here must not stop the others from taking
+            // their turn, which would hold up the whole recording for ever.
+            let line = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
+                Msg::Session(bytes) => {
+                    if let Err(e) = write_atomic(&folder.join("session.json"), &bytes) {
+                        report(format!("{e:#}"));
+                    }
+                    None
                 }
+                Msg::Frame { t, camera, feed, image, status } => {
+                    let name = format!("frames/{number:06}.jpg");
+                    let saved = encode_jpeg(&image, JPEG_QUALITY).and_then(|bytes| write_atomic(&folder.join(&name), &bytes));
+                    match saved {
+                        Ok(()) => {
+                            Some(json!({"t": t, "type": "frame", "file": name, "status": status, "cam": camera, "feed": feed}).to_string())
+                        }
+                        Err(e) => {
+                            report(format!("{e:#}"));
+                            None
+                        }
+                    }
+                }
+                Msg::Line(line) => Some(line),
+            }))
+            .unwrap_or_else(|_| {
+                report("a picture could not be written".into());
+                None
+            });
+            let mut events = events.lock().unwrap_or_else(PoisonError::into_inner);
+            while events.turn != ticket {
+                events = turn_changed.wait(events).unwrap_or_else(PoisonError::into_inner);
             }
-            Msg::Frame { t, camera, feed, image, status } => {
+            if let Some(line) = line {
+                append(&mut events, &line);
+            }
+            events.turn += 1;
+            turn_changed.notify_all();
+            drop(events);
+            if is_frame {
+                // The picture counts against the backlog until it is written: it is in memory until then.
                 queued.fetch_sub(1, Ordering::SeqCst);
-                n += 1;
-                let name = format!("frames/{n:06}.jpg");
-                let saved = encode_jpeg(&image, JPEG_QUALITY).and_then(|bytes| write_atomic(&folder.join(&name), &bytes));
-                match saved {
-                    Ok(()) => append(
-                        &json!({"t": t, "type": "frame", "file": name, "status": status, "cam": camera, "feed": feed}).to_string(),
-                        &mut report,
-                    ),
-                    Err(e) => report(format!("{e:#}")),
-                }
             }
-            Msg::Line(line) => append(&line, &mut report),
         }
-    }
+    };
+    thread::scope(|scope| {
+        for _ in 0..writer_threads() {
+            scope.spawn(work);
+        }
+    });
     let t = (begun.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
-    append(&json!({"t": t, "type": "closed", "pictures": n, "dropped": dropped.load(Ordering::Relaxed)}).to_string(), &mut report);
+    let pictures = inbox.lock().unwrap_or_else(PoisonError::into_inner).pictures;
+    let mut events = events.lock().unwrap_or_else(PoisonError::into_inner);
+    append(&mut events, &json!({"t": t, "type": "closed", "pictures": pictures, "dropped": dropped.load(Ordering::Relaxed)}).to_string());
 }
 
 /// `base`, or `base-2`, `base-3`, ... when two recordings begin in the same second.
@@ -510,6 +584,59 @@ mod tests {
         let lines: Vec<Value> =
             fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(lines.iter().filter(|l| l["type"] == "frame").count(), 10, "{lines:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn pictures_written_by_several_threads_still_read_in_the_order_they_were_given() {
+        let dir = temp_dir("order");
+        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) };
+        assert!(writer_threads() >= 2);
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        // Pictures of different sizes take different times to encode, so that the threads finish out of order if
+        // nothing holds them back; a line comes after every third feed, and each must land between its pictures.
+        let big = Arc::new(RgbImage::from_fn(640, 480, |x, y| image::Rgb([(x * 7 + y * 3) as u8, (x ^ y) as u8, (x * y) as u8])));
+        let small = Arc::new(RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])));
+        let feeds = 60u64;
+        for i in 0..feeds {
+            let at = begun + Duration::from_millis(40 * i);
+            recorder.frames(at, &[(0, Arc::clone(&big)), (2, Arc::clone(&small))], "watching", false);
+            if i % 3 == 2 {
+                recorder.event(at, "manual", json!({"after": i}));
+            }
+        }
+        let folder = recorder.folder().to_path_buf();
+        assert_eq!(recorder.dropped(), 0);
+        recorder.close();
+
+        let lines: Vec<Value> =
+            fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let mut expected = Vec::new();
+        for i in 0..feeds {
+            expected.push(format!("frame {} 0", i + 1));
+            expected.push(format!("frame {} 2", i + 1));
+            if i % 3 == 2 {
+                expected.push(format!("manual {i}"));
+            }
+        }
+        expected.push("closed".into());
+        let seen: Vec<String> = lines
+            .iter()
+            .map(|l| match l["type"].as_str().unwrap() {
+                "frame" => format!("frame {} {}", l["feed"], l["cam"]),
+                "manual" => format!("manual {}", l["after"]),
+                other => other.to_string(),
+            })
+            .collect();
+        assert_eq!(seen, expected);
+        // The files are numbered in the order of the lines, and all are there.
+        let files: Vec<&str> = lines.iter().filter(|l| l["type"] == "frame").map(|l| l["file"].as_str().unwrap()).collect();
+        for (i, file) in files.iter().enumerate() {
+            assert_eq!(*file, format!("frames/{:06}.jpg", i + 1));
+            assert!(folder.join(file).exists(), "{file}");
+        }
+        assert_eq!(lines.last().unwrap()["pictures"], 2 * feeds);
         fs::remove_dir_all(&dir).ok();
     }
 

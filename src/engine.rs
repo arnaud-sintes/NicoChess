@@ -2171,7 +2171,7 @@ impl Engine {
         let (result, reason) = inner.game.as_ref().map_or((None, None), |g| (g.result.clone(), g.termination.clone()));
         recorder.event(Instant::now(), "end", json!({"result": result, "reason": reason, "fen": game::fen_of(inner.tracker.position())}));
         if recorder.dropped() > 0 {
-            eprintln!("record: {} pictures could not be kept, the disk was too slow", recorder.dropped());
+            eprintln!("record: {} pictures could not be kept, the disk or the encoding was too slow", recorder.dropped());
         }
         eprintln!("record: saved in {}", recorder.folder().display());
     }
