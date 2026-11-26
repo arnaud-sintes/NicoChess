@@ -160,14 +160,16 @@ fn overlap(stretches: &[(f64, f64)], from: f64, to: f64) -> (f64, usize) {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: compare <recording folder> <truth.json> [--saved <game.json>] [--replay] [--late 3] [--all]";
+    let usage = "usage: compare <recording folder> <truth.json> [--saved <game.json>] [--replay [--thin]] [--late 3] [--all]";
     let (Some(folder), Some(truth_path)) = (args.next(), args.next()) else { bail!(usage) };
     let (folder, truth_path) = (PathBuf::from(folder), PathBuf::from(truth_path));
-    let (mut saved, mut replay, mut late, mut all) = (None::<PathBuf>, false, 3.0f64, false);
+    let (mut saved, mut replay, mut late, mut all, mut thin) = (None::<PathBuf>, false, 3.0f64, false, false);
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--saved" => saved = Some(PathBuf::from(args.next().context("--saved needs a file")?)),
             "--replay" => replay = true,
+            // With --replay: skip the look at every picture that is the same as the one last looked at (`--replay-thin`).
+            "--thin" => thin = true,
             "--late" => late = args.next().context("--late needs seconds")?.parse()?,
             "--all" => all = true,
             other => bail!("unknown option {other}\n{usage}"),
@@ -214,10 +216,13 @@ fn main() -> Result<()> {
     }
     let n = moves.len();
 
+    if thin && !replay {
+        bail!("--thin goes with --replay");
+    }
     // The live game: from the recording, or from a fresh run of the tracker.
     let mut source = "events.jsonl of the recording";
     if replay {
-        let report = replay_folder(&folder, &TrackerOverrides::default(), false)?;
+        let report = replay_folder(&folder, &TrackerOverrides { thin, ..TrackerOverrides::default() }, false)?;
         recorded.events = report
             .detections
             .into_iter()

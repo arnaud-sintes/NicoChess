@@ -44,6 +44,7 @@ pub mod server;
 pub mod stage;
 pub mod store;
 pub mod synthetic;
+pub mod tags;
 pub mod tracker;
 pub mod video;
 pub mod vision;

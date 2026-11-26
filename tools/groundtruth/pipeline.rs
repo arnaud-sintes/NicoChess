@@ -38,6 +38,10 @@ struct Window {
     skew_n: u64,
     skew_max: f64,
     unpaired: u64,
+    /// Looks the tracker did not make (the pictures were the same as the ones last looked at, the board quiet, the analysis
+    /// behind: recordings of format 7), and seconds of pictures with a hand or an arm over the board that fall in the window.
+    thinned: u64,
+    occluded_s: f64,
     kept: u64,
     kept_gap_max: f64,
     moves: u64,
@@ -118,6 +122,7 @@ fn main() {
                     }
                 }
                 w.unpaired += event["unpaired"].as_array().map_or(0, |v| v.len() as u64);
+                w.thinned += u64::from(event["thin"] == true);
                 // The columns are those of the first camera, the one that matters most for the board.
                 if let Some(view) = event["views"].as_array().and_then(|v| v.iter().find(|v| v["cam"] == 0)) {
                     let age = view["age_ms"].as_f64().unwrap_or(0.0);
@@ -146,6 +151,18 @@ fn main() {
                         w.kept_gap_max = w.kept_gap_max.max((at - last) * 1000.0);
                     }
                     last_kept = Some(at);
+                }
+            }
+            "occlusion" => {
+                // A stretch of occluded pictures of camera 1 (told when it ended): its seconds go to the windows it covers.
+                if event["cam"].as_u64().unwrap_or(0) == 0
+                    && let (Some(from), Some(to)) = (event["from"].as_f64(), event["to"].as_f64())
+                {
+                    let (first, last) = ((from / width).floor().max(0.0) as u64, (to / width).floor().max(0.0) as u64);
+                    for k in first..=last {
+                        let (lo, hi) = (k as f64 * width, (k + 1) as f64 * width);
+                        windows.entry(k).or_default().occluded_s += (to.min(hi) - from.max(lo)).max(0.0);
+                    }
                 }
             }
             "detect" => w.moves += event["moves"].as_array().map_or(1, |m| m.len() as u64),
@@ -195,9 +212,13 @@ fn main() {
         "skew = how far in time, in ms either way, the pictures of the other views were from the picture that began the look (recordings of format 6"
     );
     println!("and later; mean and max); unpaired = looks in which a view took part and got no picture, none being near enough in time.");
+    println!(
+        "thin = looks that were skipped (the pictures were the same as the ones last looked at, the board quiet and sure, the analysis behind; recordings of"
+    );
+    println!("format 7 and later); hand s = seconds of camera 1's pictures with a hand or an arm over the board (the `occlusion` lines).");
     println!();
     println!(
-        "{:>7} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>5} {:>6} {:>8} {:>8} {:>6} {:>7}",
+        "{:>7} {:>5} {:>6} {:>7} {:>7} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>5} {:>6} {:>8} {:>8} {:>5} {:>6} {:>6} {:>7}",
         "from s",
         "looks",
         "per s",
@@ -213,6 +234,8 @@ fn main() {
         "skew ms",
         "skew max",
         "unpair",
+        "thin",
+        "hand s",
         "moves",
         "unsure"
     );
@@ -225,7 +248,7 @@ fn main() {
         behind += usize::from(is_behind);
         let mean = |sum: f64, n: u64| if n == 0 { 0.0 } else { sum / n as f64 };
         println!(
-            "{:>7.0} {:>5} {:>6.1} {:>7.1} {:>7.0} {:>8.0} {:>8.0} {:>7.0} {:>7} {:>8.0} {:>8.0} {:>5.0} {:>8.0} {:>8.0} {:>6} {:>6} {:>7} {}",
+            "{:>7.0} {:>5} {:>6.1} {:>7.1} {:>7.0} {:>8.0} {:>8.0} {:>7.0} {:>7} {:>8.0} {:>8.0} {:>5.0} {:>8.0} {:>8.0} {:>6} {:>5} {:>6.1} {:>6} {:>7} {}",
             *key as f64 * width,
             w.looks,
             w.looks as f64 / width,
@@ -241,6 +264,8 @@ fn main() {
             mean(w.skew_sum, w.skew_n),
             w.skew_max,
             w.unpaired,
+            w.thinned,
+            w.occluded_s,
             w.moves,
             w.unsure,
             if is_behind { "BEHIND" } else { "" }

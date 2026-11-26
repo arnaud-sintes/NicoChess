@@ -16,7 +16,7 @@ use crate::depthlink::{AlignOutcome, AlignRequest, DepthLink};
 use crate::game::{self, GameRecord, TimeControl};
 use crate::picture::{self, Picture};
 use crate::pipeline::{Fed, Pipe};
-use crate::record::{RecordOptions, Recorder, SessionMeta};
+use crate::record::{LookMade, RecordOptions, Recorder, SessionMeta};
 use crate::roles::{self, Role, Roles};
 use crate::stage::Stamped;
 use crate::store::{Store, Summary};
@@ -127,11 +127,21 @@ pub struct EngineConfig {
     /// The analysis thread waits this long after each picture it takes: an analysis that cannot keep up with the camera,
     /// for the tests of what happens then. Nothing sets it in the program.
     pub analysis_delay: Duration,
+    /// Every look that is made (not one that is skipped) takes this long more: an analysis that cannot keep up while a game is
+    /// played, to see what the program does then (`NICOCHESS_ANALYSIS_DELAY_MS`, for testing only).
+    pub look_delay: Duration,
+    /// When the analysis may skip the look at a picture that is the same as the last one looked at (see `analysis::Thin`):
+    /// only while it is behind the cameras, unless `--thin` says otherwise.
+    pub thin: analysis::Thin,
+    /// How long the board must have been quiet for a look to be skipped: `tags::QUIET_FOR`; the tests' games are quick.
+    pub thin_quiet: Duration,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
+            thin: analysis::Thin::default(),
+            thin_quiet: crate::tags::QUIET_FOR,
             idle_timeout: Duration::from_secs(60),
             game_timeout: Duration::from_secs(30 * 60),
             tracker: TrackerConfig::default(),
@@ -144,6 +154,7 @@ impl Default for EngineConfig {
             fresh: FRESH,
             rate: None,
             analysis_delay: Duration::ZERO,
+            look_delay: Duration::ZERO,
         }
     }
 }
@@ -496,6 +507,7 @@ pub struct Engine {
     /// The pictures of every source and the commands, for the analysis thread (see the module `analysis`).
     inbox: Arc<Inbox>,
     analysis_delay: Duration,
+    look_delay: Duration,
 }
 
 impl Drop for Engine {
@@ -578,7 +590,9 @@ impl Engine {
         });
         let inbox = Inbox::new(analysis::ANALYSIS_BUDGET);
         let tview = TrackerView::of(&tracker);
-        let analyzer = Analyzer::new(tracker);
+        let mut analyzer = Analyzer::new(tracker);
+        analyzer.set_thin(config.thin);
+        analyzer.set_thin_quiet(config.thin_quiet);
         let engine = Arc::new(Engine {
             inner: Mutex::new(Inner {
                 roles: Roles::new(config.idle_timeout, config.game_timeout),
@@ -629,6 +643,7 @@ impl Engine {
             save_lock: Mutex::new(()),
             inbox: Arc::clone(&inbox),
             analysis_delay: config.analysis_delay,
+            look_delay: config.look_delay,
         });
         engine.spawn_analysis(analyzer);
         engine
@@ -1241,14 +1256,12 @@ impl Engine {
             interval: self.track_interval(),
             fresh: self.fresh,
             begun_at: inner.begun_at,
+            behind: self.inbox.backlog().is_behind(),
         }
     }
 
     /// The analysis thread takes a picture: the depth camera's alignment is put to use, and the tracker looks if it is time.
     fn analyse(&self, analyzer: &mut Analyzer, item: Item, backlog: Backlog) {
-        if !self.analysis_delay.is_zero() {
-            thread::sleep(self.analysis_delay);
-        }
         let lost = self.inbox.take_lost();
         if lost.iter().sum::<u64>() > 0 {
             let (count, cap) = (lost.iter().sum::<u64>(), self.inbox.budget().cap() >> 20);
@@ -1270,8 +1283,24 @@ impl Engine {
         let interval = self.track_interval();
         analyzer.deliver(item);
         // Each look is published before the next is made: what a look led to may put the tracker back on the game's position.
+        let mut looked = false;
         while let Some(look) = analyzer.next_look(&mut || self.look_context(), interval) {
+            looked = true;
+            self.simulate_slow_look(&look);
             self.publish_look(analyzer, look, backlog);
+        }
+        // A picture takes `analysis_delay` all the same when no look was made (tests of an analysis that cannot keep up).
+        if !looked && !self.analysis_delay.is_zero() {
+            thread::sleep(self.analysis_delay);
+        }
+    }
+
+    /// A look that was made takes `analysis_delay` (tests of an analysis that cannot keep up with the camera): not a look
+    /// that was skipped, which is the point of skipping it.
+    fn simulate_slow_look(&self, look: &Look) {
+        let delay = self.analysis_delay + self.look_delay;
+        if !delay.is_zero() && !look.thinned {
+            thread::sleep(delay);
         }
     }
 
@@ -1280,6 +1309,7 @@ impl Engine {
         let interval = self.track_interval();
         let backlog = self.inbox.backlog();
         while let Some(look) = analyzer.flush_look(&mut || self.look_context(), interval) {
+            self.simulate_slow_look(&look);
             self.publish_look(analyzer, look, backlog);
         }
     }
@@ -1291,7 +1321,23 @@ impl Engine {
         let mut guard = self.inner.grab();
         let lock_wait = asked_lock.elapsed();
         let inner = &mut *guard;
-        let Look { at, started, step, fed, skews_us, trigger, released, flushed, unpaired, active, views_changed, detection } = look;
+        let Look {
+            at,
+            started,
+            step,
+            fed,
+            skews_us,
+            trigger,
+            released,
+            flushed,
+            unpaired,
+            active,
+            views_changed,
+            thinned,
+            tags,
+            occlusions,
+            detection,
+        } = look;
         // Commands run between pictures, in this thread: the game cannot have ended since the look began (a game that ended
         // while its pictures waited has no looks: the context said it was not played).
         if inner.mode != Mode::Playing {
@@ -1311,7 +1357,9 @@ impl Engine {
             .map(|(i, p)| Fed { view: p.view, seq: p.seq, captured: p.captured, waited: p.waited, skew_ms: skew_ms(i) })
             .collect();
         let without: Vec<usize> = (0..VIEWS).filter(|&v| unpaired[v]).collect();
-        let feed_note = inner.pipe.fed(started, lock_wait, step, &seen, &without);
+        let mut feed_note = inner.pipe.fed(started, lock_wait, step, &seen, &without);
+        feed_note.thin = thinned;
+        inner.pipe.tagged(&tags, thinned);
         inner.pipe.backlog(&backlog);
         inner.backlog = backlog;
         // What the recording will say about this picture (see the module record).
@@ -1370,6 +1418,10 @@ impl Engine {
         if let Some(recorder) = inner.recorder.as_mut() {
             // Every look is noted, also when the picture itself is not kept: the lag is wanted at all times.
             recorder.event(now, "pipe", feed_note.json());
+            // A stretch of pictures with a hand or an arm over the board is told when it ends, once.
+            for o in &occlusions {
+                recorder.occlusion(o.view, o.from, o.to, o.pictures, o.peak);
+            }
             if recorder.records_every_picture() {
                 // Every picture was kept as it came: the recording only says which of them this look was given. The
                 // tracker may be given a picture that came before the recording began: it is kept now if it is not (a
@@ -1384,7 +1436,7 @@ impl Engine {
                     });
                     given.push((picture.view, picture.seq, skew_ms(i)));
                 }
-                recorder.look(now, &given, status_name(status), at, released, flushed);
+                recorder.look(now, &given, status_name(status), LookMade { tracker_at: at, released, flushed, thinned });
             } else if keep_picture {
                 let pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|p| (p.view, Arc::clone(&p.image))).collect();
                 recorder.frames(now, &pictures, status_name(status), loud);
@@ -3098,6 +3150,9 @@ mod tests {
             unpaired: [false; VIEWS],
             active: [false; VIEWS],
             views_changed: false,
+            thinned: false,
+            tags: Vec::new(),
+            occlusions: Vec::new(),
             detection: Detection::Move { mv: e4, since: Instant::now(), promotion_guess: false },
         };
         // The game ended while the picture waited: what the tracker found in it is not put in the game.

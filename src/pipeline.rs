@@ -8,6 +8,7 @@
 //! call is a few additions: nothing here waits, allocates much, or writes.
 
 use crate::analysis::Backlog;
+use crate::tags::Tag;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -126,6 +127,10 @@ pub struct ViewFigures {
     pub skew: Hist,
     /// Looks in which this view took part and was given no picture, because none was captured near enough in time.
     pub unpaired: u64,
+    /// Pictures that a glance found to be the same as the one before them, and pictures with a hand or an arm over the
+    /// board (see the module `tags`): information only, the tracker looks at them all the same.
+    pub duplicates: u64,
+    pub occluded: u64,
 }
 
 /// The figures of a stretch of play.
@@ -135,6 +140,9 @@ pub struct Sets {
     /// the analysis thread waited for the engine's lock to publish what the look found.
     pub feeds: u64,
     pub behind: u64,
+    /// Looks that were skipped because the analysis was behind and the board was quiet (see `analysis::Thin`): the
+    /// pictures were kept, the tracker was told that one more still picture went by.
+    pub thinned: u64,
     pub step: Hist,
     pub lock: Hist,
     /// At each look: how many pictures waited for the analysis, and how old (in ms, since its capture) the oldest was.
@@ -148,6 +156,7 @@ impl Sets {
         Sets {
             feeds: 0,
             behind: 0,
+            thinned: 0,
             step: Hist::default(),
             lock: Hist::default(),
             waiting: Hist::default(),
@@ -177,6 +186,8 @@ pub struct FeedNote {
     pub views: Vec<ViewNote>,
     /// Views that took part and were given no picture (none was near enough in time).
     pub unpaired: Vec<usize>,
+    /// The look was skipped (see `analysis::Thin`).
+    pub thin: bool,
 }
 
 pub struct ViewNote {
@@ -215,6 +226,9 @@ impl FeedNote {
         let mut note = json!({"step_ms": round1(self.step_ms), "lock_ms": round1(self.lock_ms), "views": views});
         if !self.unpaired.is_empty() {
             note["unpaired"] = json!(self.unpaired);
+        }
+        if self.thin {
+            note["thin"] = json!(true);
         }
         note
     }
@@ -261,7 +275,7 @@ impl Pipe {
     /// The tracker looked at `pictures`, starting at `started`, after `lock` waiting for the engine's lock, and took
     /// `step` to do it.
     pub fn fed(&mut self, started: Instant, lock: Duration, step: Duration, pictures: &[Fed], unpaired: &[usize]) -> FeedNote {
-        let mut note = FeedNote { step_ms: ms(step), lock_ms: ms(lock), views: Vec::new(), unpaired: unpaired.to_vec() };
+        let mut note = FeedNote { step_ms: ms(step), lock_ms: ms(lock), views: Vec::new(), unpaired: unpaired.to_vec(), thin: false };
         for &view in unpaired {
             for sets in [&mut self.total, &mut self.window] {
                 if let Some(figures) = sets.views.get_mut(view) {
@@ -309,6 +323,19 @@ impl Pipe {
         note
     }
 
+    /// What a glance said of the pictures of this look, and whether the look was skipped (see `analysis::Thin`).
+    pub fn tagged(&mut self, tags: &[(usize, Tag)], thinned: bool) {
+        for sets in [&mut self.total, &mut self.window] {
+            sets.thinned += u64::from(thinned);
+            for &(view, tag) in tags {
+                if let Some(figures) = sets.views.get_mut(view) {
+                    figures.duplicates += u64::from(tag.duplicate);
+                    figures.occluded += u64::from(tag.occluded);
+                }
+            }
+        }
+    }
+
     /// How many pictures waited for the analysis at this look, and how old the oldest was.
     pub fn backlog(&mut self, backlog: &Backlog) {
         for sets in [&mut self.total, &mut self.window] {
@@ -331,11 +358,12 @@ impl Pipe {
                     "age_ms": v.age.json(), "wait_ms": v.wait.json(), "capture_gap_ms": v.capture_gap.json(),
                     "longest_gap_ms": if v.fed_gap.count() > 0 { json!(round1(v.fed_gap.max())) } else { Value::Null },
                     "pair_skew_ms": v.skew.json(), "unpaired": v.unpaired,
+                    "duplicates": v.duplicates, "occluded": v.occluded,
                 }),
             );
         }
         json!({
-            "feeds": self.total.feeds, "behind": self.total.behind,
+            "feeds": self.total.feeds, "behind": self.total.behind, "thinned": self.total.thinned,
             "step_ms": self.total.step.json(), "lock_ms": self.total.lock.json(), "views": views,
             "waiting": self.total.waiting.json(), "oldest_waiting_ms": self.total.oldest.json(),
         })
@@ -373,6 +401,12 @@ impl Pipe {
                 String::new()
             },
         );
+        if sets.thinned > 0 {
+            line.push_str(&format!(
+                ", {} looks skipped (the board was quiet and the same, the analysis behind; the pictures are kept)",
+                sets.thinned
+            ));
+        }
         for (i, v) in sets.views.iter().enumerate() {
             if v.received == 0 && v.fed == 0 && v.unpaired == 0 {
                 continue;
@@ -388,6 +422,9 @@ impl Pipe {
             ));
             if v.skew.count() > 0 || v.unpaired > 0 {
                 line.push_str(&format!(", {} paired {} away in time, {} looks without it", v.skew.count(), v.skew.text(), v.unpaired));
+            }
+            if v.occluded > 0 {
+                line.push_str(&format!(", {} with a hand or arm over the board", v.occluded));
             }
         }
         Some(line)

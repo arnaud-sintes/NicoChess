@@ -68,8 +68,25 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// not as the newest that had come (format 5 and before): a replay of every picture takes them the same way as the recording
 /// did. A `look` line also has `released` (the number of the newest picture of each view that had come to the analysis when
 /// the look was made, which a look that waited for a later picture needs to be put where it was made) and, when the analysis
-/// was asked to decide at once, `flushed`. A recording of format 5 is read as before.
-pub const FORMAT: u32 = 6;
+/// was asked to decide at once, `flushed`. A recording of format 5 is read as before. Format 7 added `thin` to a `look` line
+/// (the tracker did not look at its pictures: they were the same as the ones it last looked at, it was sure of the board, and
+/// the analysis was behind; the pictures are in the recording, and a replay skips the look too), the `occlusion` line (a stretch
+/// of pictures with a hand or an arm over the board, told when it ended), and `thinned`, `duplicates` and `occluded` in the
+/// figures of the `pipe` and `closed` lines. A recording of format 6 is read as before (it has no skipped look).
+pub const FORMAT: u32 = 7;
+
+/// How a look of the tracker was made, for its `look` line (see [`Recorder::look`]).
+#[derive(Clone, Copy, Debug)]
+pub struct LookMade {
+    /// The capture time of the picture that began the look: the time the tracker was given.
+    pub tracker_at: Instant,
+    /// The number of the newest picture of each view that had come to the analysis when the look was made.
+    pub released: [u64; VIEWS],
+    /// The analysis was told to decide at once (a command, or no picture for a while).
+    pub flushed: bool,
+    /// The tracker did not look at the pictures (see `analysis::Thin`).
+    pub thinned: bool,
+}
 
 /// The memory that pictures waiting for the encoder or the disk may take, in bytes: 2 GB is about 700 pictures of
 /// 1280x720, 14 seconds of two cameras at 25 pictures a second. Only an encoder or a disk that is much too slow gets there.
@@ -487,15 +504,8 @@ impl Recorder {
     /// Notes which pictures the tracker was given together this time (`--record-all`: the pictures themselves were
     /// kept by [`source`](Self::source) as they came), with the status it was in afterwards. Call it before the events
     /// that the look led to.
-    pub fn look(
-        &mut self,
-        at: Instant,
-        pictures: &[(usize, u64, Option<f32>)],
-        status: &'static str,
-        tracker_at: Instant,
-        released: [u64; VIEWS],
-        flushed: bool,
-    ) {
+    pub fn look(&mut self, at: Instant, pictures: &[(usize, u64, Option<f32>)], status: &'static str, made: LookMade) {
+        let LookMade { tracker_at, released, flushed, thinned } = made;
         if !self.every_picture {
             return;
         }
@@ -515,6 +525,19 @@ impl Recorder {
         if flushed {
             line["flushed"] = json!(true);
         }
+        // The tracker did not look at these pictures (they are in the recording all the same): a replay does not either.
+        if thinned {
+            line["thin"] = json!(true);
+        }
+        self.send(Msg::Line(line.to_string()));
+    }
+
+    /// A stretch of pictures of a view with a hand or an arm over the board, told when it ended (the pictures are kept all
+    /// the same): `from` and `to` are the capture times of its first and last picture, `pictures` how many, `peak` the most
+    /// squares covered at once. It is information for whoever studies the recording; a replay does not use it.
+    pub fn occlusion(&self, view: usize, from: Instant, to: Instant, pictures: u32, peak: usize) {
+        let secs = |at: Instant| (at.saturating_duration_since(self.begun).as_secs_f64() * 1000.0).round() / 1000.0;
+        let line = json!({"t": self.seconds(to), "type": "occlusion", "cam": view, "from": secs(from), "to": secs(to), "pictures": pictures, "peak": peak});
         self.send(Msg::Line(line.to_string()));
     }
 
@@ -1377,7 +1400,12 @@ mod tests {
                 recorder.source(&stamped(2, n / 3, at + Duration::from_millis(20), &depth));
             }
             if n % 2 == 0 {
-                recorder.look(at + Duration::from_millis(20), &[(0, n, None), (1, n, Some(15.0))], "watching", at, [n, n, n / 3], false);
+                recorder.look(
+                    at + Duration::from_millis(20),
+                    &[(0, n, None), (1, n, Some(15.0))],
+                    "watching",
+                    LookMade { tracker_at: at, released: [n, n, n / 3], flushed: false, thinned: false },
+                );
             }
         }
         recorder.flush_gaps();
@@ -1527,7 +1555,12 @@ mod tests {
         let mut recorder = Recorder::begin(&RecordOptions::new(dir.clone(), Duration::ZERO), meta(), begun).unwrap();
         let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([1, 2, 3])));
         recorder.source(&stamped(0, 1, begun, &image));
-        recorder.look(begun, &[(0, 1, None)], "watching", begun, [1, 0, 0], false);
+        recorder.look(
+            begun,
+            &[(0, 1, None)],
+            "watching",
+            LookMade { tracker_at: begun, released: [1, 0, 0], flushed: false, thinned: false },
+        );
         let folder = recorder.folder().to_path_buf();
         recorder.close();
         let lines = read_lines(&folder);

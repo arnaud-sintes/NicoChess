@@ -86,7 +86,13 @@ pub struct Sampler {
     points: Vec<(f32, f32)>,
     /// For each of the `GRID * GRID` points of a square: is it in the middle?
     middle: Vec<bool>,
+    /// Which sampler this is (one is made for every calibration): a glance says it, so that glances made with other
+    /// squares than these are not compared.
+    id: u64,
 }
+
+/// The number of the next sampler.
+static NEXT_SAMPLER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Sampler {
     pub fn new(calibration: &Calibration) -> Option<Self> {
@@ -110,7 +116,7 @@ impl Sampler {
         }
         let inside = |u: f32| (MIDDLE.0..=MIDDLE.1).contains(&u);
         let middle = (0..GRID * GRID).map(|k| inside(at(k % GRID)) && inside(at(k / GRID))).collect();
-        Some(Sampler { points, middle })
+        Some(Sampler { points, middle, id: NEXT_SAMPLER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) })
     }
 
     /// For each square, the squares whose piece may lean over it in the picture: the neighbours that lie below it
@@ -222,6 +228,50 @@ impl Sampler {
             out.push(Features { v });
         }
         out
+    }
+}
+
+/// The points of a square that a glance reads (indices into the `GRID` points of a side): all inside the middle, so that a
+/// piece standing on the square shows and its neighbours do not.
+const GLANCE_PICK: [usize; 3] = [3, 6, 8];
+
+/// A rough look at the board, cheap to make: the colour of the middle of each of the 64 squares, from a few points. It is
+/// not what the tracker reads (see [`Features`]); it says whether a picture is the same as another one, and where it is not.
+#[derive(Clone)]
+pub struct Glance {
+    pub cells: [[f32; 3]; 64],
+    /// The sampler that made it (see `Sampler`): glances of different samplers look at different places.
+    pub sampler: u64,
+}
+
+impl Sampler {
+    /// A glance at a picture: about a sixteenth of the pixels that [`features`](Self::features) reads. Every point is the
+    /// mean of a block of 3 x 3 pixels, a square the mean of nine points (81 pixels, so the sensor's noise is about a
+    /// grey level).
+    pub fn glance(&self, image: &RgbImage) -> Glance {
+        let (w, h) = (image.width() as i32, image.height() as i32);
+        let per_square = GRID * GRID;
+        let mut cells = [[0.0f32; 3]; 64];
+        for (cell, square) in cells.iter_mut().zip(self.points.chunks_exact(per_square)) {
+            let mut sum = [0.0f32; 3];
+            for &j in &GLANCE_PICK {
+                for &i in &GLANCE_PICK {
+                    let (x, y) = square[j * GRID + i];
+                    let (cx, cy) = (x.round() as i32, y.round() as i32);
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let px = image.get_pixel((cx + dx).clamp(0, w - 1) as u32, (cy + dy).clamp(0, h - 1) as u32);
+                            for c in 0..3 {
+                                sum[c] += px[c] as f32;
+                            }
+                        }
+                    }
+                }
+            }
+            let n = (GLANCE_PICK.len() * GLANCE_PICK.len() * 9) as f32;
+            *cell = [sum[0] / n, sum[1] / n, sum[2] / n];
+        }
+        Glance { cells, sampler: self.id }
     }
 }
 

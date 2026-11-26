@@ -2,7 +2,7 @@
 
 Pilot of a way to read the real game from the pictures of a recording, independently of the tracker, so that the
 tracker's decisions can be compared with it and re-tested after a change. Not part of the program: nothing here is
-shipped, and `cargo build` does not build it (the three tools are Cargo examples, built on request).
+shipped, and `cargo build` does not build it (the tools are Cargo examples, built on request).
 
 The idea, in three steps:
 
@@ -28,11 +28,19 @@ From the repository root (a recording is only read, never changed):
     cargo run --release --example compare -- <recording folder> <truth.json> [--saved <game.json>] [--replay] [--late 3] [--all]
 
     cargo run --release --example pipeline -- <recording folder> [--window 10] [--age 500] [--gap 300]
+    cargo run --release --example tags -- <recording folder> [--camera 0] [--truth <truth.json>] [--csv <file>]
+
+`tags` is for tuning the tags of the pictures (see ENVIRONMENT.md, "Tags and skipped looks"): it makes a glance of each picture of a
+camera with the calibration in force, and prints the share of pictures that are the same as the one before, the stretches with a hand or an arm over the
+board, how many looks a program that skips the ones it may would skip, and (with a truth) how far each move of the game is from the nearest
+stretch; `--csv` writes one line per picture. `compare <recording> <truth.json> --replay --thin` replays with every look skipped that the rule allows
+(`--replay-thin` of the program), to see whether skipping changes what the tracker finds: on the five recordings of 2026-11-24 it did not (below).
 
 `pipeline` is not about the game but about the program: it prints, window by window, how the pictures got to the
 tracker (the `pipe` lines of a recording made by 0.11.2 or later: looks a second, how long a look took, how long the
 analysis thread waited for the engine's lock, the age of the picture when the tracker started on it, pictures never looked
-at, the longest wait between looks, the time between pictures as the camera made them) beside the moves and unsure
+at, the longest wait between looks, the time between pictures as the camera made them; with format 7 also `thin`, the looks that were skipped,
+and `hand s`, the seconds with a hand or an arm over the board) beside the moves and unsure
 stretches of the same window, and marks the windows that were behind (`--age`: a picture older than that many ms,
 `--gap`: more than that between two looks). Use it to tell a failure that came with a lag from one that did not.
 On a recording without `pipe` lines it says so and shows only the pictures that were kept and the gaps between them.
@@ -51,6 +59,23 @@ A recording made with video (`cam0.mkv` instead of `frames/`, see ENVIRONMENT.md
 `ffmpeg`, which must be found (`--ffmpeg <path>` on `keyframes`, or `NICOCHESS_FFMPEG`, or next to the program, or on
 PATH); `compare --replay` reads it the same way. The `index.json` then names a picture as `cam0.mkv#1234` (the video and the
 number of the picture in it) instead of a file.
+
+### Does skipping looks change what the tracker finds?
+
+Measured on the four recordings of 2026-11-24 that have a blind-read truth, with `compare <recording> <truth.json> --replay` and
+with `--replay --thin` (every look skipped that the rule allows, behind or not, on top of a replay as the tracker saw the pictures):
+
+| Recording | Moves of the truth | Found by the replay | Looks skipped | Difference in the report |
+|---|---|---|---|---|
+| 13-39-44 | 13 | 5 | 83 of 1723 pictures (5%) | none (0 lines differ) |
+| 13-27-41 | 25 | 12 | 266 of 4037 (7%) | none |
+| 13-14-11 | 32 | 3 | 1026 of 5121 (20%) | none |
+| 13-21-41 | 51 | 16 | 491 of 4738 (10%) | none |
+
+The same moves are found at the same times, with the same wrong and missed moves: skipping the looks at pictures that are the same
+changes nothing there (the numbers of moves found are low because these recordings lost about half of their pictures when they were made;
+what matters here is that the two reports are the same). The share skipped is small because the board is rarely quiet for 3 s in these games. The replays of
+`13-36-23` and `13-21-41` made without `--thin` give the same reports as before the tags and the skipping existed (0 lines differ).
 
 ### Reading blind
 

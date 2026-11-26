@@ -1245,6 +1245,129 @@ mod tests {
         assert_eq!(live, replayed, "a replay of every picture finds the moves the program found, in the same order\n{}", all.text);
     }
 
+    /// An engine with a slow analysis that may skip looks (`thin`), whose board is quiet after 150 ms (a test's game is quick).
+    fn rig_thin(name: &str, thin: crate::analysis::Thin, delay: Duration) -> Rig {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let record = Some(crate::record::RecordOptions::keeping_all(dir.join("recordings")));
+        let config = EngineConfig { record, analysis_delay: delay, thin, thin_quiet: Duration::from_millis(150), ..patient() };
+        let engine = Engine::new(config, store, dir.join("calibration.json"), None);
+        let source = SourceSpec::Demo { move_interval: Duration::from_millis(400) };
+        engine.spawn_capture(camera::factory(source, Duration::from_millis(60))).unwrap();
+        let handler = handler(Arc::clone(&engine), 8);
+        Rig { engine, handler, dir }
+    }
+
+    /// Plays the demo game on the rig and returns the recording's lines and the folder, once the game is over, the pictures
+    /// that waited have been looked at, and the recording is closed.
+    fn play_demo_game(rig: &Rig) -> (Vec<Value>, std::path::PathBuf) {
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
+        wait_for("the backlog to be gone", || rig.engine.backlog().waiting == 0);
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        (events, folder)
+    }
+
+    fn kind_of(e: &Value) -> String {
+        e["type"].as_str().unwrap().to_string()
+    }
+
+    fn live_moves(events: &[Value]) -> Vec<Vec<String>> {
+        events
+            .iter()
+            .filter(|e| kind_of(e) == "detect")
+            .map(|e| e["moves"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn an_analysis_that_is_behind_skips_the_looks_at_a_quiet_board_and_catches_up_with_every_move_found() {
+        use crate::analysis::Thin;
+        use crate::replay::{Feed, TrackerOverrides, replay_folder, replay_folder_with};
+        // Pictures every 60 ms, a move every 400 ms, 90 ms to look at a picture: looking at all of them (seven for a move)
+        // takes 630 ms for the 400 ms the camera needs, so the analysis falls behind; looking at the few that are not the
+        // same as the ones before it keeps up.
+        let never = rig_thin("thin-never", Thin::Never, Duration::from_millis(90));
+        let (never_events, _) = play_demo_game(&never);
+        let thin = rig_thin("thin-behind", Thin::Behind, Duration::from_millis(90));
+        let (events, folder) = play_demo_game(&thin);
+
+        // Nothing is lost either way: every move, in order, and every picture is in the recording.
+        let live = live_moves(&events);
+        assert_eq!(live.iter().map(Vec::len).sum::<usize>(), 33, "{live:?}");
+        assert_eq!(live, live_moves(&never_events), "skipping looks finds the moves that looking at every picture finds");
+        let closed = events.last().unwrap();
+        assert_eq!(closed["dropped"], 0, "no picture was lost");
+        assert_eq!(closed["source"]["kept"], closed["source"]["offered"], "{}", closed["source"]);
+        let never_closed = never_events.last().unwrap();
+        assert_eq!(never_closed["pipeline"]["thinned"], 0, "no look is skipped when nobody asked for it");
+        assert!(never_events.iter().all(|e| e.get("thin").is_none()));
+
+        // Looks were skipped, the recording says which, and the figures agree.
+        let thinned = closed["pipeline"]["thinned"].as_u64().unwrap();
+        assert!(thinned > 20, "{} looks skipped: {}", thinned, closed["pipeline"]);
+        let flagged = events.iter().filter(|e| kind_of(e) == "look" && e["thin"] == true).count() as u64;
+        assert_eq!(flagged, thinned, "every skipped look is flagged in the recording");
+        let notes = events.iter().filter(|e| kind_of(e) == "pipe" && e["thin"] == true).count() as u64;
+        assert_eq!(notes, thinned);
+
+        // The backlog drained where it grew before.
+        let lag = |closed: &Value| closed["pipeline"]["oldest_waiting_ms"]["max"].as_f64().unwrap_or(0.0);
+        assert!(lag(never_closed) > 3000.0, "looking at every picture falls well behind: {} ms", lag(never_closed));
+        assert!(
+            lag(closed) < lag(never_closed) / 2.0,
+            "skipping looks keeps up better: {} ms against {} ms",
+            lag(closed),
+            lag(never_closed)
+        );
+        eprintln!(
+            "thinning figures: {thinned} of {} looks skipped; oldest waiting picture at most {:.0} ms with skipping, {:.0} ms without",
+            closed["pipeline"]["feeds"],
+            lag(closed),
+            lag(never_closed)
+        );
+
+        // The replay skips the same looks and finds the live game again, from the looks and from every picture.
+        let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        assert_eq!(report.summary.thinned as u64, thinned, "{}", report.text);
+        check_every_picture_and_replay(&events, &report, &[0]);
+        let all = replay_folder_with(&folder, &TrackerOverrides::default(), false, Feed::EveryPicture).unwrap();
+        assert_eq!(all.summary.thinned as u64, thinned, "{}", all.text);
+        assert_eq!((all.summary.wrong, all.summary.behind), (0, 0), "{}", all.text);
+        let replayed: Vec<Vec<String>> = all.detections.iter().map(|f| f.uci.clone()).collect();
+        assert_eq!(live, replayed, "a replay of every picture finds the moves the program found\n{}", all.text);
+    }
+
+    #[test]
+    fn looks_may_be_skipped_whenever_the_board_is_quiet_when_asked_to_and_not_otherwise() {
+        use crate::analysis::Thin;
+        // No lag here, so the rule `Behind` skips nothing; `Always` skips what it may and finds the same game.
+        let behind = rig_thin("thin-keeps-up", Thin::Behind, Duration::ZERO);
+        let (behind_events, _) = play_demo_game(&behind);
+        assert_eq!(behind_events.last().unwrap()["pipeline"]["thinned"], 0, "the analysis keeps up: every look is made");
+        let always = rig_thin("thin-always", Thin::Always, Duration::ZERO);
+        let (events, folder) = play_demo_game(&always);
+        let thinned = events.last().unwrap()["pipeline"]["thinned"].as_u64().unwrap();
+        assert!(thinned > 20, "{thinned} looks skipped");
+        assert_eq!(live_moves(&events), live_moves(&behind_events), "the same moves");
+        assert_eq!(events.last().unwrap()["dropped"], 0);
+        // A replay that follows the recording skips the same looks; `--replay-thin` decides by the rule, on a program that
+        // is not behind, and finds the same game too.
+        let report = crate::replay::replay_folder(&folder, &crate::replay::TrackerOverrides::default(), false).unwrap();
+        assert_eq!(report.summary.thinned as u64, thinned, "{}", report.text);
+        assert_eq!((report.summary.wrong, report.summary.behind), (0, 0), "{}", report.text);
+    }
+
     #[test]
     fn a_move_typed_while_the_analysis_is_behind_waits_its_turn_and_the_recording_says_where_it_came() {
         // Pictures every 50 ms, 60 ms to look at each: the analysis falls a little further behind every second, so that a few

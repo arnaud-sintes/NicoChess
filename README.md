@@ -92,6 +92,8 @@ nicochess --replay recordings\2026-11-16_11-30-05 --replay-verbose
 nicochess --replay recordings --margin 9 --max-excess 80     # all the recordings, with other tuning values
 nicochess --record-all --ffmpeg C:\tools\ffmpeg\bin\ffmpeg.exe   # every picture of every camera, as video: five to twenty times smaller
 nicochess --replay recordings\2026-11-16_11-30-05 --replay-all   # a --record-all recording, picture by picture instead of as the tracker saw it
+nicochess --replay recordings\2026-11-16_11-30-05 --replay-thin  # skip the looks at pictures that are the same as the last one looked at (see ENVIRONMENT.md)
+nicochess --thin never                  # live: never skip a look (default: only while the analysis is behind the cameras)
 ```
 
 A recording has the pictures the detection was given (both cameras', when there are two), what it decided, and what the

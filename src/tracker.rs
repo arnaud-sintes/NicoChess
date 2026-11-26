@@ -20,7 +20,7 @@
 
 use crate::calibration::Calibration;
 use crate::game::{san_of, uci_of};
-use crate::vision::{ADAPT_WEIGHT, Cell, DIM, Features, Grid, Models, Sampler, difference, frame_change};
+use crate::vision::{ADAPT_WEIGHT, Cell, DIM, Features, Glance, Grid, Models, Sampler, difference, frame_change};
 use image::RgbImage;
 use serde::{Deserialize, Serialize};
 use shakmaty::{Chess, Color, Move, Position, Role, Square};
@@ -328,11 +328,35 @@ impl Gate {
         }
         self.last = Some(now);
         self.history.push_back((now, features.to_vec()));
-        // Pictures older than needed are dropped (one older than the span stays: it is what the next is compared with).
+        self.trim_history(now);
+        self.ready()
+    }
+
+    /// Pictures older than needed are dropped (one older than the span stays: it is what the next is compared with).
+    fn trim_history(&mut self, now: Instant) {
         while self.history.len() > 2 && self.history.get(1).is_some_and(|(at, _)| now.saturating_duration_since(*at) >= self.motion_span) {
             self.history.pop_front();
         }
-        self.ready()
+    }
+
+    /// Counts one more still picture of the run that is going on, one that is the same as the one before it: what
+    /// [`push`](Self::push) does with a picture that did not move, with the numbers of the picture before instead of
+    /// the numbers of this one (it is not looked at). False when there is no run to go on with.
+    fn repeat(&mut self, now: Instant) -> bool {
+        if self.run == 0 {
+            return false;
+        }
+        let Some((_, features)) = self.history.back().cloned() else { return false };
+        self.run += 1;
+        for (total, f) in self.sum.iter_mut().zip(&features) {
+            for d in 0..DIM {
+                total[d] += f.v[d];
+            }
+        }
+        self.last = Some(now);
+        self.history.push_back((now, features));
+        self.trim_history(now);
+        true
     }
 
     /// When the board became still, once it has been for long enough.
@@ -1056,6 +1080,45 @@ impl Tracker {
     /// The position the tracker believes the board shows.
     pub fn position(&self) -> &Chess {
         &self.position
+    }
+
+    /// A rough look at a picture of a camera, where the tracker knows the squares of that camera (see `vision::Glance`).
+    pub fn glance(&self, view: usize, image: &RgbImage) -> Option<Glance> {
+        self.views.get(view)?.sampler.as_ref().map(|sampler| sampler.glance(image))
+    }
+
+    /// The tracker is sure of the board and has nothing to wait for: it has seen it still, every camera that decides has
+    /// its squares learned and has been still for long enough, nothing is doubtful or held, no hand covers a square.
+    /// Looking at one more picture that is the same as the ones before then changes nothing but the count of still
+    /// pictures (see [`repeat_still`](Self::repeat_still)).
+    pub fn quiet(&self) -> bool {
+        if self.status() != Status::Watching || self.resync_pending || self.last_eval.is_none() || self.covered.iter().any(|&c| c) {
+            return false;
+        }
+        // A camera that counts and has not learned its squares learns them at the next confirmed position (a look does it).
+        if self.views.iter().any(|v| v.counts() && v.models.is_none()) {
+            return false;
+        }
+        let mut deciding = self.views.iter().filter(|v| v.judges() && !v.advisory).peekable();
+        deciding.peek().is_some() && deciding.all(|v| v.gate.ready().is_some())
+    }
+
+    /// Counts a picture of each of `views` as one more still picture, the same as the one the view had before, without
+    /// looking at it (no sampling, no scoring). Only when the tracker is [`quiet`](Self::quiet): then a look at such a picture
+    /// finds nothing, and the run of still pictures goes on as it does. False (and nothing done) when it is not quiet, or a
+    /// view has no run to go on with: the picture must then be looked at.
+    pub fn repeat_still(&mut self, views: &[usize], now: Instant) -> bool {
+        if !self.quiet() {
+            return false;
+        }
+        let counted = |v: &View| v.counts() && v.gate.run > 0;
+        if views.iter().any(|&i| self.views.get(i).is_none_or(|v| !counted(v))) {
+            return false;
+        }
+        for &i in views {
+            self.views[i].gate.repeat(now);
+        }
+        true
     }
 
     /// Sets (or clears) the calibration of the first camera. The look of the squares is learned again.
@@ -1908,6 +1971,75 @@ mod tests {
         let expected: Vec<String> = steps.iter().map(|s| uci_of(s.mv)).collect();
         assert_eq!(seen, expected);
         assert!(rig.tracker.position().is_checkmate());
+    }
+
+    #[test]
+    fn a_still_picture_that_is_the_same_can_be_counted_without_looking_at_it_and_the_game_is_followed_the_same() {
+        let steps = synthetic::game_steps(&OPERA_GAME);
+        let expected: Vec<String> = steps.iter().map(|s| uci_of(s.mv)).collect();
+        // Once with every picture looked at, once with a picture that is the same as the one before counted without a look
+        // whenever the tracker is quiet.
+        let mut outcomes: Vec<(Vec<String>, usize)> = Vec::new();
+        for thin in [false, true] {
+            let mut rig = Rig::new(Chess::default());
+            let mut skipped = 0usize;
+            let mut seen = Vec::new();
+            let mut previous: Option<PieceGrid> = None;
+            let mut show = |rig: &mut Rig, grid: &PieceGrid, times: usize, seen: &mut Vec<String>, previous: &mut Option<PieceGrid>| {
+                for _ in 0..times {
+                    rig.frames += 1;
+                    rig.now += Duration::from_millis(333);
+                    if thin && previous.as_ref() == Some(grid) && rig.tracker.quiet() && rig.tracker.repeat_still(&[0], rig.now) {
+                        skipped += 1;
+                        continue;
+                    }
+                    *previous = Some(*grid);
+                    let mut frame = synthetic::frame_from_grid(grid);
+                    synthetic::degrade(&mut frame, -15, 10, rig.frames);
+                    match rig.tracker.feed(&frame, rig.now) {
+                        Detection::Nothing => {}
+                        Detection::Move { mv, .. } => seen.push(uci_of(mv)),
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            };
+            show(&mut rig, &synthetic::start_grid(), 7, &mut seen, &mut previous);
+            for step in &steps {
+                let mut lifted = step.before;
+                lifted[usize::from(step.mv.from().unwrap())] = None;
+                show(&mut rig, &lifted, 1, &mut seen, &mut previous);
+                // A long still stretch after the move: this is where pictures are the same.
+                show(&mut rig, &step.after, 12, &mut seen, &mut previous);
+            }
+            assert!(rig.tracker.position().is_checkmate());
+            outcomes.push((seen, skipped));
+        }
+        assert_eq!(outcomes[0].0, expected);
+        assert_eq!(outcomes[1].0, expected, "the same moves, found from the same pictures, with looks skipped");
+        assert_eq!(outcomes[0].1, 0);
+        assert!(outcomes[1].1 > steps.len() * 3, "{} looks were skipped", outcomes[1].1);
+    }
+
+    #[test]
+    fn a_picture_is_not_counted_without_a_look_unless_the_tracker_is_quiet() {
+        let mut rig = Rig::new(Chess::default());
+        // Learning: nothing to repeat yet.
+        assert!(!rig.tracker.quiet() && !rig.tracker.repeat_still(&[0], rig.now));
+        rig.show(&synthetic::start_grid(), 7);
+        assert_eq!(rig.tracker.status(), Status::Watching);
+        assert!(rig.tracker.quiet());
+        // A view the tracker has no picture of cannot be repeated.
+        assert!(!rig.tracker.repeat_still(&[1], rig.now));
+        assert!(rig.tracker.repeat_still(&[0], rig.now + Duration::from_millis(40)));
+        // Pieces come and go: the board is moving, and it is looked at.
+        let steps = synthetic::game_steps(&["e4"]);
+        rig.show(&steps[0].after, 1);
+        assert_eq!(rig.tracker.status(), Status::Moving);
+        assert!(!rig.tracker.quiet() && !rig.tracker.repeat_still(&[0], rig.now));
+        // A hand-set position: the models are stale until a picture of it is seen.
+        rig.show(&steps[0].after, 5);
+        rig.tracker.set_position(positions_after(&["e4", "e5"])[2].clone());
+        assert!(!rig.tracker.quiet());
     }
 
     #[test]

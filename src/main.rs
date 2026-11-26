@@ -75,6 +75,15 @@ OPTIONS:
     --replay-all             with --replay: feed the tracker every picture of a recording made with --record-all,
                              one after the other at the moment it was captured, instead of the pictures it was
                              given live (how the program will use the pictures later)
+    --replay-thin            with --replay: skip the look at every picture that is the same as the one last looked
+                             at, on a board the tracker is sure of that has been quiet for seconds (what --thin
+                             always does live), to see whether that changes what it finds. A recording of a program
+                             that skipped looks is replayed with the same looks skipped, without this
+    --thin <never|behind|always>
+                             when the analysis may skip the look at a picture that is the same as the one last
+                             looked at (the pictures are kept all the same; the tracker is told that one more still
+                             picture went by): never; only while it is behind the cameras (a second or eight
+                             pictures late) [default]; or always, when it may
 
   Tuning the move detection:
     --stable-frames <N>      pictures in a row that must agree   [default: 3]
@@ -151,8 +160,16 @@ fn run() -> Result<()> {
         margin: args.opt_value_from_str("--margin")?,
         max_plies: args.opt_value_from_str("--max-plies")?,
         soft_margin: args.opt_value_from_str("--soft-margin")?,
+        thin: args.contains("--replay-thin"),
     };
     let tracker = overrides.apply(TrackerConfig::default());
+    let thin_option: Option<String> = args.opt_value_from_str("--thin")?;
+    if let Some(text) = &thin_option {
+        match nicochess::analysis::Thin::parse(text) {
+            Some(thin) => nicochess::analysis::set_global_thin(thin),
+            None => bail!("--thin takes never, behind or always, not {text:?}"),
+        }
+    }
 
     let record_all = args.contains("--record-all");
     let record = args.contains("--record") || record_all;
@@ -186,8 +203,8 @@ fn run() -> Result<()> {
         let feed = if replay_all { replay::Feed::EveryPicture } else { replay::Feed::AsLive };
         return replay::run(&path, &overrides, replay_verbose, feed);
     }
-    if replay_verbose || replay_all {
-        bail!("--replay-verbose and --replay-all go with --replay");
+    if replay_verbose || replay_all || overrides.thin {
+        bail!("--replay-verbose, --replay-all and --replay-thin go with --replay");
     }
     if record_budget_mb.is_some() && !record_all {
         bail!("--record-budget goes with --record-all");

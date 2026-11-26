@@ -11,7 +11,7 @@
 //!
 //! The pictures are fed at the times they were taken, so the replay is as fast as the computer, not the game.
 
-use crate::analysis::{Analyzer, Context as LookContext, Item, Pairing};
+use crate::analysis::{Analyzer, Context as LookContext, Item, Pairing, Thin};
 use crate::game::{fen_of, parse_fen, san_of, uci_of};
 use crate::record::{FORMAT, SessionMeta};
 use crate::tracker::{Detection, Status, Tracker, TrackerConfig};
@@ -35,6 +35,11 @@ pub struct TrackerOverrides {
     pub margin: Option<f32>,
     pub max_plies: Option<usize>,
     pub soft_margin: Option<f32>,
+    /// Skip the look at every picture that is the same as the one the tracker last looked at, on a board it is sure of that
+    /// has been quiet for seconds (`analysis::Thin::Always`), as the program does live only while it is behind the cameras;
+    /// the recorded decisions of a program that skipped looks are followed otherwise. To find out whether skipping changes
+    /// what the tracker finds.
+    pub thin: bool,
 }
 
 impl TrackerOverrides {
@@ -78,6 +83,9 @@ impl TrackerOverrides {
         if let Some(v) = self.soft_margin {
             parts.push(format!("soft_margin={v}"));
         }
+        if self.thin {
+            parts.push("thin=always".to_string());
+        }
         parts.join(", ")
     }
 }
@@ -100,6 +108,9 @@ pub struct Summary {
     pub behind: usize,
     /// Of the moves typed by hand during the game, how many the replay had found by itself.
     pub typed_found: usize,
+    /// Looks that were skipped (see `analysis::Thin`): the pictures were not looked at, the tracker was told that one more
+    /// still picture went by.
+    pub thinned: usize,
 }
 
 pub struct Report {
@@ -288,6 +299,8 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
     tracker.start(parse_fen(&meta.start_fen).context("the start position of the recording")?);
     // A recording of format 5 or before was made with the newest picture of the other camera, not the nearest in time.
     let mut analyzer = Analyzer::with_pairing(tracker, if meta.format >= 6 { Pairing::Nearest } else { Pairing::Newest });
+    // Looks are skipped as the recording says (or, with `--replay-thin`, wherever the rule allows).
+    analyzer.set_thin(if overrides.thin { Thin::Always } else { Thin::Never });
     analyzer.begin();
     // What the live engine told the analysis at each look (see `analysis::Context`), as far as a recording says it: which
     // cameras have a calibration (and the second is in use), whether the depth camera found the squares, and until when
@@ -471,13 +484,25 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
                             }
                             looked = true;
                         }
-                        let mut context =
-                            || LookContext { playing, usable: calibrated, depth: depth_found, interval, fresh, begun_at: Some(base) };
+                        let mut context = || LookContext {
+                            playing,
+                            usable: calibrated,
+                            depth: depth_found,
+                            interval,
+                            fresh,
+                            begun_at: Some(base),
+                            behind: false,
+                        };
                         let flushed = pull_one && event.data["flushed"].as_bool().unwrap_or(false);
+                        // A look the recording says was skipped is skipped again; else the rule decides (`--replay-thin`).
+                        analyzer.expect_thin((pull_one && !overrides.thin).then(|| event.data["thin"].as_bool().unwrap_or(false)));
                         let found =
                             if flushed { analyzer.flush_look(&mut context, interval) } else { analyzer.next_look(&mut context, interval) };
+                        analyzer.expect_thin(None);
+                        analyzer.take_occlusions();
                         match found {
                             Some(look) => {
+                                summary.thinned += usize::from(look.thinned);
                                 let made: Vec<(usize, u64)> = look.fed.iter().map(|p| (p.view, p.seq)).collect();
                                 if pull_one {
                                     let named: Vec<(usize, u64)> = event.data["pictures"]
@@ -503,8 +528,16 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
                             break;
                         }
                         looked = true;
-                        let given: Vec<Option<&image::RgbImage>> = images.iter().map(Option::as_ref).collect();
-                        analyzer.tracker.feed_views(&given, now)
+                        // A look the recording says was skipped is skipped again (`--replay-thin` decides by the rule instead).
+                        let recorded = (event.kind == "look" && !overrides.thin).then(|| event.data["thin"].as_bool().unwrap_or(false));
+                        analyzer.expect_thin(recorded);
+                        let given: Vec<(usize, Instant, &image::RgbImage)> =
+                            images.iter().enumerate().filter_map(|(view, image)| image.as_ref().map(|image| (view, now, image))).collect();
+                        let (detection, thinned, _) = analyzer.feed_given(&given, now, false);
+                        analyzer.expect_thin(None);
+                        analyzer.take_occlusions();
+                        summary.thinned += usize::from(thinned);
+                        detection
                     };
                     let moves = match detection {
                         Detection::Move { mv, .. } => vec![mv],
@@ -667,6 +700,14 @@ pub fn replay_folder_with(folder: &Path, overrides: &TrackerOverrides, verbose: 
             "{missing} pictures that the tracker was given live are not in the recording (left out by a full budget, or a depth picture with no flat surface in it)."
         );
     }
+    if summary.thinned > 0 {
+        let _ = writeln!(
+            text,
+            "{} looks were skipped: the pictures were the same as the ones last looked at, the board quiet and sure, and the analysis {} (the tracker was told that one more still picture went by).",
+            summary.thinned,
+            if overrides.thin { "treated as behind (--replay-thin)" } else { "behind the cameras, as the recording says" }
+        );
+    }
     let _ = writeln!(text, "{} pictures replayed; the replay ends in {}.", summary.pictures, fen_of(analyzer.tracker.position()));
     let _ = writeln!(
         text,
@@ -818,7 +859,7 @@ mod tests {
     use super::*;
     use crate::game::fen_of;
     use crate::picture::Picture;
-    use crate::record::{RecordOptions, Recorder, SessionMeta};
+    use crate::record::{LookMade, RecordOptions, Recorder, SessionMeta};
     use crate::synthetic::{self, PieceGrid};
     use image::RgbImage;
     use serde_json::json;
@@ -913,7 +954,12 @@ mod tests {
                 let at = self.at();
                 self.recorder.source(&crate::stage::Stamped { view: 0, seq: self.seq, captured: at, image: Arc::clone(&image) });
                 if i % look_every == 0 {
-                    self.recorder.look(at, &[(0, self.seq, None)], "watching", at, [self.seq, 0, 0], false);
+                    self.recorder.look(
+                        at,
+                        &[(0, self.seq, None)],
+                        "watching",
+                        LookMade { tracker_at: at, released: [self.seq, 0, 0], flushed: false, thinned: false },
+                    );
                 }
                 self.recorder.wait_idle();
             }

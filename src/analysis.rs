@@ -14,6 +14,7 @@
 
 use crate::engine::{CAMERAS, DEPTH_VIEW, Engine, VIEWS};
 use crate::stage::{Budget, cost_of};
+use crate::tags::{Occlusion, Tag, Tagger};
 use crate::tracker::{Detection, Tracker};
 use image::RgbImage;
 use std::collections::VecDeque;
@@ -33,6 +34,54 @@ pub const CAMERA_WAIT: Duration = Duration::from_secs(10);
 /// the recorder, which count them in their own budgets: this one is a safety net for an analysis that cannot keep up for
 /// minutes, not a way of keeping up.
 pub const ANALYSIS_BUDGET: usize = 2 << 30;
+
+/// The analysis is behind the cameras when this many pictures of a view wait for it, or the oldest has waited this long
+/// (since its capture): only then may a look at a picture that is the same as the last one looked at be skipped (see [`Thin`]).
+pub const THIN_WAITING: usize = 8;
+pub const THIN_AGE: Duration = Duration::from_secs(1);
+
+/// When the analysis may skip the look at a picture that is the same as the one it last looked at, on a board that has been
+/// quiet for seconds and that the tracker is sure of (see `tags::Tagger::may_skip` and `Tracker::quiet`). The picture is
+/// kept in the recording whatever is decided; the tracker is told that one more still picture went by (`Tracker::repeat_still`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Thin {
+    /// Every look is made.
+    Never = 0,
+    /// Looks are skipped while the analysis is behind the cameras (see [`Context::behind`]), and only then: what the program
+    /// does when it keeps up is what it always did. The default.
+    #[default]
+    Behind = 1,
+    /// Looks are skipped whenever they may be, behind or not: for tests, and for finding out on real recordings whether
+    /// skipping changes what the tracker finds (`--replay-thin`).
+    Always = 2,
+}
+
+impl Thin {
+    pub fn parse(text: &str) -> Option<Thin> {
+        match text {
+            "never" | "off" => Some(Thin::Never),
+            "behind" => Some(Thin::Behind),
+            "always" => Some(Thin::Always),
+            _ => None,
+        }
+    }
+}
+
+/// What `--thin` said, for the engine that the program builds (the command line sets it before the engine is made).
+static GLOBAL_THIN: AtomicU8 = AtomicU8::new(1);
+
+pub fn set_global_thin(thin: Thin) {
+    GLOBAL_THIN.store(thin as u8, Ordering::Relaxed);
+}
+
+pub fn global_thin() -> Thin {
+    match GLOBAL_THIN.load(Ordering::Relaxed) {
+        0 => Thin::Never,
+        2 => Thin::Always,
+        _ => Thin::Behind,
+    }
+}
 
 /// A picture as the analysis takes it.
 #[derive(Clone)]
@@ -74,6 +123,8 @@ pub struct Context {
     pub fresh: Duration,
     /// When play began (see [`CAMERA_WAIT`]).
     pub begun_at: Option<Instant>,
+    /// The pictures wait for the analysis in numbers (see [`THIN_WAITING`]): a look may be skipped (see [`Thin`]).
+    pub behind: bool,
 }
 
 /// One look of the tracker: what it was given, and what it found.
@@ -104,6 +155,13 @@ pub struct Look {
     pub active: [bool; VIEWS],
     /// The set of views that took part is not the one of the look before (a recording says so).
     pub views_changed: bool,
+    /// The tracker did not look at these pictures: they were the same as the ones it last looked at, it was sure of the
+    /// board, and the analysis was behind (see [`Thin`]); it was told that one more still picture went by.
+    pub thinned: bool,
+    /// What a glance says of each picture that was given (view, tag).
+    pub tags: Vec<(usize, Tag)>,
+    /// Stretches of occluded pictures that ended with this look.
+    pub occlusions: Vec<Occlusion>,
     pub detection: Detection,
 }
 
@@ -224,6 +282,11 @@ pub struct Analyzer {
     last_fed: [u64; VIEWS],
     last_look: Option<Instant>,
     last_active: Option<[bool; VIEWS]>,
+    /// When looks may be skipped, and what is known of the pictures that were given.
+    thin: Thin,
+    tagger: Tagger,
+    /// What a recording says about the next look (it was skipped or not): taken instead of the rule, once.
+    recorded_thin: Option<bool>,
 }
 
 impl Analyzer {
@@ -244,6 +307,9 @@ impl Analyzer {
             last_fed: [0; VIEWS],
             last_look: None,
             last_active: None,
+            thin: Thin::default(),
+            tagger: Tagger::new(),
+            recorded_thin: None,
         }
     }
 
@@ -251,6 +317,86 @@ impl Analyzer {
     pub fn begin(&mut self) {
         self.last_active = None;
         self.pending.clear();
+        // Nothing of what was compared with before is the board of the game that begins.
+        self.tagger.forget();
+    }
+
+    /// When looks may be skipped (see [`Thin`]).
+    pub fn set_thin(&mut self, thin: Thin) {
+        self.thin = thin;
+    }
+
+    pub fn thin(&self) -> Thin {
+        self.thin
+    }
+
+    /// How long the board must have been quiet for a look to be skipped (a test's games are quick).
+    pub fn set_thin_quiet(&mut self, quiet_for: Duration) {
+        self.tagger.set_quiet_for(quiet_for);
+    }
+
+    /// A replay says what a recording says of the next look: it was skipped or not. The rule is not asked for it.
+    pub fn expect_thin(&mut self, recorded: Option<bool>) {
+        self.recorded_thin = recorded;
+    }
+
+    /// Looks at the pictures that the tracker is given together at `at`, or skips the look (see [`Thin`]): `pictures` are
+    /// `(view, captured, picture)`. `behind` is whether the analysis is behind the cameras. Gives what the tracker found,
+    /// whether the look was skipped, and what a glance says of each picture. Used by a look of the analysis, and by a replay
+    /// that gives the pictures as the recording names them.
+    pub fn feed_given(
+        &mut self,
+        pictures: &[(usize, Instant, &RgbImage)],
+        at: Instant,
+        behind: bool,
+    ) -> (Detection, bool, Vec<(usize, Tag)>) {
+        // The tags of all pictures are made, whatever is decided: they are what the next ones are compared with.
+        let glances: Vec<Option<crate::vision::Glance>> =
+            pictures.iter().map(|&(view, _, image)| self.tracker.glance(view, image)).collect();
+        let mut tags = Vec::new();
+        for (&(view, captured, _), glance) in pictures.iter().zip(&glances) {
+            if let Some(glance) = glance {
+                tags.push((view, self.tagger.tag(view, captured, glance)));
+            }
+        }
+        let judged = |tagger: &Tagger| {
+            let known: Option<Vec<(usize, Instant, &crate::vision::Glance)>> =
+                pictures.iter().zip(&glances).map(|(&(view, captured, _), g)| g.as_ref().map(|g| (view, captured, g))).collect();
+            known.is_some_and(|known| tagger.may_skip(&known))
+        };
+        let wanted = match self.recorded_thin.take() {
+            Some(flag) => flag,
+            None => match self.thin {
+                Thin::Never => false,
+                Thin::Behind => behind && judged(&self.tagger),
+                Thin::Always => judged(&self.tagger),
+            },
+        };
+        let views: Vec<usize> = pictures.iter().map(|&(view, _, _)| view).collect();
+        if wanted && self.tracker.repeat_still(&views, at) {
+            for &view in &views {
+                self.tagger.skipped(view);
+            }
+            return (Detection::Nothing, true, tags);
+        }
+        let mut images: Vec<Option<&RgbImage>> = vec![None; VIEWS];
+        for &(view, _, image) in pictures {
+            if let Some(slot) = images.get_mut(view) {
+                *slot = Some(image);
+            }
+        }
+        let detection = self.tracker.feed_views(&images, at);
+        for (&(view, _, _), glance) in pictures.iter().zip(&glances) {
+            if let Some(glance) = glance {
+                self.tagger.analysed(view, glance);
+            }
+        }
+        (detection, false, tags)
+    }
+
+    /// The stretches of occluded pictures that ended since the last call (a replay has no use for them).
+    pub fn take_occlusions(&mut self) -> Vec<Occlusion> {
+        self.tagger.take_occlusions()
     }
 
     /// Pictures of cameras that have not been decided on yet: a look waits for the pictures that may go with it.
@@ -438,11 +584,11 @@ impl Analyzer {
         for (picture, _) in &fed {
             self.last_fed[picture.view] = picture.seq;
         }
-        let images: Vec<Option<&RgbImage>> =
-            (0..VIEWS).map(|v| fed.iter().find(|(p, _)| p.view == v).map(|(p, _)| p.image.as_ref())).collect();
+        let pictures: Vec<(usize, Instant, &RgbImage)> = fed.iter().map(|(p, _)| (p.view, p.captured, p.image.as_ref())).collect();
         let started = Instant::now();
-        let detection = self.tracker.feed_views(&images, at);
+        let (detection, thinned, tags) = self.feed_given(&pictures, at, state.behind);
         let step = started.elapsed();
+        let occlusions = self.tagger.take_occlusions();
         let (fed, skews_us): (Vec<Item>, Vec<i64>) = fed.into_iter().unzip();
         Some(Look {
             at,
@@ -456,6 +602,9 @@ impl Analyzer {
             unpaired,
             active,
             views_changed,
+            thinned,
+            tags,
+            occlusions,
             detection,
         })
     }
@@ -468,6 +617,15 @@ pub struct Backlog {
     pub waiting: usize,
     pub bytes: usize,
     pub oldest: Duration,
+    /// The most pictures waiting in the queue of one view.
+    pub deepest: usize,
+}
+
+impl Backlog {
+    /// The analysis is behind the cameras: many pictures of a view wait, or the oldest has waited long (see [`Thin`]).
+    pub fn is_behind(&self) -> bool {
+        self.deepest >= THIN_WAITING || self.oldest >= THIN_AGE
+    }
 }
 
 /// What a command does in the analysis thread.
@@ -627,7 +785,12 @@ impl Inbox {
     fn backlog_of(state: &State, now: Instant) -> Backlog {
         let waiting = state.queues.iter().map(VecDeque::len).sum();
         let oldest = state.queues.iter().filter_map(|q| q.front()).map(|p| p.captured).min();
-        Backlog { waiting, bytes: state.waiting_bytes, oldest: oldest.map_or(Duration::ZERO, |c| now.saturating_duration_since(c)) }
+        Backlog {
+            waiting,
+            bytes: state.waiting_bytes,
+            oldest: oldest.map_or(Duration::ZERO, |c| now.saturating_duration_since(c)),
+            deepest: state.queues.iter().map(VecDeque::len).max().unwrap_or(0),
+        }
     }
 
     /// The view whose first waiting picture was captured first, among those that `allowed` says.
@@ -733,6 +896,7 @@ mod tests {
             interval: Duration::from_millis(interval_ms),
             fresh: Duration::from_secs(2),
             begun_at: None,
+            behind: false,
         }
     }
 
@@ -1114,6 +1278,39 @@ mod tests {
         let again = run(&mut b, base, &schedule, playing(30));
         let shape = |looks: &[(Look, u64)]| looks.iter().map(|(l, r)| (ms_of(l, base), given(l), *r)).collect::<Vec<_>>();
         assert_eq!(shape(&looks), shape(&again));
+    }
+
+    #[test]
+    fn the_analysis_is_behind_when_many_pictures_of_a_view_wait_or_the_oldest_has_waited_long() {
+        let backlog =
+            |deepest: usize, oldest_ms: u64| Backlog { waiting: deepest * 3, bytes: 0, oldest: Duration::from_millis(oldest_ms), deepest };
+        assert!(!backlog(0, 0).is_behind() && !backlog(THIN_WAITING - 1, 900).is_behind(), "a few pictures, a short wait: keeping up");
+        assert!(backlog(THIN_WAITING, 100).is_behind());
+        assert!(backlog(1, 1000).is_behind());
+    }
+
+    #[test]
+    fn the_rule_for_skipping_looks_is_read_from_its_name_and_is_behind_by_default() {
+        assert_eq!(Thin::default(), Thin::Behind);
+        assert_eq!(Thin::parse("never"), Some(Thin::Never));
+        assert_eq!(Thin::parse("behind"), Some(Thin::Behind));
+        assert_eq!(Thin::parse("always"), Some(Thin::Always));
+        assert_eq!(Thin::parse("sometimes"), None);
+        assert_eq!(global_thin(), Thin::Behind, "the command line did not say otherwise");
+    }
+
+    #[test]
+    fn a_look_that_the_recording_says_was_skipped_is_made_when_the_tracker_is_not_sure_of_the_board() {
+        let base = Instant::now();
+        let mut a = analyzer();
+        // No game position learned: the tracker cannot count a picture it did not look at, so it looks.
+        a.expect_thin(Some(true));
+        let looks = feed(&mut a, picture(0, 1, base, 0), playing(0));
+        assert_eq!(looks.len(), 1);
+        assert!(!looks[0].thinned, "a tracker that is not quiet looks at the picture");
+        // And what a recording says is used once, not for the next look.
+        let looks = feed(&mut a, picture(0, 2, base, 40), playing(0));
+        assert!(!looks[0].thinned);
     }
 
     #[test]

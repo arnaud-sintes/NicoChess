@@ -141,7 +141,14 @@ pub fn build(options: ServerOptions) -> Result<Built> {
         camera: camera.clone(),
         camera2: camera2.clone(),
         second_fixed,
+        // Testing only: an analysis that cannot keep up with the cameras, to see what the program does then.
         analysis_delay: Duration::ZERO,
+        look_delay: std::env::var("NICOCHESS_ANALYSIS_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_millis),
+        thin: crate::analysis::global_thin(),
+        thin_quiet: crate::tags::QUIET_FOR,
     };
     let engine = Engine::new(config, store, options.calibration_path, calibration);
     // The demo's cameras see the same moment of the game; the other sources have nothing to keep in step.

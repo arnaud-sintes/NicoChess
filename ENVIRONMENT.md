@@ -116,7 +116,8 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   time of each picture is in `events.jsonl`.
 - `events.jsonl`: what happened, in order, with `t` in seconds: `frame` (file, camera and the tracker's status; with
   `--record-all` the number and capture time of the picture instead), `look` (`--record-all`: the pictures the tracker
-  was given together), `detect` (the moves found and the position after them), `unsure` (the candidates offered),
+  was given together; `thin` when it did not look at them, see "Skipped looks" below), `occlusion` (a stretch of pictures of a camera
+  with a hand or an arm over the board, told when it ended), `detect` (the moves found and the position after them), `unsure` (the candidates offered),
   `rejected`, `manual` (a move typed by hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`
   (with, for `--record-all`, `source`: the pictures offered and kept for each view). The line of a command (`manual`,
   `undo`, `promotion`, `doubt`, `relearn`, `calibration`) has `after`: how many pictures of each view had come when it was sent
@@ -196,6 +197,30 @@ than 150 ms and took the pictures of the others in another order than their capt
 Pairing (format 6): `cargo run --release --example pipeline -- <recording>` shows by window how far in time the pictures that went together were
 (`skew`, mean and max) and how many looks had a view without a picture near enough (`unpair`); the `closed` line has the same for the whole game
 (`pair_skew_ms`, `unpaired`, for each view).
+
+**Tags and skipped looks (format 7).** Every picture the tracker is given gets tags from a rough look at it (`src/tags.rs`; about a sixteenth
+of what the tracker reads): `duplicate` (no square differs from the picture before by more than the sensor's noise, 4 grey levels with the light of the
+whole board taken out), `occluded` (at least 6 squares differ from the last still picture by far more than a piece makes them: a hand or an arm; a board
+that stays the same for 2 s is the board, so several moves played one after the other are tagged for a moment too). Tags are information: they never change which pictures
+the tracker looks at. The `occlusion` lines of the recording tell the stretches, `closed` has `duplicates` and `occluded` for each view and `thinned`
+for the game, and `cargo run --release --example pipeline -- <recording>` shows them by window (`thin`, `hand s`); `cargo run --release --example tags -- <recording>
+[--truth <truth.json>]` prints them picture by picture for tuning. On the recordings of 2026-11-24 about half of the pictures are `duplicate` (96% of the
+pictures taken while the tracker was `watching`) and a hand is over the board in 47 to 59% of those taken while it was `moving` (0 to 9% of those taken while it
+was `watching`: several moves played one after the other). Making the tags takes about 70 microseconds a picture at 1280x720. Skipping looks changed nothing in
+what a replay finds on the real recordings of 2026-11-24 (`tools/groundtruth/README.md`); with a demo game in which the analysis is made too slow (50 ms a look
+for 25 looks a second) the oldest picture waited at most 1.4 s with skipping against 17.7 s without, and the program's memory peaked at 133 MB against 739 MB.
+
+When the analysis is **behind** the cameras (a view has 8 pictures waiting, or the oldest has waited 1 s) it may skip the look at pictures that are the same,
+so that it catches up: only if every picture of the look is the same as the one the tracker last looked at in that view (no square differs by more than 4 grey
+levels), no square of the view has changed for 3 s, no hand is over the board, the tracker is sure of the board and has nothing to wait for (`Tracker::quiet`: status
+`watching`, every deciding camera has seen it still for long enough, nothing doubtful, held or covered) and fewer than 8 looks were skipped in a row. The tracker is then
+told that one more still picture went by (`Tracker::repeat_still`: the count of still pictures and the average of the run go on with the numbers of the picture before),
+which is what a look at a picture that is the same adds, but for the noise. The pictures are in the recording all the same; the `look` line says `thin`, and a replay
+skips the same looks (so the replay is the live run, on the same pictures). `--thin never|behind|always` (default `behind`) sets the rule of the live program: `never` looks at
+everything, `always` skips whenever it may (on a program that keeps up, `behind` skips nothing). `--replay-thin` makes a replay skip wherever the rule allows, behind or not, to find out on
+real recordings whether skipping changes what the tracker finds (`compare ... --replay --thin` sets it beside the ground truth); a recording made with
+looks skipped is replayed with the same looks skipped without it. A recording made with `--record` (sampled pictures) does not say which looks were skipped. To see the program behind the cameras on a fast PC,
+`NICOCHESS_ANALYSIS_DELAY_MS=90` makes the analysis take that long more for every look it makes while a game is played (not for a skipped look): testing only.
 
 **The analysis thread.** The tracker is not run by the capture threads: each picture is stamped, put in a queue and taken by the
 analysis thread in the order of capture across the cameras (`src/analysis.rs`). If it cannot keep up with the cameras, the pictures
