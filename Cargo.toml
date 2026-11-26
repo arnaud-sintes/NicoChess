@@ -53,6 +53,10 @@ path = "tools/groundtruth/legal.rs"
 name = "compare"
 path = "tools/groundtruth/compare.rs"
 
+[[example]]
+name = "pipeline"
+path = "tools/groundtruth/pipeline.rs"
+
 # The tests play whole games on synthetic pictures, which takes minutes when nothing is optimised (and then times out on a
 # small CI machine). A little optimisation makes them several times faster; the programs that are shipped use `release`.
 [profile.test]

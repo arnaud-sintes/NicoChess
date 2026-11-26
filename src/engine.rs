@@ -12,6 +12,7 @@ use crate::clock::Clock;
 use crate::depthlink::{AlignOutcome, AlignRequest, DepthLink};
 use crate::game::{self, GameRecord, TimeControl};
 use crate::picture::{self, Picture};
+use crate::pipeline::{Fed, Pipe};
 use crate::record::{RecordOptions, Recorder, SessionMeta};
 use crate::roles::{self, Role, Roles};
 use crate::store::{Store, Summary};
@@ -212,14 +213,25 @@ pub struct Latest {
     /// Turned, but not adjusted: the same picture as `image` when nothing is adjusted.
     pub raw: Arc<RgbImage>,
     pub seq: u64,
+    /// When the camera made the picture (as far as the source knows; else when the engine got it), and how long the
+    /// capture thread waited for it (see `pipeline`).
+    captured: Instant,
+    waited: Duration,
     jpeg: OnceLock<Arc<Vec<u8>>>,
 }
 
+/// When a picture came, as the capture thread knows it.
+#[derive(Clone, Copy)]
+struct Arrival {
+    captured: Instant,
+    waited: Duration,
+}
+
 impl Latest {
-    fn new(raw: RgbImage, adjusted: Option<RgbImage>, seq: u64) -> Latest {
+    fn new(raw: RgbImage, adjusted: Option<RgbImage>, seq: u64, arrival: Arrival) -> Latest {
         let raw = Arc::new(raw);
         let image = adjusted.map_or_else(|| Arc::clone(&raw), Arc::new);
-        Latest { image, raw, seq, jpeg: OnceLock::new() }
+        Latest { image, raw, seq, captured: arrival.captured, waited: arrival.waited, jpeg: OnceLock::new() }
     }
 
     pub fn jpeg(&self) -> Arc<Vec<u8>> {
@@ -371,6 +383,8 @@ struct Inner {
     doubt: Option<DoubtNote>,
     /// The chess clock of the game being played, when it has one (see the module `clock`).
     clock: Option<Clock>,
+    /// How the pictures got to the tracker in the game being played (see the module `pipeline`).
+    pipe: Pipe,
 }
 
 /// Speed figures of the camera pipeline, smoothed.
@@ -542,6 +556,7 @@ impl Engine {
                 recorder: None,
                 doubt: None,
                 clock: None,
+                pipe: Pipe::new(VIEWS, Instant::now()),
             }),
             slots: [
                 Slot::new(config.camera, calibration_path, picture_path),
@@ -862,11 +877,15 @@ impl Engine {
                         }
                         // A panic while reading (a decoder that chokes on a picture) is a failure of the camera, not the end of
                         // the thread that reads it.
+                        let asked = Instant::now();
                         let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.next_frame()))
                             .unwrap_or_else(|_| Err(anyhow::anyhow!("internal error while reading a picture")));
+                        let got = Instant::now();
                         match read {
                             Ok(image) => {
-                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.on_frame(cam, image))).is_err() {
+                                // The source may know when the camera made the picture; else it is now.
+                                let arrival = Arrival { captured: source.captured_at().unwrap_or(got), waited: got.duration_since(asked) };
+                                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.on_frame(cam, image, arrival))).is_err() {
                                     // At 25 pictures a second the same line would come 25 times a second.
                                     broken += 1;
                                     if broken == 1 || broken.is_multiple_of(250) {
@@ -965,14 +984,14 @@ impl Engine {
     }
 
     /// Handles one camera frame.
-    fn on_frame(&self, cam: usize, image: RgbImage) {
+    fn on_frame(&self, cam: usize, image: RgbImage, arrival: Arrival) {
         let started = Instant::now();
         let slot = &self.slots[cam];
         let seq = slot.frame.read_ok().as_ref().map_or(1, |l| l.seq + 1);
         let picture = self.inner.grab().cams[cam].picture;
         let raw = picture.rotate(image);
         let adjusted = picture.adjust(&raw);
-        let latest = Arc::new(Latest::new(raw, adjusted, seq));
+        let latest = Arc::new(Latest::new(raw, adjusted, seq, arrival));
         *slot.frame.write_ok() = Some(Arc::clone(&latest));
         {
             *self.frame_count.grab() += 1;
@@ -993,10 +1012,19 @@ impl Engine {
             };
             if due { link.height_picture(rotation, true) } else { None }
         });
+        let asked_lock = Instant::now();
         let mut guard = self.inner.grab();
+        let lock_wait = asked_lock.elapsed();
         let inner = &mut *guard;
         let mut changed = inner.cams[cam].camera_error.take().is_some();
         inner.cams[cam].last_frame = Some(now);
+        let playing = inner.mode == Mode::Playing;
+        if playing {
+            inner.pipe.arrival(cam, arrival.captured, arrival.waited);
+            if let Some(line) = inner.pipe.report(now) {
+                eprintln!("{line}");
+            }
+        }
         // Time-based clean-up also runs with no page open (the camera must not stay on for ever).
         changed |= self.housekeeping(inner, now);
         // The depth camera found the squares: the tracker looks at them there from now on.
@@ -1069,7 +1097,20 @@ impl Engine {
                     link.mark_fed(*seq);
                 }
             }
+            let look = Instant::now();
             let detection = inner.tracker.feed_views(&images, now);
+            let step = look.elapsed();
+            // How the pictures got here, for the console and the recording (see the module `pipeline`).
+            let mut seen: Vec<Fed> = fed
+                .iter()
+                .map(|(c, frame)| Fed { view: *c, seq: frame.seq, captured: frame.captured, waited: Some(frame.waited) })
+                .collect();
+            if let (Some((seq, _)), Some(link)) = (&depth_given, &self.depth)
+                && let Some(stamp) = link.fresh().filter(|s| s.seq == *seq)
+            {
+                seen.push(Fed { view: DEPTH_VIEW, seq: stamp.seq, captured: stamp.at, waited: None });
+            }
+            let feed_note = inner.pipe.fed(look, lock_wait, step, &seen);
             // What the recording will say about this picture (see the module record).
             let mut noted: Option<(&'static str, Value)> = None;
             let found = matches!(detection, Detection::Move { .. } | Detection::Sequence { .. });
@@ -1122,6 +1163,8 @@ impl Engine {
             let gap = self.record.as_ref().map_or(Duration::ZERO, |r| r.busy_every);
             let keep_picture = found || inner.last_recorded.is_none_or(|t| now.duration_since(t) >= gap);
             if let Some(recorder) = inner.recorder.as_mut() {
+                // Every look is noted, also when the picture itself is not kept: the lag is wanted at all times.
+                recorder.event(now, "pipe", feed_note.json());
                 if keep_picture {
                     let mut pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|(c, frame)| (*c, Arc::clone(&frame.image))).collect();
                     if let Some((_, picture)) = &depth_given {
@@ -1791,7 +1834,8 @@ impl Engine {
         if let Some(latest) = self.latest_frame(cam) {
             let raw = Picture::default().turned(turns).rotate((*latest.raw).clone());
             let adjusted = picture.adjust(&raw);
-            *self.slots[cam].frame.write_ok() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq)));
+            let arrival = Arrival { captured: latest.captured, waited: latest.waited };
+            *self.slots[cam].frame.write_ok() = Some(Arc::new(Latest::new(raw, adjusted, latest.seq, arrival)));
             *self.frame_count.grab() += 1;
             self.frame_cv.notify_all();
         }
@@ -2169,6 +2213,7 @@ impl Engine {
             return;
         }
         let Some(recorder) = inner.recorder.take() else { return };
+        recorder.set_summary(inner.pipe.summary());
         let (result, reason) = inner.game.as_ref().map_or((None, None), |g| (g.result.clone(), g.termination.clone()));
         recorder.event(Instant::now(), "end", json!({"result": result, "reason": reason, "fen": game::fen_of(inner.tracker.position())}));
         if recorder.dropped() > 0 {
@@ -2180,6 +2225,7 @@ impl Engine {
     /// The board shows `position`: follow the game from there. `resume_at` is how many seconds
     /// of the game were already played (0 for a new game), so the timestamps carry on.
     fn begin_playing(&self, inner: &mut Inner, position: shakmaty::Chess, resume_at: f64) {
+        inner.pipe = Pipe::new(VIEWS, Instant::now());
         inner.tracker.start(position.clone());
         inner.doubt = None;
         // The depth camera looks for the squares in its picture, from what the board shows now.

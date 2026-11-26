@@ -27,6 +27,16 @@ From the repository root (a recording is only read, never changed):
     cargo run --release --example legal -- "<fen>" --play "e2e4 e7e5"
     cargo run --release --example compare -- <recording folder> <truth.json> [--saved <game.json>] [--replay] [--late 3] [--all]
 
+    cargo run --release --example pipeline -- <recording folder> [--window 10] [--age 500] [--gap 300]
+
+`pipeline` is not about the game but about the program: it prints, window by window, how the pictures got to the
+tracker (the `pipe` lines of a recording made by 0.11.2 or later: looks a second, how long a look took, how long the
+capture thread waited for the engine's lock, the age of the picture when the tracker started on it, pictures never looked
+at, the longest wait between looks, the time between pictures as the camera made them) beside the moves and unsure
+stretches of the same window, and marks the windows that were behind (`--age`: a picture older than that many ms,
+`--gap`: more than that between two looks). Use it to tell a failure that came with a lag from one that did not.
+On a recording without `pipe` lines it says so and shows only the pictures that were kept and the gaps between them.
+
 `legal --play` plays the moves (UCI) from the position and prints their SAN and the position after them; it refuses a move
 that is not legal, so a reader cannot write an impossible sequence.
 

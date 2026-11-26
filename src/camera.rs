@@ -24,6 +24,12 @@ pub trait FrameSource: Send {
     /// that stops delivering (unplugged, taken by another program) makes this return an error
     /// within a few seconds, so that the engine reports it and tries again.
     fn next_frame(&mut self) -> Result<RgbImage>;
+    /// When the camera made the picture that `next_frame` returned last, for a source that knows it (one with a thread
+    /// of its own that waits for the program). Without it the engine takes the time when `next_frame` returned, which
+    /// hides any time the picture waited for the program to ask.
+    fn captured_at(&self) -> Option<Instant> {
+        None
+    }
     /// Called when a game starts. Scripted sources begin again; a real camera does nothing.
     fn restart(&mut self) {}
 }
@@ -566,7 +572,10 @@ mod windows_camera {
     /// Dropping it stops the thread and closes the camera.
     pub struct WindowsCamera {
         description: String,
-        frames: Receiver<Result<RgbImage>>,
+        /// Each picture comes with the time the camera thread got it from the camera: the picture may then wait here
+        /// (one is kept ahead, and the camera waits for the program), and the engine wants to know how long.
+        frames: Receiver<Result<(Instant, RgbImage)>>,
+        captured: Option<Instant>,
     }
 
     impl WindowsCamera {
@@ -577,7 +586,7 @@ mod windows_camera {
             };
             let (ready_tx, ready_rx) = mpsc::channel::<Result<String>>();
             // One frame at most is kept ahead: the camera waits for the program.
-            let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<RgbImage>>(1);
+            let (frames_tx, frames_rx) = mpsc::sync_channel::<Result<(Instant, RgbImage)>>(1);
             thread::Builder::new()
                 .name("camera".into())
                 .spawn(move || {
@@ -594,7 +603,7 @@ mod windows_camera {
                         }
                     };
                     loop {
-                        let frame = grabber.next_frame();
+                        let frame = grabber.next_frame().map(|image| (Instant::now(), image));
                         let failed = frame.is_err();
                         // The receiver is gone when the camera is closed.
                         if frames_tx.send(frame).is_err() || failed {
@@ -609,7 +618,7 @@ mod windows_camera {
                 Err(mpsc::RecvTimeoutError::Timeout) => bail!("the camera did not open within {} seconds", OPEN_TIMEOUT.as_secs()),
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the camera thread stopped"),
             };
-            Ok(WindowsCamera { description, frames: frames_rx })
+            Ok(WindowsCamera { description, frames: frames_rx, captured: None })
         }
     }
 
@@ -620,12 +629,19 @@ mod windows_camera {
 
         fn next_frame(&mut self) -> Result<RgbImage> {
             match self.frames.recv_timeout(FRAME_TIMEOUT) {
-                Ok(frame) => frame,
+                Ok(frame) => frame.map(|(at, image)| {
+                    self.captured = Some(at);
+                    image
+                }),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     bail!("no picture from the camera for {} seconds (is another program using it?)", FRAME_TIMEOUT.as_secs())
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => bail!("the camera thread stopped"),
             }
+        }
+
+        fn captured_at(&self) -> Option<Instant> {
+            self.captured
         }
     }
 }

@@ -1089,6 +1089,21 @@ mod tests {
         assert_eq!((ends[0]["result"].as_str(), ends[0]["reason"].as_str()), (Some("1-0"), Some("checkmate")));
         assert_eq!(kind(events.last().unwrap()), "closed");
         assert_eq!(events.last().unwrap()["dropped"], 0, "no picture was lost");
+        // Every look of the tracker is noted with how the pictures got to it, and the end of the game sums it up.
+        let feeds: Vec<&Value> = events.iter().filter(|e| kind(e) == "pipe").collect();
+        let frames = events.iter().filter(|e| kind(e) == "frame").count();
+        assert!(feeds.len() >= 33 && feeds.len() <= frames, "{} looks, {frames} pictures", feeds.len());
+        let first = feeds[0];
+        assert!(first["step_ms"].as_f64().is_some() && first["lock_ms"].as_f64().is_some(), "{first}");
+        let view = &first["views"][0];
+        assert_eq!(view["cam"], 0);
+        assert!(view["age_ms"].as_f64().is_some_and(|age| age >= 0.0), "{view}");
+        let summary = &events.last().unwrap()["pipeline"];
+        assert_eq!(summary["feeds"].as_u64(), Some(feeds.len() as u64), "{summary}");
+        let cam0 = &summary["views"]["cam0"];
+        assert_eq!(cam0["fed"].as_u64(), Some(feeds.len() as u64), "{summary}");
+        assert!(cam0["received"].as_u64() >= cam0["fed"].as_u64(), "{summary}");
+        assert!(cam0["age_ms"]["max"].as_f64().is_some() && summary["step_ms"]["mean"].as_f64().is_some(), "{summary}");
         let session: crate::record::SessionMeta = serde_json::from_slice(&std::fs::read(folder.join("session.json")).unwrap()).unwrap();
         assert_eq!(session.game_id, "undated", "the page gave no start time");
         assert_eq!(session.calibration.map(|c| (c.corners, c.size)), Some((synthetic::corners().corners, Some([640, 480]))));
@@ -1124,7 +1139,7 @@ mod tests {
         // What the people did: not the pictures, nor the notes of the program (which cameras took part, and that the
         // tracker was unsure: the synthetic board never changes, so it may well say so between the moves typed).
         let people: Vec<&Value> =
-            events.iter().filter(|e| !["frame", "views", "unsure", "closed"].contains(&e["type"].as_str().unwrap_or(""))).collect();
+            events.iter().filter(|e| !["frame", "pipe", "views", "unsure", "closed"].contains(&e["type"].as_str().unwrap_or(""))).collect();
         let kinds: Vec<&str> = people.iter().map(|e| e["type"].as_str().unwrap()).collect();
         assert_eq!(kinds, ["manual", "manual", "undo", "end"], "{people:?}");
         assert_eq!(people[0]["text"], "e2e4");

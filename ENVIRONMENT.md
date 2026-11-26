@@ -107,7 +107,20 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   time of each picture is in `events.jsonl`.
 - `events.jsonl`: what happened, in order, with `t` in seconds: `frame` (file and the tracker's status), `detect` (the
   moves found and the position after them), `unsure` (the candidates offered), `rejected`, `manual` (a move typed by
-  hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`.
+  hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`. Also `pipe`, one for every look of the
+  tracker (also when its pictures are not kept): `step_ms` (how long the look took), `lock_ms` (how long the capture
+  thread waited for the engine's lock before it), and for each view `age_ms` (from the camera to the start of the look),
+  `skipped` (pictures of that camera that came since the one looked at the time before and were never looked at),
+  `since_last_ms`, `gap_ms` (between two pictures as the camera made them: several pictures long means the camera or its
+  driver lost some) and `wait_ms` (how long the capture thread waited for the picture: near 0 means it was already there,
+  the program was not keeping up). The `closed` line carries the sum of the game in `pipeline` (per view: pictures
+  received, looked at and never looked at; mean, 95th percentile (to within 30%) and maximum of age, wait and gap; the
+  longest wait between two looks; how many looks were behind). The same figures come to the console every 30 seconds
+  while playing (`pipeline, last 30 s: ...`, with `BEHIND` when a picture was over 0.5 s old or two looks 0.3 s
+  apart). `cargo run --release --example pipeline -- <recording>` prints them window by window beside the moves and the
+  unsure stretches, to match a failure with a lag (`tools/groundtruth/README.md`). A recording made before these lines
+  has none, and the tool says so. The time of a camera picture comes from the camera thread on Windows; elsewhere it
+  is the time the program got it, so `age_ms` leaves out any time the picture waited in the driver.
 
 ### Recording as video (much smaller): ffmpeg
 

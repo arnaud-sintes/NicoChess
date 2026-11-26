@@ -34,6 +34,7 @@ pub mod fsutil;
 pub mod game;
 pub mod http;
 pub mod picture;
+pub mod pipeline;
 pub mod pushed;
 pub mod record;
 pub mod replay;

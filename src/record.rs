@@ -162,6 +162,11 @@ pub struct Recorder {
     thread: Option<JoinHandle<()>>,
     /// The videos, when the pictures go into video files.
     video: Option<Arc<Videos>>,
+    /// How the pictures got to the tracker (the `pipeline` module), set at the end of the game and written in the
+    /// `closed` line.
+    summary: Arc<Mutex<Option<Value>>>,
+    /// The time of the last line queued, in milliseconds (see `seconds`).
+    last_ms: AtomicU64,
 }
 
 /// The cameras that can have a video: the cameras and the height picture of the depth camera, numbered as the engine
@@ -253,9 +258,11 @@ impl Recorder {
         let writer_folder = folder.clone();
         let (writer_queued, writer_dropped) = (Arc::clone(&queued), Arc::clone(&dropped));
         let writer_video = video.clone();
+        let summary = Arc::new(Mutex::new(None));
+        let writer_summary = Arc::clone(&summary);
         let thread = thread::Builder::new()
             .name("record".into())
-            .spawn(move || writer(writer_folder, rx, now, writer_queued, writer_dropped, writer_video))
+            .spawn(move || writer(writer_folder, rx, now, writer_queued, writer_dropped, writer_video, writer_summary))
             .context("cannot start the recording thread")?;
         let recorder = Recorder {
             tx: Some(tx),
@@ -269,6 +276,8 @@ impl Recorder {
             folder,
             thread: Some(thread),
             video,
+            summary,
+            last_ms: AtomicU64::new(0),
         };
         // Written by the writer, so that no file is written under the engine's lock.
         let bytes = serde_json::to_vec_pretty(&meta)?;
@@ -285,6 +294,11 @@ impl Recorder {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// What the game came to in how its pictures got to the tracker: it goes in the last line of the recording.
+    pub fn set_summary(&self, summary: Value) {
+        *self.summary.lock().unwrap_or_else(PoisonError::into_inner) = Some(summary);
+    }
+
     fn send(&self, msg: Msg) -> bool {
         let Some(tx) = &self.tx else { return false };
         match tx.try_send(msg) {
@@ -296,8 +310,13 @@ impl Recorder {
         }
     }
 
+    /// The time of a line, in seconds from the start. A line never gets a time before the one before it: the time of a
+    /// picture is when the engine began on it, which can be a few milliseconds before something that a page did while
+    /// the engine waited for its lock, and the file must read in order.
     fn seconds(&self, at: Instant) -> f64 {
-        (at.saturating_duration_since(self.begun).as_secs_f64() * 1000.0).round() / 1000.0
+        let ms = (at.saturating_duration_since(self.begun).as_secs_f64() * 1000.0).round() as u64;
+        let ms = self.last_ms.fetch_max(ms, Ordering::Relaxed).max(ms);
+        ms as f64 / 1000.0
     }
 
     /// Keeps the pictures the detection was given this time (each with the number of its camera), if it is time to
@@ -465,6 +484,7 @@ fn writer(
     queued: Arc<AtomicUsize>,
     dropped: Arc<AtomicU64>,
     videos: Option<Arc<Videos>>,
+    summary: Arc<Mutex<Option<Value>>>,
 ) {
     let file = match OpenOptions::new().create(true).append(true).open(folder.join("events.jsonl")) {
         Ok(file) => Some(file),
@@ -574,6 +594,9 @@ fn writer(
         if !video.failures.is_empty() {
             closed["video_errors"] = json!(video.failures);
         }
+    }
+    if let Some(pipeline) = summary.lock().unwrap_or_else(PoisonError::into_inner).take() {
+        closed["pipeline"] = pipeline;
     }
     append(&mut events, &closed.to_string());
 }
@@ -768,6 +791,32 @@ mod tests {
         let name = folder.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(name.len(), 19, "{name}");
         assert!(name.as_bytes()[4] == b'-' && name.as_bytes()[10] == b'_', "{name}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_closing_line_carries_the_figures_of_the_pipeline_when_the_engine_gave_them() {
+        let dir = temp_dir("summary");
+        let options = RecordOptions::new(dir.clone(), Duration::ZERO);
+        let recorder = Recorder::begin(&options, meta(), Instant::now()).unwrap();
+        recorder.event(Instant::now(), "pipe", json!({"step_ms": 1.5, "views": []}));
+        recorder.set_summary(json!({"feeds": 1, "step_ms": {"mean": 1.5}}));
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let lines: Vec<Value> =
+            fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.last().unwrap()["type"], "closed");
+        assert_eq!(lines.last().unwrap()["pipeline"]["feeds"], 1, "{lines:?}");
+        assert_eq!(lines[0]["type"], "pipe");
+        fs::remove_dir_all(&dir).ok();
+
+        // Without figures (an old caller, a recording closed at once) the line is as it was.
+        let dir = temp_dir("summary-none");
+        let recorder = Recorder::begin(&RecordOptions::new(dir.clone(), Duration::ZERO), meta(), Instant::now()).unwrap();
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let closed: Value = serde_json::from_str(fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().last().unwrap()).unwrap();
+        assert!(closed.get("pipeline").is_none(), "{closed}");
         fs::remove_dir_all(&dir).ok();
     }
 
