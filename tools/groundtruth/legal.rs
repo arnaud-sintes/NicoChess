@@ -6,11 +6,15 @@
 //! only helps; the picture decides. Piece types are not looked at: the chess rules give them.
 //!
 //! One JSON object per line: `{"plies":1,"san":"e4","uci":"e2e4","fen":"...","changed":["e2","e4"],"miss":0}`.
+//!
+//! `legal <fen> --play "e2e4 e7e5"` plays the moves instead and prints `{"san":"e4 e5","fen_after":"..."}`; a move that is
+//! not legal is an error. A reader uses it to write the position after a reading without computing it by hand.
 
 use anyhow::{Context, Result, bail};
 use nicochess::game::{fen_of, san_of, uci_of};
 use serde_json::json;
 use shakmaty::fen::Fen;
+use shakmaty::uci::UciMove;
 use shakmaty::{CastlingMode, Chess, Color, Position, Square};
 
 fn classes(pos: &Chess) -> [u8; 64] {
@@ -66,20 +70,40 @@ impl Walk<'_> {
     }
 }
 
+/// Plays the moves (UCI, separated by spaces) from the position and prints the one answer: the SAN of each, and the
+/// position after them. A move that is not legal is an error, so a reader cannot write down an impossible sequence.
+fn play_moves(mut pos: Chess, moves: &str) -> Result<()> {
+    let mut san = Vec::new();
+    for text in moves.split_whitespace() {
+        let uci: UciMove = text.parse().with_context(|| format!("{text} is not a move in UCI notation"))?;
+        let mv = uci.to_move(&pos).map_err(|_| anyhow::anyhow!("{text} is not legal here ({})", fen_of(&pos)))?;
+        san.push(san_of(&pos, mv));
+        pos.play_unchecked(mv);
+    }
+    println!("{}", json!({"san": san.join(" "), "fen_after": fen_of(&pos)}));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let Some(fen) = args.next() else { bail!("usage: legal <fen> [--plies 3] [--changed e2,e4] [--top 8]") };
-    let (mut plies, mut top, mut target) = (1usize, 8usize, None);
+    let Some(fen) = args.next() else {
+        bail!("usage: legal <fen> [--plies 3] [--changed e2,e4] [--top 8] | legal <fen> --play \"e2e4 e7e5\"")
+    };
+    let (mut plies, mut top, mut target, mut play) = (1usize, 8usize, None, None::<String>);
     while let Some(flag) = args.next() {
         let mut value = || args.next().with_context(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--plies" => plies = value()?.parse()?,
             "--top" => top = value()?.parse()?,
             "--changed" => target = Some(value()?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect::<Vec<_>>()),
+            "--play" => play = Some(value()?),
             other => bail!("unknown option {other}"),
         }
     }
     let pos: Chess = fen.parse::<Fen>().context("cannot read the FEN")?.into_position(CastlingMode::Standard).context("not a position")?;
+    if let Some(moves) = play {
+        return play_moves(pos, &moves);
+    }
     let mut walk = Walk { start: classes(&pos), target: &target, san: Vec::new(), uci: Vec::new(), out: Vec::new() };
     walk.go(&pos, plies);
     let mut found = walk.out;

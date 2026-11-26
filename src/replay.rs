@@ -11,7 +11,7 @@
 //!
 //! The pictures are fed at the times they were taken, so the replay is as fast as the computer, not the game.
 
-use crate::game::{fen_of, parse_fen, san_of};
+use crate::game::{fen_of, parse_fen, san_of, uci_of};
 use crate::record::{FORMAT, SessionMeta};
 use crate::tracker::{Detection, Status, Tracker, TrackerConfig};
 use anyhow::{Context, Result, bail};
@@ -103,6 +103,19 @@ pub struct Summary {
 pub struct Report {
     pub text: String,
     pub summary: Summary,
+    /// What the replayed tracker found by itself, in order, for tools that set it beside another reading of the game
+    /// (`tools/groundtruth`). A place where the replay had to be put on the real position is not in the list.
+    pub detections: Vec<Found>,
+}
+
+/// One detection of the replayed tracker: the moves (one or a sequence) with the time of the picture that gave them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    pub t: f64,
+    pub before: String,
+    pub uci: Vec<String>,
+    pub san: Vec<String>,
+    pub after: String,
 }
 
 /// A line of `events.jsonl`.
@@ -227,6 +240,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     let _ = writeln!(text);
 
     let mut summary = Summary::default();
+    let mut detections: Vec<Found> = Vec::new();
     let base = Instant::now();
     let mut last_file = String::new();
     let mut last_status = String::new();
@@ -280,6 +294,13 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                     continue;
                 }
                 let after = fen_of(tracker.position());
+                detections.push(Found {
+                    t: event.t,
+                    before: fen_of(&before),
+                    uci: moves.iter().map(|m| uci_of(*m)).collect(),
+                    san: sans_of(&before, &moves).split(' ').map(str::to_string).collect(),
+                    after: after.clone(),
+                });
                 let ok = real.contains(&key_of(&after));
                 if ok {
                     summary.found += 1;
@@ -401,7 +422,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
         summary.typed_found,
         summary.live_typed
     );
-    Ok(Report { text, summary })
+    Ok(Report { text, summary, detections })
 }
 
 /// Why a tracker was unsure, from the cost of the second candidate (how far it is behind the first): two moves that
