@@ -1292,7 +1292,8 @@ function renderLive(ctl) {
     const depthOn = !!(S.depth && S.depth.on && S.depth.offered) && st !== 'learning';
     setText(statusEl, (STATUS[st] || st) + ' ' + turn + ' to move.'
       + (twoCameras ? (used >= 2 ? ' Two cameras are watching.' : ' Only one camera is giving a picture.') : '')
-      + (depthOn ? (S.depth.in_use && !S.depth.ignored ? ' The depth is helping.' : ' The depth is not being used (see the Calibrate tab).') : ''));
+      + (depthOn ? (S.depth.in_use && !S.depth.ignored ? ' The depth is helping.' : ' The depth is not being used (see the Calibrate tab).') : '')
+      + (S.tracker.lag_ms > 1000 ? ' Catching up: the moves shown are about ' + Math.round(S.tracker.lag_ms / 1000) + ' s behind the board.' : ''));
     statusEl.dataset.state = st;
   } else {
     setText(statusEl, over ? 'Game over: ' + g.result + (g.termination ? ' (' + g.termination + ')' : '') + '.' : 'The recording is stopped.');
@@ -1606,7 +1607,8 @@ setInterval(async () => {
   if (!liveOn) { $('cam-stats').textContent = ''; return; }
   try {
     const r = await (await fetch('/api/camera/stats?cam=' + (camN + 1))).json();
-    $('cam-stats').textContent = r.fps.toFixed(1) + ' pictures/s from the camera · ' + r.process_ms.toFixed(0) + ' ms to process · ' + r.encode_ms.toFixed(0) + ' ms to compress';
+    $('cam-stats').textContent = r.fps.toFixed(1) + ' pictures/s from the camera · ' + r.process_ms.toFixed(0) + ' ms to process · ' + r.encode_ms.toFixed(0) + ' ms to compress'
+      + (r.waiting > 1 ? ' · ' + r.waiting + ' pictures wait to be looked at (' + (r.lag_ms / 1000).toFixed(1) + ' s behind)' : '');
   } catch (e) { /* the next time */ }
 }, 1500);
 

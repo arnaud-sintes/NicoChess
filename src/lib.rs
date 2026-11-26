@@ -20,6 +20,7 @@ pub fn version_text() -> String {
     if COMMIT.is_empty() { VERSION.to_string() } else { format!("{VERSION} ({COMMIT})") }
 }
 
+pub mod analysis;
 pub mod app;
 pub mod boarddetect;
 pub mod calibration;

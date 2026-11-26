@@ -60,7 +60,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// and `frame` lines that tell the video and the number of a picture instead of a file); a recording of format 2
 /// is read as before. Format 4 added the recording of every picture (`every_picture` in `session.json`; `seq` and
 /// `captured` on a `frame` line, and the `look`, `backlog` and `gap` lines); a recording of format 3 is read as before.
-pub const FORMAT: u32 = 4;
+/// Format 5 added `track_interval` to `session.json`, `at` (the capture time of the picture that began it) to a `look` line,
+/// `after` (how many pictures of each view came before it) to the lines of a command, and the `analysis_gap` line: a
+/// recording of format 4 is read as before.
+pub const FORMAT: u32 = 5;
 
 /// The memory that pictures waiting for the encoder or the disk may take, in bytes: 2 GB is about 700 pictures of
 /// 1280x720, 14 seconds of two cameras at 25 pictures a second. Only an encoder or a disk that is much too slow gets there.
@@ -155,6 +158,10 @@ pub struct SessionMeta {
     /// with `--record`: its pictures are those the detection was given, as it saw them.
     #[serde(default)]
     pub every_picture: bool,
+    /// The least time between two looks of the tracker, in seconds (format 5): a replay of every picture looks at the
+    /// same pace. Absent in older recordings, which were looked at every picture of the replay.
+    #[serde(default)]
+    pub track_interval: f64,
 }
 
 /// How the pictures were encoded.
@@ -474,13 +481,16 @@ impl Recorder {
     /// Notes which pictures the tracker was given together this time (`--record-all`: the pictures themselves were
     /// kept by [`source`](Self::source) as they came), with the status it was in afterwards. Call it before the events
     /// that the look led to.
-    pub fn look(&mut self, at: Instant, pictures: &[(usize, u64)], status: &'static str) {
+    pub fn look(&mut self, at: Instant, pictures: &[(usize, u64)], status: &'static str, tracker_at: Instant) {
         if !self.every_picture {
             return;
         }
         self.feeds += 1;
         let list: Vec<Value> = pictures.iter().map(|(cam, seq)| json!({"cam": cam, "seq": seq})).collect();
-        let line = json!({"t": self.seconds(at), "type": "look", "feed": self.feeds, "status": status, "pictures": list});
+        // The time the tracker was given is the capture time of the picture that began the look, which the lag of the
+        // analysis does not change (`t` is when the look was made, and never goes back).
+        let given = (tracker_at.saturating_duration_since(self.begun).as_secs_f64() * 1e6).round() / 1e6;
+        let line = json!({"t": self.seconds(at), "type": "look", "feed": self.feeds, "status": status, "at": given, "pictures": list});
         self.send(Msg::Line(line.to_string()));
     }
 
@@ -1026,6 +1036,7 @@ mod tests {
             picture2: None,
             video: None,
             every_picture: false,
+            track_interval: 0.0,
         }
     }
 
@@ -1342,7 +1353,7 @@ mod tests {
                 recorder.source(&stamped(2, n / 3, at + Duration::from_millis(20), &depth));
             }
             if n % 2 == 0 {
-                recorder.look(at + Duration::from_millis(20), &[(0, n), (1, n)], "watching");
+                recorder.look(at + Duration::from_millis(20), &[(0, n), (1, n)], "watching", at);
             }
         }
         recorder.flush_gaps();
@@ -1488,7 +1499,7 @@ mod tests {
         let mut recorder = Recorder::begin(&RecordOptions::new(dir.clone(), Duration::ZERO), meta(), begun).unwrap();
         let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([1, 2, 3])));
         recorder.source(&stamped(0, 1, begun, &image));
-        recorder.look(begun, &[(0, 1)], "watching");
+        recorder.look(begun, &[(0, 1)], "watching", begun);
         let folder = recorder.folder().to_path_buf();
         recorder.close();
         let lines = read_lines(&folder);

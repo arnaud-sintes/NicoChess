@@ -7,6 +7,7 @@
 //! last stretch (printed every [`REPORT_EVERY`] while playing). The engine calls this with its lock held, so every
 //! call is a few additions: nothing here waits, allocates much, or writes.
 
+use crate::analysis::Backlog;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -126,17 +127,28 @@ pub struct ViewFigures {
 #[derive(Clone)]
 pub struct Sets {
     /// Times the tracker looked, how many of them were late (see [`BEHIND_AGE`]), how long one look took, and how long
-    /// the capture thread waited for the engine's lock before it.
+    /// the analysis thread waited for the engine's lock to publish what the look found.
     pub feeds: u64,
     pub behind: u64,
     pub step: Hist,
     pub lock: Hist,
+    /// At each look: how many pictures waited for the analysis, and how old (in ms, since its capture) the oldest was.
+    pub waiting: Hist,
+    pub oldest: Hist,
     pub views: Vec<ViewFigures>,
 }
 
 impl Sets {
     fn new(views: usize) -> Sets {
-        Sets { feeds: 0, behind: 0, step: Hist::default(), lock: Hist::default(), views: vec![ViewFigures::default(); views] }
+        Sets {
+            feeds: 0,
+            behind: 0,
+            step: Hist::default(),
+            lock: Hist::default(),
+            waiting: Hist::default(),
+            oldest: Hist::default(),
+            views: vec![ViewFigures::default(); views],
+        }
     }
 }
 
@@ -268,6 +280,14 @@ impl Pipe {
         note
     }
 
+    /// How many pictures waited for the analysis at this look, and how old the oldest was.
+    pub fn backlog(&mut self, backlog: &Backlog) {
+        for sets in [&mut self.total, &mut self.window] {
+            sets.waiting.add(backlog.waiting as f32);
+            sets.oldest.add(ms(backlog.oldest));
+        }
+    }
+
     /// What the whole game came to, for the `closed` line of the recording.
     pub fn summary(&self) -> Value {
         let mut views = serde_json::Map::new();
@@ -287,6 +307,7 @@ impl Pipe {
         json!({
             "feeds": self.total.feeds, "behind": self.total.behind,
             "step_ms": self.total.step.json(), "lock_ms": self.total.lock.json(), "views": views,
+            "waiting": self.total.waiting.json(), "oldest_waiting_ms": self.total.oldest.json(),
         })
     }
 
@@ -302,11 +323,15 @@ impl Pipe {
             return None;
         }
         let mut line = format!(
-            "pipeline, last {:.0} s: {} looks, tracker {}, waiting for the lock {}{}",
+            "pipeline, last {:.0} s: {} looks, tracker {}, waiting for the lock {}, pictures waiting for the analysis: {:.0} (p95 {:.0}, max {:.0}), the oldest {}{}",
             span.as_secs_f32(),
             sets.feeds,
             sets.step.text(),
             sets.lock.text(),
+            sets.waiting.mean(),
+            sets.waiting.p95(),
+            sets.waiting.max(),
+            sets.oldest.text(),
             if sets.behind > 0 {
                 format!(
                     ", BEHIND {} times (a picture over {} ms old or {} ms between looks)",

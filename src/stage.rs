@@ -5,8 +5,8 @@
 //! only a memory budget bounds them (a [`Budget`]). Going past it is a failure that is said loudly (the recorder warns
 //! at half of it and writes a `gap` line for every stretch of pictures it had to leave out), not a way of keeping up.
 //!
-//! The analysis does not read its pictures from here yet (it still takes the latest of each camera, see `engine`);
-//! the recorder does, and the stamp is what a queue per source will carry.
+//! The recorder reads its pictures from here, and so does the analysis (see `analysis`, whose `Inbox` has a `Budget` of
+//! its own: the same picture waits in both queues and is counted in both, which is cautious, not exact).
 
 use image::RgbImage;
 use std::sync::Arc;

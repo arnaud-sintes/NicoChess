@@ -105,7 +105,7 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   the board can be found in). The pictures are as the camera gave them, turned but not adjusted: the replay applies
   the brightness and contrast of `session.json` again (they cannot change during a game). Each picture has a number
   (`seq`, among the pictures of its camera, with no hole when nothing was lost) and `captured` (the moment the
-  camera made it); `look` lines say which pictures the tracker was given together. Several megabytes a second as
+  camera made it); `look` lines say which pictures the tracker was given together, and `at` (the capture time of the picture that began the look, which the tracker was given as its time). Several megabytes a second as
   JPEG at 1280x720 for two cameras, so use video (below). **Nothing is dropped for want of room in a queue**: the
   pictures that wait for the disk or the encoder take memory, up to 2 GB (`--record-budget <MB>`); at half of it the
   console and the recording say so (`backlog` line, every 5 s), and only past it are pictures left out: counted in
@@ -118,9 +118,12 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   `--record-all` the number and capture time of the picture instead), `look` (`--record-all`: the pictures the tracker
   was given together), `detect` (the moves found and the position after them), `unsure` (the candidates offered),
   `rejected`, `manual` (a move typed by hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`
-  (with, for `--record-all`, `source`: the pictures offered and kept for each view). Also `pipe`, one for every look of the
-  tracker (also when its pictures are not kept): `step_ms` (how long the look took), `lock_ms` (how long the capture
-  thread waited for the engine's lock before it), and for each view `age_ms` (from the camera to the start of the look),
+  (with, for `--record-all`, `source`: the pictures offered and kept for each view). The line of a command (`manual`,
+  `undo`, `promotion`, `doubt`, `relearn`, `calibration`) has `after`: how many pictures of each view had come when it was sent
+  (the analysis carried it out after those); `analysis_gap` says that pictures were left out of the analysis (below). Also `pipe`, one for every look of the
+  tracker (also when its pictures are not kept): `step_ms` (how long the look took), `lock_ms` (how long the analysis thread
+  waited for the engine's lock to publish what it found), and for each view `age_ms` (from the camera to the start of the look:
+  it includes the time the picture waited for the analysis, and for the other camera's picture),
   `skipped` (pictures of that camera that came since the one looked at the time before and were never looked at),
   `since_last_ms`, `gap_ms` (between two pictures as the camera made them: several pictures long means the camera or its
   driver lost some) and `wait_ms` (how long the capture thread waited for the picture: near 0 means it was already there,
@@ -129,7 +132,9 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   longest wait between two looks; how many looks were behind). The same figures come to the console every 30 seconds
   while playing (`pipeline, last 30 s: ...`, with `BEHIND` when a picture was over 0.5 s old or two looks 0.3 s
   apart). `cargo run --release --example pipeline -- <recording>` prints them window by window beside the moves and the
-  unsure stretches, to match a failure with a lag (`tools/groundtruth/README.md`). A recording made before these lines
+  unsure stretches, to match a failure with a lag (`tools/groundtruth/README.md`). The `closed` line also has `waiting` (the pictures waiting for the analysis at each look: mean, p95, max)
+  and `oldest_waiting_ms` (how old the oldest of them was). The console line says how many pictures wait for the analysis, and
+  the page says "Catching up" under the board when the moves it shows are more than a second behind. A recording made before these lines
   has none, and the tool says so. The time of a camera picture comes from the camera thread on Windows; elsewhere it
   is the time the program got it, so `age_ms` leaves out any time the picture waited in the driver.
 
@@ -181,11 +186,21 @@ replayed recording by recording. The tuning options replace the recorded ones, t
 status and every list of candidates. Open the picture files named in the report to see what the camera saw. A
 recording made with `--record-all` is replayed as the tracker saw it live (the pictures of each `look`, at the times of
 the looks), which is what compares with what happened; `--replay-all` feeds it every picture instead, one after the
-other at the moment it was captured (each picture a look of its own: how the analysis will take its pictures later).
+other in the order they were captured, by the rule of the analysis thread (the tracker looks when `track_interval` has
+passed since the look before, counted on capture times, with the newest picture of each camera that is not newer: so a replay of
+every picture finds what the program found live, however late the analysis was). The lines of the commands are put among the
+pictures by their `after`.
+
+**The analysis thread.** The tracker is not run by the capture threads: each picture is stamped, put in a queue and taken by the
+analysis thread in the order of capture across the cameras (`src/analysis.rs`). If it cannot keep up with the cameras, the pictures
+wait (the page says it is catching up, the console line says how many wait): they are not dropped. They take memory, up to 2 GB
+(`ANALYSIS_BUDGET`); past it pictures are left out of the analysis (not of the recording), the console says so and the recording has
+an `analysis_gap` line. A command from a page (a move typed, an undo, a calibration, ending the game) is carried out after the pictures
+that were waiting when it was sent, so on a machine that is seconds behind the page answers after that wait.
 
 Limits: a recording made with `--record` has only the pictures that were kept, so with the default spacing a replay
 follows the live run closely only around moves (where a few pictures a second are kept); use `--record-all` for a
-faithful replay. A move that the people undid after the program found it counts as played. In a recording made with
+faithful replay (a recording of format 5 also gives the tracker the capture times it had). A move that the people undid after the program found it counts as played. In a recording made with
 `--record-all` a picture can be missing only where a `gap` line says so (the memory budget was full: the replay says
 how many pictures that the tracker was given live are not there). Two to four threads encode and write the JPEG
 pictures (0.11.1 had one, and `--record-all` lost about half of the pictures with two cameras, the depth view first);

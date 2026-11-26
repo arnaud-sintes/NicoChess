@@ -1,9 +1,12 @@
 //! The heart of the program: ties the camera, the tracker, the game record, the
 //! store and the roles together, and tells the pages when something changed.
 //!
-//! One mutex guards the state that matters (`Inner`). The capture thread takes it
-//! once per frame, for a few milliseconds; commands from the pages take it briefly.
+//! One mutex guards the state that matters (`Inner`). The capture threads take it once per frame, for a few
+//! milliseconds; commands from the pages take it briefly. The tracker is not under it: it belongs to the analysis
+//! thread (module `analysis`), which takes the pictures the capture threads put in its inbox and carries out the
+//! commands, in order, and takes the lock only to publish what it found.
 
+use crate::analysis::{self, Analyzer, Backlog, Context, Inbox, Item, Look, Next};
 use crate::boarddetect;
 use crate::calibration::{self, Calibration};
 use crate::camera::{FrameRate, SourceFactory};
@@ -24,7 +27,7 @@ use image::{ExtendedColorType, ImageEncoder, RgbImage};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -85,15 +88,15 @@ type FollowJob = (usize, Arc<Latest>, Instant);
 /// How long every picture is recorded while the tracker is in a status other than "watching" (see `loud`).
 const RECORD_LOUD: Duration = Duration::from_secs(20);
 /// What the tracker looks at: the cameras, and after them the height picture of the depth camera (see `depth`).
-const VIEWS: usize = CAMERAS + 1;
-const DEPTH_VIEW: usize = CAMERAS;
+pub(crate) const VIEWS: usize = CAMERAS + 1;
+pub(crate) const DEPTH_VIEW: usize = CAMERAS;
 /// A camera whose last picture is older than this is not working: the detection goes on without it. (Until then
 /// the other cameras wait for it to be still: a game that goes on meanwhile may get too far for the tracker, which
 /// takes up to three moves at once. People are not that quick; a test with a demo game is, and sets it shorter.)
 const FRESH: Duration = Duration::from_secs(2);
-/// A camera that has not given a picture yet is waited for this long after a game begins, so that the squares are
-/// learned from all the cameras at once (opening a USB camera takes a moment).
-const CAMERA_WAIT: Duration = Duration::from_secs(10);
+/// How long a command waits for the analysis thread to get to it (it comes after the pictures that were waiting when it
+/// was sent) before the page is told that the analysis is too far behind.
+const COMMAND_WAIT: Duration = Duration::from_secs(60);
 
 /// Microseconds the last preview JPEG took to make (for the speed figures on the page).
 static ENCODE_US: AtomicU32 = AtomicU32::new(0);
@@ -121,6 +124,9 @@ pub struct EngineConfig {
     pub fresh: Duration,
     /// How many pictures a second the main camera keeps, when the page may change it (a real camera).
     pub rate: Option<Arc<FrameRate>>,
+    /// The analysis thread waits this long after each picture it takes: an analysis that cannot keep up with the camera,
+    /// for the tests of what happens then. Nothing sets it in the program.
+    pub analysis_delay: Duration,
 }
 
 impl Default for EngineConfig {
@@ -137,6 +143,7 @@ impl Default for EngineConfig {
             depth: None,
             fresh: FRESH,
             rate: None,
+            analysis_delay: Duration::ZERO,
         }
     }
 }
@@ -331,9 +338,8 @@ struct Cam {
     /// What the camera is, as the source says it ("" while it is off).
     source: String,
     camera_error: Option<String>,
-    /// When a picture last came, and the number of the last one given to the tracker.
+    /// When a picture last came.
     last_frame: Option<Instant>,
-    last_fed: u64,
     /// The pictures are the size the calibration was made for (or there is no calibration).
     size_ok: bool,
     follow: Follow,
@@ -347,10 +353,25 @@ impl Cam {
             source: String::new(),
             camera_error: None,
             last_frame: None,
-            last_fed: 0,
             size_ok: true,
             follow: Follow { last: None, count: 0, shift: 0.0, every: FOLLOW_EVERY, anchor: None, last_save: None },
         }
+    }
+}
+
+/// What the pages and the other threads may know about the tracker without asking the analysis thread, which owns it:
+/// the analysis thread puts it in `Inner` after everything it does (a look, a command).
+#[derive(Clone)]
+struct TrackerView {
+    status: Status,
+    /// The views the tracker uses (the cameras, then the depth camera).
+    views: Vec<bool>,
+    depth_ignored: bool,
+}
+
+impl TrackerView {
+    fn of(tracker: &Tracker) -> TrackerView {
+        TrackerView { status: tracker.status(), views: tracker.views_in_use(), depth_ignored: tracker.depth_ignored() }
     }
 }
 
@@ -363,18 +384,22 @@ struct Inner {
     game_started: Option<Instant>,
     /// When play began (a game started or resumed): the cameras that have not given a picture are waited for a while.
     begun_at: Option<Instant>,
-    tracker: Tracker,
+    /// The tracker, as the analysis thread last said it was (see `TrackerView`).
+    tview: TrackerView,
     candidates: Vec<Candidate>,
     notice: Option<String>,
     last_status: Status,
     /// The main camera and the second one.
     cams: [Cam; CAMERAS],
-    last_feed: Option<Instant>,
     /// When a picture was last handed to the recording, and since when the tracker has been in the status it is in.
     last_recorded: Option<Instant>,
     status_since: Option<Instant>,
-    /// Which cameras (and the depth) the tracker was told were giving pictures, the last time (for the recording).
-    last_active: Option<[bool; VIEWS]>,
+    /// Where the analysis thread is in the pictures that came: how many of the pictures that arrived while playing it took
+    /// from the inbox (see `Backlog`), as of the last one.
+    backlog: Backlog,
+    /// The state of the inbox when the command that is running was sent, for the lines it writes in a recording (a
+    /// replay of every picture puts the command where the analysis put it).
+    job_after: Option<[u64; VIEWS]>,
     /// The game to write to the disk: set under the lock, written by `flush_save` once the lock is
     /// released (writing and flushing a file can take long on a small machine).
     pending_save: Option<GameRecord>,
@@ -468,6 +493,16 @@ pub struct Engine {
     /// Held while a game is written: one writer at a time, so that an older version cannot land
     /// after a newer one. Taken before `inner`, never while holding it.
     save_lock: Mutex<()>,
+    /// The pictures of every source and the commands, for the analysis thread (see the module `analysis`).
+    inbox: Arc<Inbox>,
+    analysis_delay: Duration,
+}
+
+impl Drop for Engine {
+    /// The analysis thread ends with the engine that it works for.
+    fn drop(&mut self) {
+        self.inbox.stop();
+    }
 }
 
 /// Picture streams allowed at once (two per page: the camera and the top-down board).
@@ -541,7 +576,10 @@ impl Engine {
             eprintln!("picture: {e:#}; using the defaults");
             Picture::default()
         });
-        Arc::new(Engine {
+        let inbox = Inbox::new(analysis::ANALYSIS_BUDGET);
+        let tview = TrackerView::of(&tracker);
+        let analyzer = Analyzer::new(tracker);
+        let engine = Arc::new(Engine {
             inner: Mutex::new(Inner {
                 roles: Roles::new(config.idle_timeout, config.game_timeout),
                 mode: Mode::Idle,
@@ -549,15 +587,15 @@ impl Engine {
                 game: unfinished,
                 game_started: None,
                 begun_at: None,
-                tracker,
+                tview,
                 candidates: Vec::new(),
                 notice: None,
                 last_status: Status::NoCalibration,
                 cams: [Cam::new(calibration, picture), Cam::new(second_calibration, second_picture)],
-                last_feed: None,
                 last_recorded: None,
                 status_since: None,
-                last_active: None,
+                backlog: Backlog::default(),
+                job_after: None,
                 pending_save: None,
                 recorder: None,
                 doubt: None,
@@ -589,7 +627,11 @@ impl Engine {
             frame_cv: Condvar::new(),
             frame_streams: AtomicUsize::new(0),
             save_lock: Mutex::new(()),
-        })
+            inbox: Arc::clone(&inbox),
+            analysis_delay: config.analysis_delay,
+        });
+        engine.spawn_analysis(analyzer);
+        engine
     }
 
     // ---- The cameras ----------------------------------------------------------
@@ -794,7 +836,7 @@ impl Engine {
                         match source.next_frame() {
                             Ok(frame) => {
                                 link.publish(&frame);
-                                self.record_depth_picture(link);
+                                self.offer_depth_picture(link);
                             }
                             Err(e) => {
                                 eprintln!("depth: {e:#}");
@@ -825,22 +867,33 @@ impl Engine {
         }
     }
 
-    /// With `--record-all` the height picture of every depth picture is kept, as the colour pictures are (the tracker
-    /// only looks at the latest one when it looks). The plane of the board takes a few milliseconds to find: that is done
-    /// here, on the depth thread, and not under the lock.
-    fn record_depth_picture(&self, link: &DepthLink) {
-        let rotation = {
+    /// A depth picture was read: its height picture goes to the analysis (when the tracker uses the depth) and, with
+    /// `--record-all`, to the recording, as the colour pictures do. The plane of the board takes a few milliseconds to
+    /// find: that is done here, on the depth thread, once for both, and not under the lock.
+    fn offer_depth_picture(&self, link: &DepthLink) {
+        let (rotation, recording_all) = {
             let inner = self.inner.grab();
-            match &inner.recorder {
-                Some(recorder) if recorder.records_every_picture() => inner.cams[0].picture.rotation,
-                _ => return,
-            }
+            (inner.cams[0].picture.rotation, inner.recorder.as_ref().is_some_and(Recorder::records_every_picture))
         };
+        let for_the_tracker = link.wanted() && link.aligned();
+        if !for_the_tracker && !recording_all {
+            return;
+        }
         let Some(stamp) = link.fresh() else { return };
         let Some(image) = link.height_picture_of(&stamp, rotation) else { return };
-        let mut inner = self.inner.grab();
-        if let Some(recorder) = inner.recorder.as_mut() {
-            recorder.source(&Stamped { view: DEPTH_VIEW, seq: stamp.seq, captured: stamp.at, image: Arc::new(image) });
+        let image = Arc::new(image);
+        if recording_all && let Some(recorder) = self.inner.grab().recorder.as_mut() {
+            recorder.source(&Stamped { view: DEPTH_VIEW, seq: stamp.seq, captured: stamp.at, image: Arc::clone(&image) });
+        }
+        if for_the_tracker {
+            self.offer_to_analysis(Item {
+                view: DEPTH_VIEW,
+                seq: stamp.seq,
+                captured: stamp.at,
+                waited: None,
+                image: Arc::clone(&image),
+                raw: image,
+            });
         }
     }
 
@@ -868,14 +921,14 @@ impl Engine {
     }
 
     /// Puts the result of an alignment to use: the tracker looks at the squares where they were found.
-    fn apply_depth_outcome(inner: &mut Inner, outcome: &AlignOutcome) {
+    fn apply_depth_outcome(inner: &Inner, analyzer: &mut Analyzer, outcome: &AlignOutcome) {
         match outcome.calibration {
             Some(calibration) => {
-                inner.tracker.set_view_advisory(DEPTH_VIEW, true);
-                inner.tracker.set_view_calibration(DEPTH_VIEW, Some(&calibration));
+                analyzer.tracker.set_view_advisory(DEPTH_VIEW, true);
+                analyzer.tracker.set_view_calibration(DEPTH_VIEW, Some(&calibration));
                 Self::record(inner, "calibration", json!({"cam": DEPTH_VIEW, "calibration": calibration, "how": "depth"}));
             }
-            None => inner.tracker.set_view_calibration(DEPTH_VIEW, None),
+            None => analyzer.tracker.set_view_calibration(DEPTH_VIEW, None),
         }
     }
 
@@ -966,8 +1019,6 @@ impl Engine {
     fn set_source(&self, cam: usize, description: String) {
         {
             let mut inner = self.inner.grab();
-            // The pictures of a camera that was opened (or closed) are numbered from 1 again.
-            inner.cams[cam].last_fed = 0;
             // A camera that is off has no pictures to be the wrong size.
             if description.is_empty() {
                 inner.cams[cam].size_ok = true;
@@ -1011,7 +1062,8 @@ impl Engine {
         }
     }
 
-    /// Handles one camera frame.
+    /// Handles one camera frame: stamps it, shows it, gives it to the recording and puts it in the inbox of the analysis
+    /// thread, which decides what the tracker looks at (see the module `analysis`). Nothing here waits for the tracker.
     fn on_frame(&self, cam: usize, image: RgbImage, arrival: Arrival) {
         let started = Instant::now();
         let slot = &self.slots[cam];
@@ -1028,22 +1080,7 @@ impl Engine {
         }
 
         let now = Instant::now();
-        // The height picture of the depth camera, for the tracker, made before the lock is taken (finding the plane of
-        // the board takes a few milliseconds): only when the tracker is about to look.
-        let depth_given: Option<(u64, RgbImage)> = self.depth.as_ref().and_then(|link| {
-            if !link.wanted() || !link.aligned() {
-                return None;
-            }
-            let (due, rotation) = {
-                let guard = self.inner.grab();
-                let due = guard.mode == Mode::Playing && guard.last_feed.is_none_or(|t| now.duration_since(t) >= self.track_interval());
-                (due, guard.cams[0].picture.rotation)
-            };
-            if due { link.height_picture(rotation, true) } else { None }
-        });
-        let asked_lock = Instant::now();
         let mut guard = self.inner.grab();
-        let lock_wait = asked_lock.elapsed();
         let inner = &mut *guard;
         let mut changed = inner.cams[cam].camera_error.take().is_some();
         inner.cams[cam].last_frame = Some(now);
@@ -1052,8 +1089,7 @@ impl Engine {
         if let Some(recorder) = inner.recorder.as_mut() {
             recorder.source(&Stamped { view: cam, seq, captured: arrival.captured, image: Arc::clone(&latest.raw) });
         }
-        let playing = inner.mode == Mode::Playing;
-        if playing {
+        if inner.mode == Mode::Playing {
             inner.pipe.arrival(cam, arrival.captured, arrival.waited);
             if let Some(line) = inner.pipe.report(now) {
                 eprintln!("{line}");
@@ -1061,11 +1097,6 @@ impl Engine {
         }
         // Time-based clean-up also runs with no page open (the camera must not stay on for ever).
         changed |= self.housekeeping(inner, now);
-        // The depth camera found the squares: the tracker looks at them there from now on.
-        if let Some(outcome) = self.depth.as_ref().and_then(|link| link.take_outcome()) {
-            Self::apply_depth_outcome(inner, &outcome);
-            changed = true;
-        }
 
         // A calibration is only good for the picture size it was made for.
         let size = [latest.image.width(), latest.image.height()];
@@ -1079,159 +1110,254 @@ impl Engine {
         }
         inner.cams[cam].size_ok = size_ok;
         changed |= Self::size_notice(inner);
+        drop(guard);
 
-        let feed_due = inner.last_feed.is_none_or(|t| now.duration_since(t) >= self.track_interval());
-        // The new pictures of the cameras that take part, for the tracker: one for each camera that has a calibration,
-        // gives pictures of that size, and has not been looked at yet.
-        let mut fed: Vec<(usize, Arc<Latest>)> = Vec::new();
-        if inner.mode == Mode::Playing && feed_due {
-            let mut active = [false; VIEWS];
-            // Several arrays are indexed by the camera together.
-            #[allow(clippy::needless_range_loop)]
-            for c in 0..CAMERAS {
-                let usable = inner.cams[c].calibration.is_some() && inner.cams[c].size_ok && self.cam_enabled(c);
-                let fresh = inner.cams[c].last_frame.is_some_and(|t| now.duration_since(t) < self.fresh);
-                // A camera that has gone quiet is left out, so that the others are not held up; one that has not
-                // given a picture since play began is waited for a little, so that all learn the squares together.
-                let waiting =
-                    inner.begun_at.is_some_and(|b| now.duration_since(b) < CAMERA_WAIT && inner.cams[c].last_frame.is_none_or(|t| t < b));
-                active[c] = usable && (fresh || waiting);
-                inner.tracker.set_view_active(c, active[c]);
-                if !usable || !fresh {
-                    continue;
-                }
-                let frame = if c == cam { Some(Arc::clone(&latest)) } else { self.slots[c].frame.read_ok().clone() };
-                if let Some(frame) = frame {
-                    fed.push((c, frame));
-                }
-            }
-            // The depth camera takes part when it is wanted, has found the squares, and gives pictures.
-            if let Some(link) = &self.depth {
-                active[DEPTH_VIEW] = link.wanted() && link.aligned() && link.fresh().is_some();
-                inner.tracker.set_view_active(DEPTH_VIEW, active[DEPTH_VIEW]);
-            }
-            // A camera is not given the same picture twice: a repeat would count as one more still picture.
-            fed.retain(|(c, frame)| frame.seq != inner.cams[*c].last_fed);
-            // The recording says which cameras took part, so that a replay does the same (see `replay`).
-            if inner.last_active != Some(active) && !fed.is_empty() {
-                inner.last_active = Some(active);
-                Self::record(inner, "views", json!({"active": active}));
-            }
+        // The picture goes to the analysis thread: it never waits, and never drops a picture within its memory budget.
+        self.offer_to_analysis(Item {
+            view: cam,
+            seq,
+            captured: arrival.captured,
+            waited: Some(arrival.waited),
+            image: Arc::clone(&latest.image),
+            raw: Arc::clone(&latest.raw),
+        });
+        if changed {
+            self.hub.notify();
         }
-        if !fed.is_empty() {
-            inner.last_feed = Some(now);
-            let mut images: Vec<Option<&RgbImage>> = vec![None; VIEWS];
-            for (c, frame) in &fed {
-                images[*c] = Some(frame.image.as_ref());
-                inner.cams[*c].last_fed = frame.seq;
-            }
-            if let Some((seq, picture)) = &depth_given {
-                images[DEPTH_VIEW] = Some(picture);
-                if let Some(link) = &self.depth {
-                    link.mark_fed(*seq);
+        self.follow_later(cam, &latest, now);
+        self.note_speed(cam, started);
+    }
+
+    /// Puts a picture in the inbox of the analysis thread. Only when the memory budget of the inbox is full (the analysis is
+    /// minutes behind) is a picture left out: the analysis thread says so, loudly, when it gets to the next one.
+    fn offer_to_analysis(&self, item: Item) {
+        let _ = self.inbox.push(item);
+    }
+
+    // ---- The analysis thread ----------------------------------------------------
+
+    /// Starts the thread that owns the tracker: it takes the pictures and the commands from the inbox, in order. It ends
+    /// when the engine is gone.
+    fn spawn_analysis(self: &Arc<Self>, mut analyzer: Analyzer) {
+        let inbox = Arc::clone(&self.inbox);
+        let engine = Arc::downgrade(self);
+        let started = thread::Builder::new().name("analysis".into()).spawn(move || {
+            loop {
+                match inbox.next() {
+                    Next::Stop => return,
+                    Next::Picture(item, backlog) => {
+                        let Some(engine) = engine.upgrade() else { return };
+                        // A panic while looking at a picture costs that picture, not the thread.
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.analyse(&mut analyzer, item, backlog)));
+                        if outcome.is_err() {
+                            eprintln!("analysis: a picture could not be looked at (internal error); going on");
+                        }
+                    }
+                    Next::Job(job) => {
+                        let Some(engine) = engine.upgrade() else { return };
+                        // The person who sent it may have given up waiting: it must not run then.
+                        if !job.begin() {
+                            continue;
+                        }
+                        engine.inner.grab().job_after = Some(job.after());
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run(&engine, &mut analyzer)));
+                        {
+                            let mut inner = engine.inner.grab();
+                            inner.job_after = None;
+                            inner.tview = TrackerView::of(&analyzer.tracker);
+                        }
+                        if outcome.is_err() {
+                            eprintln!("analysis: a command could not be carried out (internal error); going on");
+                        }
+                    }
                 }
             }
-            let look = Instant::now();
-            let detection = inner.tracker.feed_views(&images, now);
-            let step = look.elapsed();
-            // How the pictures got here, for the console and the recording (see the module `pipeline`).
-            let mut seen: Vec<Fed> = fed
-                .iter()
-                .map(|(c, frame)| Fed { view: *c, seq: frame.seq, captured: frame.captured, waited: Some(frame.waited) })
-                .collect();
-            if let (Some((seq, _)), Some(link)) = (&depth_given, &self.depth)
-                && let Some(stamp) = link.fresh().filter(|s| s.seq == *seq)
+        });
+        if let Err(e) = started {
+            eprintln!("analysis: cannot start the thread: {e}");
+        }
+    }
+
+    /// Does something that changes what the tracker or the game believes, in the analysis thread, after the pictures that
+    /// were in the inbox when this was called, and waits for the answer. Never call it with `inner` held (the analysis thread
+    /// takes it), nor from the analysis thread itself.
+    fn ordered<T: Send + 'static>(&self, f: impl FnOnce(&Engine, &mut Analyzer) -> ApiResult<T> + Send + 'static) -> ApiResult<T> {
+        let (tx, rx) = sync_channel::<ApiResult<T>>(1);
+        let run: analysis::Work = Box::new(move |engine, analyzer| {
+            let _ = tx.send(f(engine, analyzer));
+        });
+        let Some(handle) = self.inbox.submit(run) else { return Err(ApiError::Internal("the analysis is not running".into())) };
+        let failed = || ApiError::Internal("the command could not be carried out (internal error)".into());
+        match rx.recv_timeout(COMMAND_WAIT) {
+            Ok(answer) => answer,
+            Err(RecvTimeoutError::Timeout) => {
+                if handle.cancel() {
+                    Err(ApiError::Internal("the analysis is too far behind the camera to take this now: try again in a moment".into()))
+                } else {
+                    // It is running: wait for it.
+                    rx.recv().unwrap_or_else(|_| Err(failed()))
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(failed()),
+        }
+    }
+
+    /// The same without waiting for the answer: for what a thread of the engine does by itself (following the board).
+    fn posted(&self, f: impl FnOnce(&Engine, &mut Analyzer) + Send + 'static) {
+        let _ = self.inbox.submit(Box::new(f));
+    }
+
+    /// What the tracker looks at, and the state of the engine that it depends on, for the analysis thread.
+    fn look_context(&self) -> Context {
+        let inner = self.inner.grab();
+        let mut usable = [false; CAMERAS];
+        for (c, usable) in usable.iter_mut().enumerate() {
+            *usable = inner.cams[c].calibration.is_some() && inner.cams[c].size_ok && self.cam_enabled(c);
+        }
+        Context {
+            playing: inner.mode == Mode::Playing,
+            usable,
+            depth: self.depth.as_ref().is_some_and(|link| link.wanted() && link.aligned()),
+            interval: self.track_interval(),
+            fresh: self.fresh,
+            begun_at: inner.begun_at,
+        }
+    }
+
+    /// The analysis thread takes a picture: the depth camera's alignment is put to use, and the tracker looks if it is time.
+    fn analyse(&self, analyzer: &mut Analyzer, item: Item, backlog: Backlog) {
+        if !self.analysis_delay.is_zero() {
+            thread::sleep(self.analysis_delay);
+        }
+        let lost = self.inbox.take_lost();
+        if lost.iter().sum::<u64>() > 0 {
+            let (count, cap) = (lost.iter().sum::<u64>(), self.inbox.budget().cap() >> 20);
+            eprintln!(
+                "analysis: {count} pictures were left out of the analysis: the pictures waiting for it passed {cap} MB (the analysis is far behind the camera)"
+            );
+            let inner = self.inner.grab();
+            Self::record(&inner, "analysis_gap", json!({"left_out": lost, "limit_mb": cap}));
+        }
+        // The depth camera found the squares: the tracker looks at them there from now on.
+        if let Some(outcome) = self.depth.as_ref().and_then(|link| link.take_outcome()) {
             {
-                seen.push(Fed { view: DEPTH_VIEW, seq: stamp.seq, captured: stamp.at, waited: None });
+                let mut inner = self.inner.grab();
+                Self::apply_depth_outcome(&inner, analyzer, &outcome);
+                inner.tview = TrackerView::of(&analyzer.tracker);
             }
-            let feed_note = inner.pipe.fed(look, lock_wait, step, &seen);
-            // What the recording will say about this picture (see the module record).
-            let mut noted: Option<(&'static str, Value)> = None;
-            let found = matches!(detection, Detection::Move { .. } | Detection::Sequence { .. });
-            match detection {
-                Detection::Nothing => {
-                    if inner.tracker.status() != Status::Unsure && !inner.candidates.is_empty() {
-                        inner.candidates.clear();
-                        changed = true;
-                    }
-                }
-                Detection::Unsure { candidates } => {
-                    // Tell the pages only when the list changed: this comes at every picture while unsure.
-                    if !inner.candidates.iter().map(|c| &c.uci).eq(candidates.iter().map(|c| &c.uci)) {
-                        noted = Some(("unsure", json!({"candidates": candidates_json(&candidates)})));
-                        inner.candidates = candidates;
-                        changed = true;
-                    }
-                }
-                Detection::Sequence { moves, since } => {
+            self.hub.notify();
+        }
+        let interval = self.track_interval();
+        if let Some(look) = analyzer.on_picture(item, || self.look_context(), interval) {
+            self.publish_look(analyzer, look, backlog);
+        }
+    }
+
+    /// What the tracker found at a look goes to the game, the pages and the recording. The tracker looked without the
+    /// engine's lock; only this takes it.
+    fn publish_look(&self, analyzer: &mut Analyzer, look: Look, backlog: Backlog) {
+        let asked_lock = Instant::now();
+        let mut guard = self.inner.grab();
+        let lock_wait = asked_lock.elapsed();
+        let inner = &mut *guard;
+        let Look { at, started, step, fed, active, views_changed, detection } = look;
+        // Commands run between pictures, in this thread: the game cannot have ended since the look began (a game that ended
+        // while its pictures waited has no looks: the context said it was not played).
+        if inner.mode != Mode::Playing {
+            return;
+        }
+        let mut changed = false;
+        // The recording says which cameras took part, so that a replay does the same (see `replay`).
+        if views_changed {
+            Self::record(inner, "views", json!({"active": active}));
+        }
+        // How the pictures got here, for the console and the recording (see the module `pipeline`).
+        let seen: Vec<Fed> = fed.iter().map(|p| Fed { view: p.view, seq: p.seq, captured: p.captured, waited: p.waited }).collect();
+        let feed_note = inner.pipe.fed(started, lock_wait, step, &seen);
+        inner.pipe.backlog(&backlog);
+        inner.backlog = backlog;
+        // What the recording will say about this picture (see the module record).
+        let mut noted: Option<(&'static str, Value)> = None;
+        let found = matches!(detection, Detection::Move { .. } | Detection::Sequence { .. });
+        match detection {
+            Detection::Nothing => {
+                if analyzer.tracker.status() != Status::Unsure && !inner.candidates.is_empty() {
                     inner.candidates.clear();
-                    let doubt = inner.tracker.take_doubt();
-                    let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
-                    self.apply_detected_moves(inner, &moves, since);
-                    noted = Some(detection_event(inner, before, moves.len(), doubt.as_ref()));
-                    remember_doubt(inner, doubt, before, moves.len());
                     changed = true;
                 }
-                Detection::Move { mv, since, promotion_guess } => {
-                    inner.candidates.clear();
-                    let doubt = inner.tracker.take_doubt();
-                    let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
-                    self.apply_detected_move(inner, mv, since, promotion_guess);
-                    noted = Some(detection_event(inner, before, 1, doubt.as_ref()));
-                    remember_doubt(inner, doubt, before, 1);
+            }
+            Detection::Unsure { candidates } => {
+                // Tell the pages only when the list changed: this comes at every picture while unsure.
+                if !inner.candidates.iter().map(|c| &c.uci).eq(candidates.iter().map(|c| &c.uci)) {
+                    noted = Some(("unsure", json!({"candidates": candidates_json(&candidates)})));
+                    inner.candidates = candidates;
                     changed = true;
                 }
             }
-            let status = inner.tracker.status();
-            if status != inner.last_status {
-                inner.last_status = status;
-                inner.status_since = Some(now);
+            Detection::Sequence { moves, since } => {
+                inner.candidates.clear();
+                let doubt = analyzer.tracker.take_doubt();
+                let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
+                self.apply_detected_moves(inner, &mut analyzer.tracker, &moves, since);
+                noted = Some(detection_event(inner, &analyzer.tracker, before, moves.len(), doubt.as_ref()));
+                remember_doubt(inner, doubt, before, moves.len());
                 changed = true;
             }
-            // Every picture is wanted while something is going on, but not for ever: a game left "unsure" overnight would
-            // fill the disk. After a while in the same status the pictures come at the slow pace of `--record-every`.
-            let loud = found || (status != Status::Watching && inner.status_since.is_none_or(|t| now.duration_since(t) < RECORD_LOUD));
-            // The picture comes before what it led to, so that the file reads in order. Every picture is kept
-            // while something is going on; only now and then while the board is quiet.
-            // At 25 pictures a second the recording keeps a few a second, not all (a replay takes the time from the file).
-            let gap = self.record.as_ref().map_or(Duration::ZERO, |r| r.busy_every);
-            let keep_picture = found || inner.last_recorded.is_none_or(|t| now.duration_since(t) >= gap);
-            if let Some(recorder) = inner.recorder.as_mut() {
-                // Every look is noted, also when the picture itself is not kept: the lag is wanted at all times.
-                recorder.event(now, "pipe", feed_note.json());
-                if recorder.records_every_picture() {
-                    // Every picture was kept as it came: the recording only says which of them this look was given. The
-                    // tracker is given the latest picture of each camera, which may be one that came before the recording
-                    // began, or that the thread of its camera has not handed over yet: it is kept now if it is not (a
-                    // picture is kept once, whoever offers it first).
-                    let mut given: Vec<(usize, u64)> = Vec::with_capacity(fed.len() + 1);
-                    for (c, frame) in &fed {
-                        recorder.source(&Stamped { view: *c, seq: frame.seq, captured: frame.captured, image: Arc::clone(&frame.raw) });
-                        given.push((*c, frame.seq));
-                    }
-                    if let Some((seq, picture)) = &depth_given {
-                        // The depth thread keeps the height picture of every depth picture; this one may not be there yet.
-                        if !recorder.has_picture(DEPTH_VIEW, *seq) {
-                            let captured = seen.iter().find(|f| f.view == DEPTH_VIEW).map_or(now, |f| f.captured);
-                            recorder.source(&Stamped { view: DEPTH_VIEW, seq: *seq, captured, image: Arc::new(picture.clone()) });
-                        }
-                        given.push((DEPTH_VIEW, *seq));
-                    }
-                    recorder.look(now, &given, status_name(status));
-                } else if keep_picture {
-                    let mut pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|(c, frame)| (*c, Arc::clone(&frame.image))).collect();
-                    if let Some((_, picture)) = &depth_given {
-                        pictures.push((DEPTH_VIEW, Arc::new(picture.clone())));
-                    }
-                    recorder.frames(now, &pictures, status_name(status), loud);
-                    inner.last_recorded = Some(now);
-                }
-                if let Some((kind, data)) = noted {
-                    recorder.event(now, kind, data);
-                }
+            Detection::Move { mv, since, promotion_guess } => {
+                inner.candidates.clear();
+                let doubt = analyzer.tracker.take_doubt();
+                let before = inner.game.as_ref().map_or(0, |g| g.moves.len());
+                self.apply_detected_move(inner, &mut analyzer.tracker, mv, since, promotion_guess);
+                noted = Some(detection_event(inner, &analyzer.tracker, before, 1, doubt.as_ref()));
+                remember_doubt(inner, doubt, before, 1);
+                changed = true;
             }
-            self.close_recording_if_idle(inner);
         }
+        inner.tview = TrackerView::of(&analyzer.tracker);
+        let status = analyzer.tracker.status();
+        let now = Instant::now();
+        if status != inner.last_status {
+            inner.last_status = status;
+            inner.status_since = Some(now);
+            changed = true;
+        }
+        // Every picture is wanted while something is going on, but not for ever: a game left "unsure" overnight would
+        // fill the disk. After a while in the same status the pictures come at the slow pace of `--record-every`.
+        let loud = found || (status != Status::Watching && inner.status_since.is_none_or(|t| now.duration_since(t) < RECORD_LOUD));
+        // The picture comes before what it led to, so that the file reads in order. Every picture is kept
+        // while something is going on; only now and then while the board is quiet.
+        // At 25 pictures a second the recording keeps a few a second, not all (a replay takes the time from the file).
+        let gap = self.record.as_ref().map_or(Duration::ZERO, |r| r.busy_every);
+        let keep_picture = found || inner.last_recorded.is_none_or(|t| now.duration_since(t) >= gap);
+        if let Some(recorder) = inner.recorder.as_mut() {
+            // Every look is noted, also when the picture itself is not kept: the lag is wanted at all times.
+            recorder.event(now, "pipe", feed_note.json());
+            if recorder.records_every_picture() {
+                // Every picture was kept as it came: the recording only says which of them this look was given. The
+                // tracker may be given a picture that came before the recording began: it is kept now if it is not (a
+                // picture is kept once, whoever offers it first).
+                let mut given: Vec<(usize, u64)> = Vec::with_capacity(fed.len());
+                for picture in &fed {
+                    recorder.source(&Stamped {
+                        view: picture.view,
+                        seq: picture.seq,
+                        captured: picture.captured,
+                        image: Arc::clone(&picture.raw),
+                    });
+                    given.push((picture.view, picture.seq));
+                }
+                recorder.look(now, &given, status_name(status), at);
+            } else if keep_picture {
+                let pictures: Vec<(usize, Arc<RgbImage>)> = fed.iter().map(|p| (p.view, Arc::clone(&p.image))).collect();
+                recorder.frames(now, &pictures, status_name(status), loud);
+                inner.last_recorded = Some(now);
+            }
+            if let Some((kind, data)) = noted {
+                recorder.event(now, kind, data);
+            }
+        }
+        self.close_recording_if_idle(inner, &analyzer.tracker);
         let save_due = inner.pending_save.is_some();
         drop(guard);
         // The pages are told first; the game is written by the saver thread, whose failure becomes the notice of the pages.
@@ -1241,8 +1367,6 @@ impl Engine {
         if save_due {
             self.request_save();
         }
-        self.follow_later(cam, &latest, now);
-        self.note_speed(cam, started);
     }
 
     /// Keeps the figures shown under the camera picture: pictures per second, and the time
@@ -1257,6 +1381,11 @@ impl Engine {
         stats.process_ms = smooth(stats.process_ms, started.elapsed().as_secs_f32() * 1000.0);
     }
 
+    /// The pictures that wait for the analysis now, and how old the oldest is.
+    pub fn backlog(&self) -> Backlog {
+        self.inbox.backlog()
+    }
+
     /// True while a game is being recorded (the Android app refuses camera changes then).
     pub fn is_playing(&self) -> bool {
         self.inner.grab().mode == Mode::Playing
@@ -1264,6 +1393,7 @@ impl Engine {
 
     /// Pictures per second and milliseconds per picture, for the page.
     pub fn camera_stats(&self, cam: usize) -> Value {
+        let backlog = self.inbox.backlog();
         let stats = self.slots[cam.min(CAMERAS - 1)].stats.grab();
         let fps = match stats.last_frame {
             Some(last) if last.elapsed() < Duration::from_secs(3) && stats.interval_ms > 0.0 => 1000.0 / stats.interval_ms,
@@ -1274,6 +1404,9 @@ impl Engine {
             "process_ms": (stats.process_ms * 10.0).round() / 10.0,
             "encode_ms": (ENCODE_US.load(Ordering::Relaxed) as f32 / 100.0).round() / 10.0,
             "streams": self.frame_streams.load(Ordering::SeqCst),
+            // The pictures waiting for the analysis, and how old the oldest is.
+            "waiting": backlog.waiting,
+            "lag_ms": backlog.oldest.as_millis() as u64,
         })
     }
 
@@ -1292,7 +1425,7 @@ impl Engine {
                 return;
             }
             // Only while the board is quiet: no hand, no move being made.
-            if !matches!(inner.tracker.status(), Status::Watching | Status::Learning) {
+            if !matches!(inner.tview.status, Status::Watching | Status::Learning) {
                 return;
             }
             inner.cams[cam].follow.last = Some(now);
@@ -1306,14 +1439,22 @@ impl Engine {
         let started = Instant::now();
         let found = boarddetect::refine(&latest.image, &calibration);
         let spent = started.elapsed();
-        let mut inner = self.inner.grab();
-        inner.cams[cam].follow.every = FOLLOW_EVERY.max(spent * 20);
+        self.inner.grab().cams[cam].follow.every = FOLLOW_EVERY.max(spent * 20);
         let Ok(found) = found else { return };
         let moved = Calibration::for_frame(found.corners, size[0], size[1]);
         let shift = boarddetect::shift_in_squares(&calibration, &moved);
         if !(FOLLOW_MIN_SHIFT..=FOLLOW_MAX_SHIFT).contains(&shift) || moved.validate(size[0], size[1]).is_err() {
             return;
         }
+        // The tracker is the analysis thread's: the move of the calibration is a command to it, which comes after the
+        // pictures that were taken before it, as the board stood then.
+        self.posted(move |engine, analyzer| engine.follow_apply(analyzer, cam, calibration, moved, shift, now));
+    }
+
+    /// The analysis thread moves the calibration of a camera along with the board, if things are still as they were when
+    /// the board was looked for.
+    fn follow_apply(&self, analyzer: &mut Analyzer, cam: usize, calibration: Calibration, moved: Calibration, shift: f32, now: Instant) {
+        let mut inner = self.inner.grab();
         // Things may have changed while looking.
         if inner.mode != Mode::Playing || inner.cams[cam].calibration != Some(calibration) {
             return;
@@ -1323,10 +1464,10 @@ impl Engine {
             eprintln!("follow: the board is more than a square from where the game began; not following (calibrate again)");
             return;
         }
-        match inner.tracker.status() {
+        match analyzer.tracker.status() {
             // Nothing learned yet: learn from the better grid.
-            Status::Learning => inner.tracker.set_view_calibration(cam, Some(&moved)),
-            Status::Watching => inner.tracker.move_view_calibration(cam, &moved),
+            Status::Learning => analyzer.tracker.set_view_calibration(cam, Some(&moved)),
+            Status::Watching => analyzer.tracker.move_view_calibration(cam, &moved),
             _ => return,
         }
         inner.cams[cam].calibration = Some(moved);
@@ -1355,7 +1496,7 @@ impl Engine {
         since.saturating_duration_since(inner.game_started.unwrap_or(since)).as_secs_f64()
     }
 
-    fn apply_detected_move(&self, inner: &mut Inner, mv: shakmaty::Move, since: Instant, guess: bool) {
+    fn apply_detected_move(&self, inner: &mut Inner, tracker: &mut Tracker, mv: shakmaty::Move, since: Instant, guess: bool) {
         let t = Self::move_time(inner, since);
         let Some(game) = inner.game.as_mut() else { return };
         match game.push_move(mv, t, guess) {
@@ -1364,7 +1505,7 @@ impl Engine {
                 // The tracker and the game disagree: trust the game.
                 inner.notice = Some(format!("a detected move was rejected ({e:#}); position kept"));
                 if let Ok(pos) = game.position() {
-                    inner.tracker.set_position(pos);
+                    tracker.set_position(pos);
                 }
                 return;
             }
@@ -1391,6 +1532,16 @@ impl Engine {
     /// player could not checkmate with any moves (the rules of chess call that a draw). Returns true when it did.
     /// Called by the clock thread, and by tests.
     fn check_clock(&self) -> bool {
+        // Only a clock that has run out needs the analysis thread: the game ends after the pictures that were waiting, so
+        // that a move that was made in time is not lost to the flag.
+        if !matches!(self.time_to_flag(), Some(left) if left.is_zero()) {
+            return false;
+        }
+        self.ordered(|engine, analyzer| Ok(engine.check_clock_now(analyzer))).unwrap_or(false)
+    }
+
+    /// `check_clock`, in the analysis thread.
+    fn check_clock_now(&self, analyzer: &mut Analyzer) -> bool {
         {
             let mut guard = self.inner.grab();
             let inner = &mut *guard;
@@ -1413,7 +1564,7 @@ impl Engine {
             self.go_idle(inner);
             inner.candidates.clear();
             inner.doubt = None;
-            self.close_recording_if_idle(inner);
+            self.close_recording_if_idle(inner, &analyzer.tracker);
         }
         self.hub.notify();
         // A failure to write the game becomes the notice of the pages, and is tried again (see `flush_save`).
@@ -1458,7 +1609,7 @@ impl Engine {
     /// which is the time of the last of them; the others are put evenly between the move before them and that time
     /// (an estimate, so that the time each player took is shared out, not all given to the last move). At the start of a
     /// game there is no move before: the clock starts with the first move, and all are at 0.
-    fn apply_detected_moves(&self, inner: &mut Inner, moves: &[shakmaty::Move], since: Instant) {
+    fn apply_detected_moves(&self, inner: &mut Inner, tracker: &mut Tracker, moves: &[shakmaty::Move], since: Instant) {
         let t = Self::move_time(inner, since);
         let Some(game) = inner.game.as_mut() else { return };
         let before = game.moves.len();
@@ -1474,7 +1625,7 @@ impl Engine {
                     }
                     inner.notice = Some(format!("the moves detected at once were rejected ({e:#}); position kept"));
                     if let Ok(pos) = game.position() {
-                        inner.tracker.set_position(pos);
+                        tracker.set_position(pos);
                     }
                     return;
                 }
@@ -1654,8 +1805,9 @@ impl Engine {
             _ => None,
         };
         let promotion_pending = inner.game.as_ref().and_then(|g| g.moves.last()).is_some_and(|m| m.promotion_guess);
+        let backlog = if playing { self.inbox.backlog() } else { Backlog::default() };
         // The cameras the tracker uses (the depth view is told apart, after them).
-        let views = inner.tracker.views_in_use();
+        let views = inner.tview.views.clone();
         let depth = self.depth.as_ref().map(|link| {
             let status = link.status();
             json!({
@@ -1668,7 +1820,7 @@ impl Engine {
                 "score": (status.score * 100.0).round() / 100.0,
                 "message": status.message,
                 "in_use": views.get(DEPTH_VIEW).copied().unwrap_or(false),
-                "ignored": inner.tracker.depth_ignored(),
+                "ignored": inner.tview.depth_ignored,
                 "settings": link.settings(),
                 "modes": link.modes(),
                 "valid": (status.valid * 100.0).round() / 100.0,
@@ -1717,8 +1869,11 @@ impl Engine {
                 "last_shift": (inner.cams.iter().map(|c| c.follow.shift).fold(0.0f32, f32::max) * 100.0).round() / 100.0,
             },
             "tracker": {
-                "status": status_name(inner.tracker.status()),
+                "status": status_name(inner.tview.status),
                 "views": views.iter().take(CAMERAS).collect::<Vec<_>>(),
+                // Pictures waiting for the analysis and how old the oldest is: the page shows a move late when it is behind.
+                "waiting": backlog.waiting,
+                "lag_ms": backlog.oldest.as_millis() as u64,
                 "candidates": candidates_json(&inner.candidates),
                 "doubt": doubt_json(inner),
                 "promotion_pending": promotion_pending,
@@ -1817,6 +1972,11 @@ impl Engine {
 
     pub fn set_calibration(&self, token: &str, cam: usize, corners: [[f32; 2]; 4]) -> ApiResult {
         self.check_cam(cam)?;
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.set_calibration_in(analyzer, &token, cam, corners))
+    }
+
+    fn set_calibration_in(&self, analyzer: &mut Analyzer, token: &str, cam: usize, corners: [[f32; 2]; 4]) -> ApiResult {
         let mut inner = self.controlled(token)?;
         let frame = self.latest_frame(cam).ok_or_else(|| ApiError::Conflict("the camera is off: open the calibration first".into()))?;
         let calibration = Calibration::for_frame(corners, frame.image.width(), frame.image.height());
@@ -1827,7 +1987,7 @@ impl Engine {
         inner.cams[cam].size_ok = true;
         Self::record(&inner, "calibration", json!({"how": "set", "cam": cam, "calibration": calibration}));
         // During a game the squares are learned again from the position reached.
-        inner.tracker.set_view_calibration(cam, Some(&calibration));
+        analyzer.tracker.set_view_calibration(cam, Some(&calibration));
         // Any notice is old news now; a camera that is still the wrong size says so again.
         inner.notice = None;
         Self::size_notice(&mut inner);
@@ -1899,6 +2059,11 @@ impl Engine {
     /// The calibration is turned with it, so it stays valid.
     pub fn rotate_picture(&self, token: &str, cam: usize, turns: i32) -> ApiResult {
         self.check_cam(cam)?;
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.rotate_picture_in(analyzer, &token, cam, turns))
+    }
+
+    fn rotate_picture_in(&self, analyzer: &mut Analyzer, token: &str, cam: usize, turns: i32) -> ApiResult {
         let mut inner = self.picture_guard(token)?;
         let turns = turns.rem_euclid(4);
         if turns == 0 {
@@ -1919,7 +2084,7 @@ impl Engine {
             turned.save(&self.slots[cam].calibration_path).map_err(ApiError::internal)?;
             inner.cams[cam].calibration = Some(turned);
             inner.cams[cam].follow.anchor = None;
-            inner.tracker.set_view_calibration(cam, Some(&turned));
+            analyzer.tracker.set_view_calibration(cam, Some(&turned));
         }
         self.store_picture(&mut inner, cam, settings, turns)?;
         drop(inner);
@@ -1963,17 +2128,22 @@ impl Engine {
 
     pub fn clear_calibration(&self, token: &str, cam: usize) -> ApiResult {
         self.check_cam(cam)?;
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.clear_calibration_in(analyzer, &token, cam))
+    }
+
+    fn clear_calibration_in(&self, analyzer: &mut Analyzer, token: &str, cam: usize) -> ApiResult {
         let mut inner = self.controlled(token)?;
         if inner.mode == Mode::Playing {
             return Err(ApiError::Conflict("a game is running".into()));
         }
-        self.forget_calibration(&mut inner, cam)?;
+        self.forget_calibration(&mut inner, analyzer, cam)?;
         drop(inner);
         self.hub.notify();
         Ok(())
     }
 
-    fn forget_calibration(&self, inner: &mut Inner, cam: usize) -> ApiResult {
+    fn forget_calibration(&self, inner: &mut Inner, analyzer: &mut Analyzer, cam: usize) -> ApiResult {
         match std::fs::remove_file(&self.slots[cam].calibration_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1982,7 +2152,7 @@ impl Engine {
         inner.cams[cam].calibration = None;
         inner.cams[cam].follow.anchor = None;
         inner.cams[cam].size_ok = true;
-        inner.tracker.set_view_calibration(cam, None);
+        analyzer.tracker.set_view_calibration(cam, None);
         Self::size_notice(inner);
         Ok(())
     }
@@ -2059,7 +2229,7 @@ impl Engine {
         }
         // Looking for the cameras takes a moment: not under the lock.
         let camera = selection.find(id).map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
-        let mut inner = self.controlled(token)?;
+        let inner = self.controlled(token)?;
         refuse_when_playing(&inner)?;
         if selection.device() == camera.id {
             return Ok(());
@@ -2074,12 +2244,17 @@ impl Engine {
             )));
         }
         selection.store(&camera).map_err(ApiError::internal)?;
-        if inner.cams[cam].calibration.is_some() {
-            self.forget_calibration(&mut inner, cam)?;
-        }
-        inner.cams[cam].camera_error = None;
-        self.slots[cam].reopen.store(true, Ordering::SeqCst);
+        let had_calibration = inner.cams[cam].calibration.is_some();
         drop(inner);
+        // The tracker is the analysis thread's: it forgets the calibration of a camera that was left.
+        if had_calibration {
+            self.ordered(move |engine, analyzer| {
+                let mut inner = engine.inner.grab();
+                engine.forget_calibration(&mut inner, analyzer, cam)
+            })?;
+        }
+        self.inner.grab().cams[cam].camera_error = None;
+        self.slots[cam].reopen.store(true, Ordering::SeqCst);
         // The other camera may have a depth part, or none.
         if cam == 0 {
             self.refresh_depth_offer();
@@ -2095,6 +2270,14 @@ impl Engine {
     /// Ticks or unticks "use the depth" (kept for the next start). While a game is going on, the squares are looked for
     /// in the depth picture at once, from the position the game is in.
     pub fn set_depth(&self, token: &str, on: bool) -> ApiResult {
+        if self.depth.is_none() {
+            return Err(ApiError::Conflict("this program cannot read a depth camera".into()));
+        }
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.set_depth_in(analyzer, &token, on))
+    }
+
+    fn set_depth_in(&self, analyzer: &mut Analyzer, token: &str, on: bool) -> ApiResult {
         let Some(link) = &self.depth else { return Err(ApiError::Conflict("this program cannot read a depth camera".into())) };
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
@@ -2104,12 +2287,12 @@ impl Engine {
         link.set_on(on).map_err(ApiError::internal)?;
         if on {
             if inner.mode == Mode::Playing {
-                let position = inner.tracker.position().clone();
+                let position = analyzer.tracker.position().clone();
                 self.ask_depth_alignment(inner, &position);
             }
         } else {
-            inner.tracker.set_view_active(DEPTH_VIEW, false);
-            inner.tracker.set_view_calibration(DEPTH_VIEW, None);
+            analyzer.tracker.set_view_active(DEPTH_VIEW, false);
+            analyzer.tracker.set_view_calibration(DEPTH_VIEW, None);
         }
         drop(guard);
         // The depth thread starts or stops reading.
@@ -2122,6 +2305,14 @@ impl Engine {
     /// that count, the size of the picture, its speed. Not during a game. The distances work at once; another size or
     /// speed opens the camera again, and the board has to be found in the new picture again.
     pub fn set_depth_settings(&self, token: &str, patch: crate::depthlink::DepthPatch) -> ApiResult {
+        if self.depth.is_none() {
+            return Err(ApiError::Conflict("this program cannot read a depth camera".into()));
+        }
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.set_depth_settings_in(analyzer, &token, patch))
+    }
+
+    fn set_depth_settings_in(&self, analyzer: &mut Analyzer, token: &str, patch: crate::depthlink::DepthPatch) -> ApiResult {
         let Some(link) = &self.depth else { return Err(ApiError::Conflict("this program cannot read a depth camera".into())) };
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
@@ -2139,8 +2330,8 @@ impl Engine {
         let reopen = link.set_settings(next).map_err(ApiError::internal)?;
         if reopen {
             // What was found about the board belonged to the other picture.
-            inner.tracker.set_view_active(DEPTH_VIEW, false);
-            inner.tracker.set_view_calibration(DEPTH_VIEW, None);
+            analyzer.tracker.set_view_active(DEPTH_VIEW, false);
+            analyzer.tracker.set_view_calibration(DEPTH_VIEW, None);
         }
         drop(guard);
         // The depth thread opens the camera again.
@@ -2152,6 +2343,14 @@ impl Engine {
     /// Looks for the squares in the depth picture now, with the board in the position of the game (or the start
     /// position when there is no game: the page asks for it with the pieces set up).
     pub fn align_depth(&self, token: &str) -> ApiResult {
+        if self.depth.is_none() {
+            return Err(ApiError::Conflict("this program cannot read a depth camera".into()));
+        }
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.align_depth_in(analyzer, &token))
+    }
+
+    fn align_depth_in(&self, analyzer: &mut Analyzer, token: &str) -> ApiResult {
         let Some(link) = &self.depth else { return Err(ApiError::Conflict("this program cannot read a depth camera".into())) };
         let guard = self.controlled(token)?;
         if !link.wanted() {
@@ -2160,7 +2359,7 @@ impl Engine {
         if guard.cams[0].calibration.is_none() {
             return Err(ApiError::Conflict("calibrate the board on the colour picture first".into()));
         }
-        let position = if guard.mode == Mode::Playing { guard.tracker.position().clone() } else { shakmaty::Chess::default() };
+        let position = if guard.mode == Mode::Playing { analyzer.tracker.position().clone() } else { shakmaty::Chess::default() };
         link.set_message("looking for the board in the depth picture...");
         self.ask_depth_alignment(&guard, &position);
         drop(guard);
@@ -2193,6 +2392,11 @@ impl Engine {
     // ---- Games -------------------------------------------------------------------
 
     pub fn start_game(&self, token: &str, request: StartRequest) -> ApiResult {
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.start_game_in(analyzer, &token, request))
+    }
+
+    fn start_game_in(&self, analyzer: &mut Analyzer, token: &str, request: StartRequest) -> ApiResult {
         let mut inner = self.controlled(token)?;
         if inner.mode == Mode::Playing {
             return Err(ApiError::Conflict("a game is already running".into()));
@@ -2205,7 +2409,7 @@ impl Engine {
         game.time_control = request.time_control;
         let position = game.start_position()?;
         inner.game = Some(game);
-        self.begin_playing(&mut inner, position, 0.0);
+        self.begin_playing(&mut inner, analyzer, position, 0.0);
         // A scripted source (the demo) begins its game again; a real camera does nothing.
         for slot in &self.slots {
             slot.restart.store(true, Ordering::SeqCst);
@@ -2240,6 +2444,7 @@ impl Engine {
             picture2: self.second_enabled().then_some(inner.cams[1].picture),
             video: None,
             every_picture: false,
+            track_interval: self.track_interval().as_secs_f64(),
         };
         inner.recorder = match Recorder::begin(options, meta, Instant::now()) {
             Ok(recorder) => {
@@ -2254,15 +2459,20 @@ impl Engine {
     }
 
     /// Notes something in the recording of the game, if there is one.
-    fn record(inner: &Inner, kind: &str, data: Value) {
+    fn record(inner: &Inner, kind: &str, mut data: Value) {
         if let Some(recorder) = &inner.recorder {
+            // A command that ran in the analysis thread says how many pictures of each view came before it: a replay of
+            // every picture puts it in the same place.
+            if let (Some(after), Value::Object(fields)) = (inner.job_after, &mut data) {
+                fields.insert("after".into(), json!(after));
+            }
             recorder.event(Instant::now(), kind, data);
         }
     }
 
     /// The game is over or was ended: its recording ends. Call it once the last thing that happened in the game
     /// has been noted.
-    fn close_recording_if_idle(&self, inner: &mut Inner) {
+    fn close_recording_if_idle(&self, inner: &mut Inner, tracker: &Tracker) {
         if inner.mode == Mode::Playing {
             return;
         }
@@ -2271,7 +2481,7 @@ impl Engine {
         // The stretches of pictures that were left out (a budget that was full) are told before the end of the game.
         recorder.flush_gaps();
         let (result, reason) = inner.game.as_ref().map_or((None, None), |g| (g.result.clone(), g.termination.clone()));
-        recorder.event(Instant::now(), "end", json!({"result": result, "reason": reason, "fen": game::fen_of(inner.tracker.position())}));
+        recorder.event(Instant::now(), "end", json!({"result": result, "reason": reason, "fen": game::fen_of(tracker.position())}));
         if recorder.dropped() > 0 {
             eprintln!(
                 "record: {} pictures could not be kept: the disk or the encoder fell behind past the memory limit (`gap` lines of the recording say where)",
@@ -2283,9 +2493,10 @@ impl Engine {
 
     /// The board shows `position`: follow the game from there. `resume_at` is how many seconds
     /// of the game were already played (0 for a new game), so the timestamps carry on.
-    fn begin_playing(&self, inner: &mut Inner, position: shakmaty::Chess, resume_at: f64) {
+    fn begin_playing(&self, inner: &mut Inner, analyzer: &mut Analyzer, position: shakmaty::Chess, resume_at: f64) {
         inner.pipe = Pipe::new(VIEWS, Instant::now());
-        inner.tracker.start(position.clone());
+        analyzer.tracker.start(position.clone());
+        analyzer.begin();
         inner.doubt = None;
         // The depth camera looks for the squares in its picture, from what the board shows now.
         self.ask_depth_alignment(inner, &position);
@@ -2305,13 +2516,17 @@ impl Engine {
             cam.follow.anchor = None;
         }
         inner.begun_at = Some(Instant::now());
-        inner.last_active = None;
         self.set_camera(true);
     }
 
     /// Goes on with the unfinished game that was found at start (or left by a crash or a stop).
     /// The board must show the position the game had reached.
     pub fn resume_game(&self, token: &str) -> ApiResult {
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.resume_game_in(analyzer, &token))
+    }
+
+    fn resume_game_in(&self, analyzer: &mut Analyzer, token: &str) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         if inner.mode == Mode::Playing {
@@ -2327,7 +2542,7 @@ impl Engine {
             .ok_or_else(|| ApiError::Conflict("there is no unfinished game to resume".into()))?;
         let position = game.position().map_err(ApiError::internal)?;
         let resume_at = game.moves.last().map_or(0.0, |m| m.t);
-        self.begin_playing(inner, position, resume_at);
+        self.begin_playing(inner, analyzer, position, resume_at);
         drop(guard);
         self.hub.notify();
         Ok(())
@@ -2335,6 +2550,11 @@ impl Engine {
 
     /// Ends the game with a result decided by the players.
     pub fn end_game(&self, token: &str, result: &str, reason: &str) -> ApiResult {
+        let (token, result, reason) = (token.to_string(), result.to_string(), reason.to_string());
+        self.ordered(move |engine, analyzer| engine.end_game_in(analyzer, &token, &result, &reason))
+    }
+
+    fn end_game_in(&self, analyzer: &mut Analyzer, token: &str, result: &str, reason: &str) -> ApiResult {
         let mut inner = self.controlled(token)?;
         let unfinished_but_stopped = inner.mode != Mode::Playing && inner.game.as_ref().is_some_and(|g| g.result.is_none());
         if inner.mode != Mode::Playing && !unfinished_but_stopped {
@@ -2369,7 +2589,7 @@ impl Engine {
         }
         self.go_idle(&mut inner);
         inner.candidates.clear();
-        self.close_recording_if_idle(&mut inner);
+        self.close_recording_if_idle(&mut inner, &analyzer.tracker);
         drop(inner);
         if let Some(id) = forget
             && let Err(e) = self.store.remove(&id)
@@ -2393,12 +2613,18 @@ impl Engine {
 
     /// Records a move entered by hand (UCI or SAN), or one picked from the candidates.
     pub fn manual_move(&self, token: &str, text: &str) -> ApiResult {
+        // The time of the move is the moment it was typed, not the moment the analysis gets to it.
+        let (token, text, at) = (token.to_string(), text.to_string(), Instant::now());
+        self.ordered(move |engine, analyzer| engine.manual_move_in(analyzer, &token, &text, at))
+    }
+
+    fn manual_move_in(&self, analyzer: &mut Analyzer, token: &str, text: &str, at: Instant) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         if inner.mode != Mode::Playing {
             return Err(ApiError::Conflict("no game is running".into()));
         }
-        let t = Self::move_time(inner, Instant::now());
+        let t = Self::move_time(inner, at);
         let game = inner.game.as_mut().ok_or_else(|| ApiError::Conflict("no game".into()))?;
         // One move, or several ("e4 e5") when replies were played before the first move was seen: all or nothing.
         let parts: Vec<&str> = text.split_whitespace().collect();
@@ -2417,11 +2643,11 @@ impl Engine {
         let position = game.position().map_err(ApiError::internal)?;
         let entered = game.moves.len() - before;
         Self::record(inner, "manual", json!({"text": text.trim(), "fen": game::fen_of(&position)}));
-        inner.tracker.set_position(position);
+        analyzer.tracker.set_position(position);
         inner.candidates.clear();
-        Self::clock_after_moves(inner, entered, Instant::now());
+        Self::clock_after_moves(inner, entered, at);
         self.after_game_change(inner);
-        self.close_recording_if_idle(inner);
+        self.close_recording_if_idle(inner, &analyzer.tracker);
         drop(guard);
         self.hub.notify();
         self.flush_save()
@@ -2430,6 +2656,11 @@ impl Engine {
     /// Takes back the last move. Also reopens a game that ended by the rules,
     /// for example when a misread move led to a false checkmate.
     pub fn undo(&self, token: &str) -> ApiResult {
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.undo_in(analyzer, &token))
+    }
+
+    fn undo_in(&self, analyzer: &mut Analyzer, token: &str) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         let reopenable = inner.mode != Mode::Playing
@@ -2451,12 +2682,12 @@ impl Engine {
         let resume_at = game.moves.last().map_or(0.0, |m| m.t);
         if reopenable {
             // The board must show the position again before learning resumes.
-            self.begin_playing(inner, position, resume_at);
+            self.begin_playing(inner, analyzer, position, resume_at);
         } else {
             Self::record(inner, "undo", json!({"fen": game::fen_of(&position)}));
             // The board still shows the move that was taken back: nothing is decided, and nothing is learned from it,
             // until it shows the position again (the pieces put back) or the move that was played is entered.
-            inner.tracker.undo_to(position, Some(undone.uci));
+            analyzer.tracker.undo_to(position, Some(undone.uci));
             // The clock goes back to what the move before says (a pause stays), and the player to move is running.
             let paused = inner.clock.as_ref().is_some_and(Clock::paused);
             inner.clock = inner.game.as_ref().and_then(|g| Clock::from_game(g, Instant::now(), paused, true));
@@ -2472,6 +2703,12 @@ impl Engine {
     /// The clock of the game: "switch" is the button or the space bar (it starts the clock, goes on after a pause, or
     /// hands the time over to the other player), "pause" stops both times and "resume" goes on.
     pub fn clock_action(&self, token: &str, action: &str) -> ApiResult {
+        // The clock is pressed at the moment of the press, not of the moment the analysis gets to it.
+        let (token, action, at) = (token.to_string(), action.to_string(), Instant::now());
+        self.ordered(move |engine, _| engine.clock_action_in(&token, &action, at))
+    }
+
+    fn clock_action_in(&self, token: &str, action: &str, now: Instant) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         if inner.mode != Mode::Playing {
@@ -2484,7 +2721,6 @@ impl Engine {
             .map(|p| shakmaty::Position::turn(&p))
             .ok_or_else(|| ApiError::Conflict("no game".into()))?;
         let clock = inner.clock.as_mut().ok_or_else(|| ApiError::Conflict("this game has no clock".into()))?;
-        let now = Instant::now();
         match action {
             "switch" => clock.press(turn, now),
             "pause" => {
@@ -2507,6 +2743,11 @@ impl Engine {
 
     /// Changes the piece chosen for the last promotion.
     pub fn set_promotion(&self, token: &str, piece: char) -> ApiResult {
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.set_promotion_in(analyzer, &token, piece))
+    }
+
+    fn set_promotion_in(&self, analyzer: &mut Analyzer, token: &str, piece: char) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         if inner.mode != Mode::Playing {
@@ -2518,9 +2759,9 @@ impl Engine {
         game.set_last_promotion(piece)?;
         let position = game.position().map_err(ApiError::internal)?;
         Self::record(inner, "promotion", json!({"piece": piece.to_string(), "fen": game::fen_of(&position)}));
-        inner.tracker.set_position(position);
+        analyzer.tracker.set_position(position);
         self.after_game_change(inner);
-        self.close_recording_if_idle(inner);
+        self.close_recording_if_idle(inner, &analyzer.tracker);
         drop(guard);
         self.hub.notify();
         self.flush_save()
@@ -2530,6 +2771,11 @@ impl Engine {
     /// the other likely explanations. `None` takes it back and leaves the person to say what was played: the
     /// tracker offers the explanations again and decides nothing until a move is entered.
     pub fn resolve_doubt(&self, token: &str, choice: Option<&str>) -> ApiResult {
+        let (token, choice) = (token.to_string(), choice.map(str::to_string));
+        self.ordered(move |engine, analyzer| engine.resolve_doubt_in(analyzer, &token, choice.as_deref()))
+    }
+
+    fn resolve_doubt_in(&self, analyzer: &mut Analyzer, token: &str, choice: Option<&str>) -> ApiResult {
         let mut guard = self.controlled(token)?;
         let inner = &mut *guard;
         if inner.mode != Mode::Playing {
@@ -2594,7 +2840,7 @@ impl Engine {
             }
         }
         Self::record(inner, "doubt", json!({"choice": choice, "fen": game::fen_of(&position)}));
-        inner.tracker.set_position(position);
+        analyzer.tracker.set_position(position);
         inner.candidates.clear();
         if replacement.is_none() {
             // Ask again: the move that was taken and the other likely ones.
@@ -2606,11 +2852,11 @@ impl Engine {
             };
             let mut offered = vec![guessed];
             offered.extend(note.alternatives.iter().cloned());
-            inner.tracker.hold(offered.clone());
+            analyzer.tracker.hold(offered.clone());
             inner.candidates = offered;
         }
         self.after_game_change(inner);
-        self.close_recording_if_idle(inner);
+        self.close_recording_if_idle(inner, &analyzer.tracker);
         drop(guard);
         self.hub.notify();
         self.flush_save()
@@ -2618,12 +2864,17 @@ impl Engine {
 
     /// Learns the look of the squares again, from the position the game is in.
     pub fn relearn(&self, token: &str) -> ApiResult {
+        let token = token.to_string();
+        self.ordered(move |engine, analyzer| engine.relearn_in(analyzer, &token))
+    }
+
+    fn relearn_in(&self, analyzer: &mut Analyzer, token: &str) -> ApiResult {
         let mut inner = self.controlled(token)?;
         if inner.mode != Mode::Playing {
             return Err(ApiError::Conflict("no game is running".into()));
         }
         Self::record(&inner, "relearn", json!({}));
-        inner.tracker.relearn();
+        analyzer.tracker.relearn();
         inner.last_status = Status::Learning;
         drop(inner);
         self.hub.notify();
@@ -2720,8 +2971,8 @@ fn remember_doubt(inner: &mut Inner, doubt: Option<Doubt>, moves_before: usize, 
 
 /// What the recording says of moves that were just found: the moves and the position after them, or that
 /// the game refused them.
-fn detection_event(inner: &Inner, moves_before: usize, count: usize, doubt: Option<&Doubt>) -> (&'static str, Value) {
-    let fen = game::fen_of(inner.tracker.position());
+fn detection_event(inner: &Inner, tracker: &Tracker, moves_before: usize, count: usize, doubt: Option<&Doubt>) -> (&'static str, Value) {
+    let fen = game::fen_of(tracker.position());
     match inner.game.as_ref() {
         Some(game) if game.moves.len() == moves_before + count => {
             let found = &game.moves[moves_before..];
@@ -2749,6 +3000,92 @@ fn status_name(status: Status) -> &'static str {
 mod tests {
     use super::*;
 
+    /// A tracker for the functions that apply detected moves (they put it back on the game's position when a move is refused).
+    fn test_tracker() -> Tracker {
+        Tracker::new(TrackerConfig::default())
+    }
+
+    /// A picture of the first camera for the inbox of the analysis: blank, captured `ms` after `base`.
+    fn blank_picture(seq: u64, base: Instant, ms: u64) -> Item {
+        let image = Arc::new(RgbImage::new(8, 8));
+        Item { view: 0, seq, captured: base + Duration::from_millis(ms), waited: None, image: Arc::clone(&image), raw: image }
+    }
+
+    fn engine_in(name: &str, config: EngineConfig) -> (Arc<Engine>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        (Engine::new(config, store, dir.join("calibration.json"), None), dir)
+    }
+
+    #[test]
+    fn a_command_is_carried_out_after_the_pictures_that_were_waiting_when_it_was_sent() {
+        // An analysis that takes 60 ms a picture, six pictures waiting: a command sent now comes after all six, and not
+        // before the one that is sent after it.
+        let (engine, dir) =
+            engine_in("command-order", EngineConfig { analysis_delay: Duration::from_millis(60), ..EngineConfig::default() });
+        let base = Instant::now();
+        for seq in 1..=6 {
+            engine.offer_to_analysis(blank_picture(seq, base, seq * 20));
+        }
+        let (tx, rx) = channel::<(usize, Duration)>();
+        let sent = Instant::now();
+        engine.posted(move |engine, _| {
+            let _ = tx.send((engine.backlog().waiting, sent.elapsed()));
+        });
+        engine.offer_to_analysis(blank_picture(7, base, 140));
+        let (waiting, after) = rx.recv_timeout(Duration::from_secs(20)).expect("the command was carried out");
+        assert_eq!(waiting, 1, "the six pictures before it were taken, the one sent after it still waits");
+        assert!(after >= Duration::from_millis(6 * 60 - 20), "it waited for the six pictures: {after:?}");
+        // And a command that waits for its answer gets it, with the pictures after it taken later.
+        let answer = engine.ordered(|_, _| Ok(7u32)).unwrap();
+        assert_eq!(answer, 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_detection_is_not_applied_to_a_game_that_is_over() {
+        let (engine, dir) = engine_playing("late-detection");
+        let start = shakmaty::Chess::default();
+        let e4 = crate::game::parse_move(&start, "e2e4").unwrap();
+        let mut analyzer = Analyzer::new(test_tracker());
+        let look = || Look {
+            at: Instant::now(),
+            started: Instant::now(),
+            step: Duration::ZERO,
+            fed: Vec::new(),
+            active: [false; VIEWS],
+            views_changed: false,
+            detection: Detection::Move { mv: e4, since: Instant::now(), promotion_guess: false },
+        };
+        // The game ended while the picture waited: what the tracker found in it is not put in the game.
+        engine.inner.grab().mode = Mode::Idle;
+        engine.publish_look(&mut analyzer, look(), Backlog::default());
+        assert!(engine.inner.grab().game.as_ref().unwrap().moves.is_empty());
+        // While the game is played it is.
+        engine.inner.grab().mode = Mode::Playing;
+        engine.publish_look(&mut analyzer, look(), Backlog::default());
+        assert_eq!(engine.inner.grab().game.as_ref().unwrap().moves.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_analysis_thread_ends_when_its_engine_is_dropped() {
+        let (engine, dir) = engine_in("analysis-shutdown", EngineConfig::default());
+        let inbox = Arc::clone(&engine.inbox);
+        // The thread holds a handle on the inbox: it is the only other one.
+        assert_eq!(Arc::strong_count(&inbox), 3, "this one, the engine's, the thread's");
+        drop(engine);
+        let started = Instant::now();
+        while Arc::strong_count(&inbox) > 1 {
+            assert!(started.elapsed() < Duration::from_secs(5), "the analysis thread did not end");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // A command sent to an inbox that is stopped is refused, not left waiting.
+        assert!(inbox.submit(Box::new(|_, _| {})).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// An engine with a game that is being recorded, to feed the detections of the tracker by hand.
     fn engine_playing(name: &str) -> (Arc<Engine>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
@@ -2775,7 +3112,7 @@ mod tests {
         let e5 = crate::game::parse_move(&after, "e7e5").unwrap();
         {
             let mut inner = engine.inner.grab();
-            engine.apply_detected_moves(&mut inner, &[e4, e5], Instant::now());
+            engine.apply_detected_moves(&mut inner, &mut test_tracker(), &[e4, e5], Instant::now());
             let game = inner.game.as_ref().unwrap();
             assert_eq!(game.moves.len(), 2);
             assert_eq!((game.moves[0].uci.as_str(), game.moves[1].uci.as_str()), ("e2e4", "e7e5"));
@@ -2789,7 +3126,7 @@ mod tests {
         // A pair that does not follow from the position (the tracker and the game disagree): neither is kept.
         {
             let mut inner = engine.inner.grab();
-            engine.apply_detected_moves(&mut inner, &[e4, e5], Instant::now());
+            engine.apply_detected_moves(&mut inner, &mut test_tracker(), &[e4, e5], Instant::now());
             assert_eq!(inner.game.as_ref().unwrap().moves.len(), 2);
             assert!(inner.notice.as_deref().is_some_and(|n| n.contains("the moves detected at once were rejected")));
         }
@@ -2810,10 +3147,10 @@ mod tests {
         let first = Instant::now();
         let mut inner = engine.inner.grab();
         // The first move starts the clock. A pair seen after 9 seconds: 4.5 and 9.0, between the move before and the picture.
-        engine.apply_detected_move(&mut inner, e4, first, false);
-        engine.apply_detected_moves(&mut inner, &[e5, nf3], first + Duration::from_secs(9));
+        engine.apply_detected_move(&mut inner, &mut test_tracker(), e4, first, false);
+        engine.apply_detected_moves(&mut inner, &mut test_tracker(), &[e5, nf3], first + Duration::from_secs(9));
         // Two more seen 6 seconds later: 12 and 15.
-        engine.apply_detected_moves(&mut inner, &[nc6, bb5], first + Duration::from_secs(15));
+        engine.apply_detected_moves(&mut inner, &mut test_tracker(), &[nc6, bb5], first + Duration::from_secs(15));
         let times: Vec<f64> = inner.game.as_ref().unwrap().moves.iter().map(|m| m.t).collect();
         assert_eq!(times, [0.0, 4.5, 9.0, 12.0, 15.0]);
         drop(inner);
@@ -2821,7 +3158,7 @@ mod tests {
         // At the start of a game there is nothing before the first move: the clock starts with it, and all are at 0.
         let (engine, dir2) = engine_playing("shared-time-start");
         let mut inner = engine.inner.grab();
-        engine.apply_detected_moves(&mut inner, &[e4, e5], first + Duration::from_secs(5));
+        engine.apply_detected_moves(&mut inner, &mut test_tracker(), &[e4, e5], first + Duration::from_secs(5));
         let times: Vec<f64> = inner.game.as_ref().unwrap().moves.iter().map(|m| m.t).collect();
         assert_eq!(times, [0.0, 0.0]);
         drop(inner);
@@ -2842,16 +3179,16 @@ mod tests {
             // The game was started on the page a minute ago, and the players only now play.
             inner.game_started = Instant::now().checked_sub(Duration::from_secs(60));
             let first = Instant::now();
-            engine.apply_detected_move(&mut inner, e4, first, false);
+            engine.apply_detected_move(&mut inner, &mut test_tracker(), e4, first, false);
             assert_eq!(inner.game.as_ref().unwrap().moves[0].t, 0.0, "the first move is at 0");
             // Black thinks for four seconds.
-            engine.apply_detected_move(&mut inner, e5, first + Duration::from_secs(4), false);
+            engine.apply_detected_move(&mut inner, &mut test_tracker(), e5, first + Duration::from_secs(4), false);
             assert_eq!(inner.game.as_ref().unwrap().moves[1].t, 4.0);
             // Taking the first moves back and playing again starts the clock again.
             inner.game.as_mut().unwrap().undo();
             inner.game.as_mut().unwrap().undo();
             let later = first + Duration::from_secs(30);
-            engine.apply_detected_move(&mut inner, e4, later, false);
+            engine.apply_detected_move(&mut inner, &mut test_tracker(), e4, later, false);
             assert_eq!(inner.game.as_ref().unwrap().moves[0].t, 0.0);
         }
         // In the PGN, the first move took no time.
@@ -2943,7 +3280,7 @@ mod tests {
         let e4 = crate::game::parse_move(&start, "e2e4").unwrap();
         {
             let mut inner = engine.inner.grab();
-            engine.apply_detected_move(&mut inner, e4, Instant::now(), false);
+            engine.apply_detected_move(&mut inner, &mut test_tracker(), e4, Instant::now(), false);
             let left = inner.game.as_ref().unwrap().moves[0].left.expect("the move keeps the time left");
             assert!((left[0] - 288.0).abs() < 0.5, "300 seconds, 12 of them used: {left:?}");
             assert_eq!(left[1], 300.0);
@@ -3000,7 +3337,7 @@ mod tests {
             let mut inner = engine.inner.grab();
             let start = shakmaty::Chess::default();
             let e4 = crate::game::parse_move(&start, "e2e4").unwrap();
-            engine.apply_detected_move(&mut inner, e4, Instant::now(), false);
+            engine.apply_detected_move(&mut inner, &mut test_tracker(), e4, Instant::now(), false);
             inner.pending_save.is_some()
         };
         assert!(moves, "the game is marked to be written");

@@ -141,6 +141,7 @@ pub fn build(options: ServerOptions) -> Result<Built> {
         camera: camera.clone(),
         camera2: camera2.clone(),
         second_fixed,
+        analysis_delay: Duration::ZERO,
     };
     let engine = Engine::new(config, store, options.calibration_path, calibration);
     // The demo's cameras see the same moment of the game; the other sources have nothing to keep in step.

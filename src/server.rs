@@ -1180,6 +1180,108 @@ mod tests {
         assert!(all.summary.found >= 20, "{}", all.text);
     }
 
+    /// An engine whose analysis cannot keep up with the camera: it takes `delay` for each picture, which the camera gives
+    /// faster. Every picture is recorded.
+    fn rig_slow(name: &str, source: SourceSpec, frame_interval: Duration, delay: Duration) -> Rig {
+        let dir = std::env::temp_dir().join(format!("nicochess-{name}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let store = Store::open(&dir.join("games")).unwrap();
+        let record = Some(crate::record::RecordOptions::keeping_all(dir.join("recordings")));
+        let engine = Engine::new(EngineConfig { record, analysis_delay: delay, ..patient() }, store, dir.join("calibration.json"), None);
+        engine.spawn_capture(camera::factory(source, frame_interval)).unwrap();
+        let handler = handler(Arc::clone(&engine), 8);
+        Rig { engine, handler, dir }
+    }
+
+    #[test]
+    fn an_analysis_that_cannot_keep_up_with_the_camera_loses_no_picture_and_no_move() {
+        use crate::replay::{Feed, TrackerOverrides, replay_folder, replay_folder_with};
+        // Pictures every 60 ms, the analysis takes 90 ms for each: it falls further behind all the game (about nine seconds at
+        // the end of it) and has caught up with nothing until the camera stops.
+        let rig = rig_slow(
+            "slow-analysis",
+            SourceSpec::Demo { move_interval: Duration::from_millis(500) },
+            Duration::from_millis(60),
+            Duration::from_millis(90),
+        );
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        // The page can see that the analysis is behind while the game goes on.
+        wait_for("the analysis to be behind", || rig.state(BOB)["tracker"]["lag_ms"].as_u64().unwrap_or(0) > 1000);
+        assert!(rig.state(BOB)["tracker"]["waiting"].as_u64().unwrap_or(0) > 10);
+        wait_for("checkmate", || rig.state(BOB)["game"]["over"] == true);
+        wait_for("the backlog to be gone", || rig.engine.backlog().waiting == 0);
+
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        let kind = |e: &Value| e["type"].as_str().unwrap().to_string();
+        // Every move of the game was found, in order: being behind costs time, not moves.
+        let live: Vec<Vec<String>> = events
+            .iter()
+            .filter(|e| kind(e) == "detect")
+            .map(|e| e["moves"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect())
+            .collect();
+        assert_eq!(live.iter().map(Vec::len).sum::<usize>(), 33, "{live:?}");
+        let closed = events.last().unwrap();
+        assert_eq!(closed["dropped"], 0, "no picture was lost");
+        assert!(closed["pipeline"]["behind"].as_u64().unwrap_or(0) > 0, "{}", closed["pipeline"]);
+        assert!(closed["pipeline"]["oldest_waiting_ms"]["max"].as_f64().unwrap_or(0.0) > 1000.0, "{}", closed["pipeline"]);
+        assert!(closed["pipeline"]["views"]["cam0"]["age_ms"]["max"].as_f64().unwrap_or(0.0) > 1000.0, "{}", closed["pipeline"]);
+
+        // The replay of the looks is the live game again, and so is a replay of every picture, taken by the same rule on
+        // the time of capture, however late the analysis was.
+        let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        check_every_picture_and_replay(&events, &report, &[0]);
+        let all = replay_folder_with(&folder, &TrackerOverrides::default(), false, Feed::EveryPicture).unwrap();
+        assert_eq!((all.summary.wrong, all.summary.behind), (0, 0), "{}", all.text);
+        let replayed: Vec<Vec<String>> = all.detections.iter().map(|f| f.uci.clone()).collect();
+        assert_eq!(live, replayed, "a replay of every picture finds the moves the program found, in the same order\n{}", all.text);
+    }
+
+    #[test]
+    fn a_move_typed_while_the_analysis_is_behind_waits_its_turn_and_the_recording_says_where_it_came() {
+        // Pictures every 50 ms, 60 ms to look at each: the analysis falls a little further behind every second, so that a few
+        // pictures wait whenever a command is sent (a command waits for the ones that came before it, and the next one for
+        // the ones that came meanwhile).
+        let rig = rig_slow("slow-commands", SourceSpec::Synthetic, Duration::from_millis(50), Duration::from_millis(60));
+        rig.state(ALICE);
+        rig.call("POST", "/api/calibration/open", ALICE, "");
+        wait_for("a frame", || rig.engine.latest_frame(0).is_some());
+        assert_eq!(rig.call("POST", "/api/calibration", ALICE, &corners_json()).0, 200);
+        assert_eq!(rig.call("POST", "/api/game/start", ALICE, r#"{"white":"A","black":"B"}"#).0, 200);
+        wait_for("the analysis to be behind", || rig.state(BOB)["tracker"]["lag_ms"].as_u64().unwrap_or(0) > 400);
+        // The move is typed now; it is entered once the pictures that were waiting have been looked at.
+        let asked = Instant::now();
+        assert_eq!(rig.call("POST", "/api/game/move", ALICE, r#"{"move":"e2e4"}"#).0, 200);
+        assert!(asked.elapsed() > Duration::from_millis(200), "it came after the pictures that were waiting: {:?}", asked.elapsed());
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 1);
+        // Taking it back, again after the pictures that came meanwhile.
+        assert_eq!(rig.call("POST", "/api/game/undo", ALICE, "").0, 200);
+        assert_eq!(rig.state(ALICE)["game"]["moves"].as_array().unwrap().len(), 0);
+        assert_eq!(rig.call("POST", "/api/game/end", ALICE, r#"{"result":"*","reason":"other"}"#).0, 200);
+
+        let folder = std::fs::read_dir(rig.dir.join("recordings")).unwrap().next().unwrap().unwrap().path();
+        wait_for("the recording to be closed", || {
+            std::fs::read_to_string(folder.join("events.jsonl")).is_ok_and(|text| text.contains("\"type\":\"closed\""))
+        });
+        let events: Vec<Value> =
+            std::fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        // What a command wrote says how many pictures of each view had come when it was sent, so that a replay of every
+        // picture puts it in the same place.
+        for event in events.iter().filter(|e| ["manual", "undo"].contains(&e["type"].as_str().unwrap())) {
+            let after = event["after"].as_array().unwrap_or_else(|| panic!("no place in the pictures: {event}"));
+            assert_eq!(after.len(), 3, "{event}");
+            assert!(after[0].as_u64().unwrap() > 10, "{event}");
+        }
+    }
+
     #[test]
     fn what_the_players_do_is_in_the_recording_with_the_position_after_it() {
         let rig = rig_with("recording-manual", SourceSpec::Synthetic, Duration::from_millis(60), true);
