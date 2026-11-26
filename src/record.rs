@@ -8,23 +8,28 @@
 //! - `frames/000001.jpg`, ...: the pictures the detection was given (turned and adjusted as it saw them).
 //!   One every `--record-every` seconds, and every picture while something happens: the tracker is learning,
 //!   a hand is moving, it is unsure, a move was found. With two cameras each time brings two pictures.
+//!   When an `ffmpeg` is found the pictures go instead into one video for each camera (`cam0.mkv`, `cam2.mkv`
+//!   for the depth view: see [`crate::video`]), a fifth to a twentieth of the size; a camera whose video cannot be
+//!   written goes on in JPEG files.
 //! - `events.jsonl`: one JSON object per line, in order, each with `t` (seconds since the recording began)
-//!   and a `type`: `frame` (the file, the tracker's status, the camera `cam` and the number `feed` that the
-//!   pictures given together share), `detect` (moves found, and the position after),
-//!   `unsure` (the candidates offered), `manual`, `undo`, `promotion`, `relearn`, `calibration`, `end`, and
-//!   `closed` last. Positions are FEN strings.
+//!   and a `type`: `frame` (the file, or the video and the number of the picture in it, the tracker's status, the
+//!   camera `cam` and the number `feed` that the pictures given together share), `video` (the first time a camera's
+//!   video is used: its file and the size of its pictures), `video_lost` (its encoder failed), `detect` (moves found,
+//!   and the position after), `unsure` (the candidates offered), `manual`, `undo`, `promotion`, `relearn`,
+//!   `calibration`, `end`, and `closed` last. Positions are FEN strings.
 //!
 //! Nothing here may disturb the game: the capture thread only hands pictures and lines to the writer threads
-//! (`try_send`, never waiting for the disk); when they cannot keep up, pictures are dropped and counted. Pictures are
-//! encoded and written by two to four threads at once (one keeps up with about 20 a second, and two cameras at 25
-//! feeds a second give 50), the lines of `events.jsonl` are still appended in the order things happened.
-//! A failure to write is reported once on the console and the game goes on.
+//! (`try_send`, never waiting for the disk or the encoder); when they cannot keep up, pictures are dropped and
+//! counted. JPEG pictures are encoded and written by two to four threads at once (one keeps up with about 20 a second,
+//! and two cameras at 25 feeds a second give 50), the lines of `events.jsonl` are still appended in the order things
+//! happened. A failure to write is reported once on the console and the game goes on.
 
 use crate::calibration::Calibration;
 use crate::engine::encode_jpeg;
 use crate::fsutil::write_atomic;
 use crate::picture::Picture;
 use crate::tracker::TrackerConfig;
+use crate::video::{self, Push, VideoWriter};
 use anyhow::{Context, Result};
 use image::RgbImage;
 use serde::{Deserialize, Serialize};
@@ -40,8 +45,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The format of the files below: a replay refuses a recording of a newer format. Format 2 added the second camera
 /// (`cam` and `feed` on a `frame` line, `calibration2` and `picture2` in `session.json`); a recording of format 1 is
-/// read as one made with one camera.
-pub const FORMAT: u32 = 2;
+/// read as one made with one camera. Format 3 added the videos (`video` in `session.json`, the `video`, `video_lost`
+/// and `frame` lines that tell the video and the number of a picture instead of a file); a recording of format 2
+/// is read as before.
+pub const FORMAT: u32 = 3;
 
 /// Pictures that may wait for the writer: more than this and the next ones are dropped (a picture is about a
 /// megabyte in memory), so that a slow disk costs pictures, not memory.
@@ -64,18 +71,27 @@ pub struct RecordOptions {
     /// The least time between two pictures kept while something is going on (at 25 pictures a second a recording
     /// would be huge, and a few a second tell the story); zero keeps every picture the detection looks at.
     pub busy_every: Duration,
+    /// The `ffmpeg` that writes the pictures as video; `None` keeps them as JPEG files (the program looks for one,
+    /// see [`crate::video::find_ffmpeg`], and puts it here; tests leave it out).
+    pub ffmpeg: Option<PathBuf>,
 }
 
 impl RecordOptions {
     pub fn new(dir: PathBuf, every: Duration) -> RecordOptions {
-        RecordOptions { dir, every, backlog: DEFAULT_BACKLOG, busy_every: Duration::from_millis(150) }
+        RecordOptions { dir, every, backlog: DEFAULT_BACKLOG, busy_every: Duration::from_millis(150), ffmpeg: None }
+    }
+
+    /// The same, with the pictures going into video files through this `ffmpeg` (or JPEG files when it is `None`).
+    pub fn with_ffmpeg(mut self, ffmpeg: Option<PathBuf>) -> RecordOptions {
+        self.ffmpeg = ffmpeg;
+        self
     }
 
     /// Every picture the detection looks at is kept, quiet or not (`--record-all`). At 25 pictures a second that is
     /// several megabytes a second, so more of them may wait for the disk than usual before some are dropped (and
     /// counted: the program says so when the game ends).
     pub fn keeping_all(dir: PathBuf) -> RecordOptions {
-        RecordOptions { dir, every: Duration::ZERO, backlog: ALL_BACKLOG, busy_every: Duration::ZERO }
+        RecordOptions { dir, every: Duration::ZERO, backlog: ALL_BACKLOG, busy_every: Duration::ZERO, ffmpeg: None }
     }
 
     /// True when no picture is left out on purpose.
@@ -109,6 +125,19 @@ pub struct SessionMeta {
     pub calibration2: Option<Calibration>,
     #[serde(default)]
     pub picture2: Option<Picture>,
+    /// Set when the pictures go into video files (see the `video` lines of `events.jsonl`): the `ffmpeg` used and how.
+    /// Absent when they are JPEG files.
+    #[serde(default)]
+    pub video: Option<VideoMeta>,
+}
+
+/// How the pictures were encoded.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct VideoMeta {
+    pub ffmpeg: String,
+    pub codec: String,
+    pub camera_crf: u32,
+    pub depth_crf: u32,
 }
 
 enum Msg {
@@ -131,6 +160,59 @@ pub struct Recorder {
     dropped: Arc<AtomicU64>,
     folder: PathBuf,
     thread: Option<JoinHandle<()>>,
+    /// The videos, when the pictures go into video files.
+    video: Option<Arc<Videos>>,
+}
+
+/// The cameras that can have a video: the cameras and the height picture of the depth camera, numbered as the engine
+/// numbers its views.
+const VIEWS: usize = 3;
+
+/// The videos of a recording. The capture side hands pictures to them through `state`; the writer thread ends them
+/// (waits for each `ffmpeg` to finish its file) before it writes the last line, which tells how many pictures were kept.
+struct Videos {
+    ffmpeg: PathBuf,
+    folder: PathBuf,
+    state: Mutex<VideoState>,
+}
+
+struct VideoState {
+    /// The video of each view, started at its first picture.
+    streams: [Option<VideoWriter>; VIEWS],
+    /// Views that go in JPEG files from now on: the encoder could not start or died.
+    jpeg: [bool; VIEWS],
+    /// The recording is over: no video takes a picture any more.
+    finished: bool,
+}
+
+/// What the videos kept in all.
+struct VideoTotals {
+    written: u64,
+    lost: u64,
+    /// What went wrong with an encoder, if anything did (a picture counted as written may still have been lost with it).
+    failures: Vec<String>,
+}
+
+impl Videos {
+    /// Ends every video and waits for the files to be complete.
+    fn finish(&self) -> VideoTotals {
+        let streams: Vec<VideoWriter> = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.finished = true;
+            state.streams.iter_mut().filter_map(Option::take).collect()
+        };
+        let mut totals = VideoTotals { written: 0, lost: 0, failures: Vec::new() };
+        for stream in streams {
+            let done = stream.finish();
+            totals.written += done.written;
+            totals.lost += done.lost;
+            if let Some(reason) = done.failure {
+                eprintln!("record: a video ended badly ({reason}); the pictures after that point are lost or in JPEG files");
+                totals.failures.push(reason);
+            }
+        }
+        totals
+    }
 }
 
 impl Recorder {
@@ -144,14 +226,36 @@ impl Recorder {
         let folder = unique_folder(&options.dir, &name)?;
         fs::create_dir_all(folder.join("frames")).with_context(|| format!("cannot create {}", folder.display()))?;
 
+        // Video only when the program that writes it is there; otherwise JPEG files, and the session says so.
+        let video = match &options.ffmpeg {
+            Some(ffmpeg) if video::usable(ffmpeg) => {
+                meta.video = Some(video_meta(ffmpeg));
+                Some(Arc::new(Videos {
+                    ffmpeg: ffmpeg.clone(),
+                    folder: folder.clone(),
+                    state: Mutex::new(VideoState { streams: [None, None, None], jpeg: [false; VIEWS], finished: false }),
+                }))
+            }
+            Some(ffmpeg) => {
+                eprintln!("record: {} is not there: the pictures are saved as JPEG files", ffmpeg.display());
+                meta.video = None;
+                None
+            }
+            None => {
+                meta.video = None;
+                None
+            }
+        };
+
         let (tx, rx) = sync_channel(QUEUE + options.backlog);
         let queued = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let writer_folder = folder.clone();
         let (writer_queued, writer_dropped) = (Arc::clone(&queued), Arc::clone(&dropped));
+        let writer_video = video.clone();
         let thread = thread::Builder::new()
             .name("record".into())
-            .spawn(move || writer(writer_folder, rx, now, writer_queued, writer_dropped))
+            .spawn(move || writer(writer_folder, rx, now, writer_queued, writer_dropped, writer_video))
             .context("cannot start the recording thread")?;
         let recorder = Recorder {
             tx: Some(tx),
@@ -164,6 +268,7 @@ impl Recorder {
             dropped,
             folder,
             thread: Some(thread),
+            video,
         };
         // Written by the writer, so that no file is written under the engine's lock.
         let bytes = serde_json::to_vec_pretty(&meta)?;
@@ -206,6 +311,10 @@ impl Recorder {
         }
         let t = self.seconds(at);
         for (camera, image) in images {
+            if self.keep_in_video(t, *camera, image, status) {
+                self.last_saved = Some(at);
+                continue;
+            }
             // Too many waiting: the pictures that would be kept are lost, never the lines, which are small.
             if self.queued.load(Ordering::SeqCst) >= self.backlog {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -217,6 +326,73 @@ impl Recorder {
             } else {
                 self.queued.fetch_sub(1, Ordering::SeqCst);
             }
+        }
+    }
+
+    /// Hands a picture to the video of its camera, which is started at the first picture. Returns false when the picture
+    /// must go in a JPEG file instead (there is no video, or the encoder failed, or the picture is of another size
+    /// than the video); true when it was taken, or lost because the encoder was too slow (and counted).
+    fn keep_in_video(&self, t: f64, camera: usize, image: &Arc<RgbImage>, status: &'static str) -> bool {
+        let Some(videos) = &self.video else { return false };
+        if camera >= VIEWS {
+            return false;
+        }
+        let mut state = videos.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.finished || state.jpeg[camera] {
+            return false;
+        }
+        let name = format!("cam{camera}.{}", video::FILE_EXTENSION);
+        if state.streams[camera].is_none() {
+            let crf = if camera == VIEWS - 1 { video::DEPTH_CRF } else { video::CAMERA_CRF };
+            let started = VideoWriter::start(
+                &videos.ffmpeg,
+                videos.folder.join(&name),
+                videos.folder.join(format!("ffmpeg-cam{camera}.log")),
+                image.width(),
+                image.height(),
+                crf,
+                self.backlog.max(video::MIN_QUEUE),
+            );
+            match started {
+                Ok(writer) => {
+                    state.streams[camera] = Some(writer);
+                    self.send(Msg::Line(
+                        json!({"t": t, "type": "video", "cam": camera, "file": name, "width": image.width(), "height": image.height(),
+                               "codec": video::CODEC, "crf": crf})
+                        .to_string(),
+                    ));
+                }
+                Err(e) => {
+                    state.jpeg[camera] = true;
+                    eprintln!("record: no video for camera {camera} ({e:#}): its pictures are saved as JPEG files");
+                    return false;
+                }
+            }
+        }
+        let Some(stream) = state.streams[camera].as_mut() else { return false };
+        match stream.push(image) {
+            Push::Queued(index) => {
+                self.send(Msg::Line(
+                    json!({"t": t, "type": "frame", "video": name, "index": index, "status": status, "cam": camera, "feed": self.feeds})
+                        .to_string(),
+                ));
+                true
+            }
+            Push::Full => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Push::Unusable => match stream.failure() {
+                Some(reason) => {
+                    // The encoder is gone: this camera goes on in JPEG files, and the recording says where it changed.
+                    state.jpeg[camera] = true;
+                    eprintln!("record: the video of camera {camera} failed ({reason}): its pictures are saved as JPEG files from now on");
+                    self.send(Msg::Line(json!({"t": t, "type": "video_lost", "cam": camera, "file": name, "reason": reason}).to_string()));
+                    false
+                }
+                // Only this picture does not fit (the camera changed its size): it goes in a file.
+                None => false,
+            },
         }
     }
 
@@ -282,7 +458,14 @@ struct Events {
 /// Several threads encode and write the pictures at the same time, which is the slow part, but a line is appended to
 /// `events.jsonl` only when every message before it has been: the file reads in the order things happened, and a
 /// `frame` line is only there once its picture is on the disk.
-fn writer(folder: PathBuf, rx: Receiver<Msg>, begun: Instant, queued: Arc<AtomicUsize>, dropped: Arc<AtomicU64>) {
+fn writer(
+    folder: PathBuf,
+    rx: Receiver<Msg>,
+    begun: Instant,
+    queued: Arc<AtomicUsize>,
+    dropped: Arc<AtomicU64>,
+    videos: Option<Arc<Videos>>,
+) {
     let file = match OpenOptions::new().create(true).append(true).open(folder.join("events.jsonl")) {
         Ok(file) => Some(file),
         Err(e) => {
@@ -376,10 +559,32 @@ fn writer(folder: PathBuf, rx: Receiver<Msg>, begun: Instant, queued: Arc<Atomic
             scope.spawn(work);
         }
     });
+    // The videos are ended after the last line before this one: each `ffmpeg` finishes its file, and what it kept and
+    // lost is counted with the rest.
+    let video = videos.as_ref().map(|v| v.finish());
+    if let Some(video) = &video {
+        dropped.fetch_add(video.lost, Ordering::Relaxed);
+    }
     let t = (begun.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
-    let pictures = inbox.lock().unwrap_or_else(PoisonError::into_inner).pictures;
+    let jpegs = inbox.lock().unwrap_or_else(PoisonError::into_inner).pictures;
     let mut events = events.lock().unwrap_or_else(PoisonError::into_inner);
-    append(&mut events, &json!({"t": t, "type": "closed", "pictures": pictures, "dropped": dropped.load(Ordering::Relaxed)}).to_string());
+    let mut closed = json!({"t": t, "type": "closed", "pictures": jpegs + video.as_ref().map_or(0, |v| v.written), "dropped": dropped.load(Ordering::Relaxed)});
+    if let Some(video) = &video {
+        closed["video_pictures"] = json!(video.written);
+        if !video.failures.is_empty() {
+            closed["video_errors"] = json!(video.failures);
+        }
+    }
+    append(&mut events, &closed.to_string());
+}
+
+fn video_meta(ffmpeg: &Path) -> VideoMeta {
+    VideoMeta {
+        ffmpeg: ffmpeg.display().to_string(),
+        codec: video::CODEC.to_string(),
+        camera_crf: video::CAMERA_CRF,
+        depth_crf: video::DEPTH_CRF,
+    }
 }
 
 /// `base`, or `base-2`, `base-3`, ... when two recordings begin in the same second.
@@ -524,6 +729,7 @@ mod tests {
             picture: Picture::default(),
             calibration2: None,
             picture2: None,
+            video: None,
         }
     }
 
@@ -637,6 +843,158 @@ mod tests {
             assert!(folder.join(file).exists(), "{file}");
         }
         assert_eq!(lines.last().unwrap()["pictures"], 2 * feeds);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    fn read_lines(folder: &Path) -> Vec<Value> {
+        fs::read_to_string(folder.join("events.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn with_ffmpeg_the_pictures_go_into_a_video_for_each_camera_and_the_lines_say_which_picture() {
+        use crate::video::{PictureRef, Pictures};
+        let dir = temp_dir("video");
+        let ffmpeg = crate::video::tests::fake_ffmpeg();
+        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) }.with_ffmpeg(Some(ffmpeg.clone()));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        let camera = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([200, 100, 50])));
+        let depth = Arc::new(RgbImage::from_fn(16, 12, |x, y| image::Rgb([(x * 9) as u8, (y * 9) as u8, 7])));
+        for i in 0..6u64 {
+            let at = begun + Duration::from_millis(40 * i);
+            recorder.frames(at, &[(0, Arc::clone(&camera)), (2, Arc::clone(&depth))], "watching", false);
+            if i == 2 {
+                recorder.event(at, "manual", json!({"text": "e4"}));
+            }
+        }
+        let folder = recorder.folder().to_path_buf();
+        assert_eq!(recorder.dropped(), 0);
+        recorder.close();
+
+        let lines = read_lines(&folder);
+        let seen: Vec<String> = lines
+            .iter()
+            .map(|l| match l["type"].as_str().unwrap() {
+                "video" => format!("video {} {}x{}", l["file"].as_str().unwrap(), l["width"], l["height"]),
+                "frame" => format!("frame cam{} feed{} {}#{}", l["cam"], l["feed"], l["video"].as_str().unwrap(), l["index"]),
+                other => other.to_string(),
+            })
+            .collect();
+        let mut expected = Vec::new();
+        for i in 0..6u64 {
+            if i == 0 {
+                expected.push("video cam0.mkv 32x24".to_string());
+            }
+            expected.push(format!("frame cam0 feed{} cam0.mkv#{i}", i + 1));
+            if i == 0 {
+                expected.push("video cam2.mkv 16x12".to_string());
+            }
+            expected.push(format!("frame cam2 feed{} cam2.mkv#{i}", i + 1));
+            if i == 2 {
+                expected.push("manual".to_string());
+            }
+        }
+        expected.push("closed".to_string());
+        assert_eq!(seen, expected);
+        assert!(lines.iter().filter(|l| l["type"] == "frame").all(|l| l.get("file").is_none()));
+        let closed = lines.last().unwrap();
+        assert_eq!(
+            (closed["pictures"].as_u64(), closed["video_pictures"].as_u64(), closed["dropped"].as_u64()),
+            (Some(12), Some(12), Some(0))
+        );
+        assert!(closed.get("video_errors").is_none(), "{closed}");
+        assert_eq!(fs::read_dir(folder.join("frames")).unwrap().count(), 0);
+        let session: SessionMeta = serde_json::from_slice(&fs::read(folder.join("session.json")).unwrap()).unwrap();
+        let video = session.video.expect("the session tells that the pictures are in video");
+        assert_eq!(video.ffmpeg, ffmpeg.display().to_string());
+        assert_eq!(video.codec, crate::video::CODEC);
+
+        let mut pictures = Pictures::with_ffmpeg(&folder, ffmpeg.clone());
+        for line in lines.iter().filter(|l| l["type"] == "video") {
+            pictures.note_video(line);
+        }
+        let at = |name: &str, index: u64| PictureRef { file: None, video: Some(name.into()), index };
+        assert_eq!(&pictures.load(&at("cam0.mkv", 4)).unwrap(), camera.as_ref());
+        assert_eq!(&pictures.load(&at("cam2.mkv", 5)).unwrap(), depth.as_ref());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_video_that_dies_leaves_the_rest_of_the_pictures_in_files_and_the_recording_says_so() {
+        // The stand-in ends at once when the path of its output has `fakedie` in it.
+        let dir = temp_dir("fakedie");
+        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) }
+            .with_ffmpeg(Some(crate::video::tests::fake_ffmpeg()));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        let image = Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([9, 9, 9])));
+        let started = Instant::now();
+        let mut n = 0u64;
+        let died = |recorder: &Recorder| recorder.video.as_ref().is_some_and(|v| v.state.lock().unwrap().jpeg[0]);
+        while !died(&recorder) && started.elapsed() < Duration::from_secs(20) {
+            recorder.frame(begun + Duration::from_millis(40 * n), &image, "watching", false);
+            n += 1;
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(died(&recorder), "the failure of the encoder was not noticed");
+        for _ in 0..3 {
+            recorder.frame(begun + Duration::from_millis(40 * n), &image, "watching", false);
+            n += 1;
+            recorder.wait_idle();
+        }
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+
+        let lines = read_lines(&folder);
+        let lost_at = lines.iter().position(|l| l["type"] == "video_lost").expect("a video_lost line");
+        assert_eq!(lines[lost_at]["cam"], 0);
+        let after: Vec<&Value> = lines[lost_at..].iter().filter(|l| l["type"] == "frame").collect();
+        // The picture that found out about the failure goes in a file too, with the three that come after it.
+        assert_eq!(after.len(), 4, "the pictures after the failure are in files");
+        for line in &after {
+            assert!(folder.join(line["file"].as_str().unwrap()).is_file());
+        }
+        let closed = lines.last().unwrap();
+        assert!(
+            closed["video_errors"].as_array().is_some_and(|e| !e.is_empty()),
+            "the end of the recording tells that an encoder failed: {closed}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_picture_that_a_video_cannot_hold_goes_into_a_file() {
+        // A video needs even sizes: 15x9 is kept as a JPEG file, and no video is started for it.
+        let dir = temp_dir("odd");
+        let options = RecordOptions { backlog: 100_000, ..RecordOptions::keeping_all(dir.clone()) }
+            .with_ffmpeg(Some(crate::video::tests::fake_ffmpeg()));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        let odd = Arc::new(RgbImage::from_pixel(15, 9, image::Rgb([1, 2, 3])));
+        recorder.frame(begun, &odd, "watching", false);
+        recorder.wait_idle();
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let lines = read_lines(&folder);
+        assert!(lines.iter().all(|l| l["type"] != "video"), "{lines:?}");
+        assert_eq!(lines[0]["file"], "frames/000001.jpg");
+        assert!(folder.join("frames/000001.jpg").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_program_that_is_not_there_means_files_and_the_session_does_not_claim_video() {
+        let dir = temp_dir("missing");
+        let options = RecordOptions::keeping_all(dir.clone()).with_ffmpeg(Some(dir.join("no-such-ffmpeg")));
+        let begun = Instant::now();
+        let mut recorder = Recorder::begin(&options, meta(), begun).unwrap();
+        recorder.frame(begun, &Arc::new(RgbImage::from_pixel(32, 24, image::Rgb([1, 2, 3]))), "watching", false);
+        recorder.wait_idle();
+        let folder = recorder.folder().to_path_buf();
+        recorder.close();
+        let session: SessionMeta = serde_json::from_slice(&fs::read(folder.join("session.json")).unwrap()).unwrap();
+        assert!(session.video.is_none());
+        assert!(folder.join("frames/000001.jpg").is_file());
         fs::remove_dir_all(&dir).ok();
     }
 

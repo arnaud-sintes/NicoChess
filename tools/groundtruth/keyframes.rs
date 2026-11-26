@@ -10,8 +10,11 @@
 //!
 //! Nothing here looks at the tracker's own opinion to decide what a keyframe is: only at the pictures.
 //!
+//! A recording made with video (`cam0.mkv`, see `src/video.rs`) is read through `ffmpeg`: give it with `--ffmpeg
+//! <path>`, or put it on PATH or in NICOCHESS_FFMPEG.
+//!
 //! Run: `cargo run --release --example keyframes -- <recording> <output folder> [--px 80] [--still 6] [--frames 4]
-//! [--square 9] [--side] [--camera 0]`
+//! [--square 9] [--side] [--camera 0] [--ffmpeg <path>]`
 
 use anyhow::{Context, Result, bail};
 use image::codecs::jpeg::JpegEncoder;
@@ -19,6 +22,7 @@ use image::{ExtendedColorType, GrayImage, ImageEncoder, Luma, Rgb, RgbImage};
 use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
 use nicochess::calibration::Calibration;
 use nicochess::record::SessionMeta;
+use nicochess::video::{PictureRef, Pictures};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::fs;
@@ -51,7 +55,9 @@ struct Options {
 fn options() -> Result<Options> {
     let mut args = std::env::args().skip(1);
     let (Some(recording), Some(out)) = (args.next(), args.next()) else {
-        bail!("usage: keyframes <recording folder> <output folder> [--px 80] [--still 6] [--frames 4] [--square 9] [--side] [--camera 0]");
+        bail!(
+            "usage: keyframes <recording folder> <output folder> [--px 80] [--still 6] [--frames 4] [--square 9] [--side] [--camera 0] [--ffmpeg <path>]"
+        );
     };
     let mut o =
         Options { recording: recording.into(), out: out.into(), px: 80, still: 6.0, frames: 4, square: 9.0, side: false, camera: 0 };
@@ -64,6 +70,7 @@ fn options() -> Result<Options> {
             "--square" => o.square = value()?.parse()?,
             "--camera" => o.camera = value()?.parse()?,
             "--side" => o.side = true,
+            "--ffmpeg" => nicochess::video::set_explicit(value()?.into()),
             other => bail!("unknown option {other}"),
         }
     }
@@ -113,7 +120,9 @@ fn square_name(index: usize) -> String {
 
 struct Shot {
     t: f64,
+    /// The picture as the index names it: the file, or the video and the number of the picture in it.
     file: String,
+    picture: PictureRef,
     feed: i64,
     status: String,
     calibration: Calibration,
@@ -226,6 +235,7 @@ fn main() -> Result<()> {
     // The pictures of the camera, each with the calibration in force.
     let mut calibration = session.calibration.context("the recording has no calibration")?;
     let mut shots: Vec<Shot> = Vec::new();
+    let mut pictures = Pictures::new(&o.recording);
     for e in &events {
         match e["type"].as_str() {
             Some("calibration") if e["cam"].as_i64() == Some(o.camera) => {
@@ -233,16 +243,24 @@ fn main() -> Result<()> {
                     calibration = c;
                 }
             }
-            Some("frame") if e["cam"].as_i64() == Some(o.camera) => shots.push(Shot {
-                t: e["t"].as_f64().unwrap_or(0.0),
-                file: e["file"].as_str().unwrap_or_default().to_string(),
-                feed: e["feed"].as_i64().unwrap_or(0),
-                status: e["status"].as_str().unwrap_or_default().to_string(),
-                calibration,
-            }),
+            Some("frame") if e["cam"].as_i64() == Some(o.camera) => {
+                if let Some(picture) = PictureRef::of_event(e) {
+                    shots.push(Shot {
+                        t: e["t"].as_f64().unwrap_or(0.0),
+                        file: picture.name(),
+                        picture,
+                        feed: e["feed"].as_i64().unwrap_or(0),
+                        status: e["status"].as_str().unwrap_or_default().to_string(),
+                        calibration,
+                    });
+                }
+            }
+            Some("video") => pictures.note_video(e),
             _ => {}
         }
     }
+    // A recording made with video needs ffmpeg to be read: say so before anything else.
+    pictures.require_ffmpeg_for_videos()?;
     if shots.len() < 2 {
         bail!("fewer than two pictures of camera {}", o.camera);
     }
@@ -253,7 +271,7 @@ fn main() -> Result<()> {
     let mut previous: Option<GrayImage> = None;
     let mut csv = String::from("t,status,motion\n");
     for (i, shot) in shots.iter().enumerate() {
-        let image = image::open(o.recording.join(&shot.file)).with_context(|| shot.file.clone())?.to_rgb8();
+        let image = pictures.load(&shot.picture)?;
         let scan = grey(&warp(&image, &shot.calibration, SCAN_PX, 0).context("the corners do not define a board")?);
         if let Some(p) = &previous {
             motion[i] = square_changes(p, &scan).into_iter().fold(0.0, f32::max);
@@ -292,7 +310,7 @@ fn main() -> Result<()> {
     for (s, e) in &stretches {
         let i = (s + e) / 2;
         let shot = &shots[i];
-        let image = image::open(o.recording.join(&shot.file))?.to_rgb8();
+        let image = pictures.load(&shot.picture)?;
         let scan = grey(&warp(&image, &shot.calibration, SCAN_PX, 0).context("bad corners")?);
         let mut strongest: Vec<(String, f32)> = Vec::new();
         let (changed, since) = match &last_kept {

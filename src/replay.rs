@@ -14,6 +14,7 @@
 use crate::game::{fen_of, parse_fen, san_of, uci_of};
 use crate::record::{FORMAT, SessionMeta};
 use crate::tracker::{Detection, Status, Tracker, TrackerConfig};
+use crate::video::{PictureRef, Pictures};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use shakmaty::Move;
@@ -156,7 +157,12 @@ fn group_pictures(events: Vec<Event>) -> Vec<Event> {
             out.push(event);
             continue;
         }
-        let file = serde_json::json!({"cam": event.data["cam"].as_u64().unwrap_or(0), "file": event.text("file")});
+        let file = serde_json::json!({
+            "cam": event.data["cam"].as_u64().unwrap_or(0),
+            "file": event.text("file"),
+            "video": event.text("video"),
+            "index": event.data["index"].as_u64().unwrap_or(0),
+        });
         let feed = event.data["feed"].as_u64();
         if let (Some(previous), Some(number), Some(last)) = (out.last_mut(), feed, last_feed)
             && number == last
@@ -197,7 +203,17 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     if meta.format > FORMAT {
         bail!("this recording has format {}, newer than this program understands ({FORMAT}): use a newer NicoChess", meta.format);
     }
-    let events = group_pictures(read_events(folder)?);
+    // The videos of a recording that keeps its pictures in video files are told by lines of their own, before the
+    // pictures; they must not break up the pictures of one time.
+    let (video_lines, events): (Vec<Event>, Vec<Event>) = read_events(folder)?.into_iter().partition(|e| e.kind == "video");
+    let mut pictures = Pictures::new(folder);
+    for line in &video_lines {
+        pictures.note_video(&line.data);
+    }
+    // A recording in video needs ffmpeg: say so before anything else.
+    pictures.require_ffmpeg_for_videos()?;
+    let mut unreadable = 0usize;
+    let events = group_pictures(events);
 
     // Every position the game was in, according to the recording.
     let mut real: HashSet<String> = HashSet::new();
@@ -257,20 +273,36 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
             }
             "frame" => {
                 // The pictures that were given to the tracker together: one per camera.
-                let files: Vec<(usize, String)> = event.data["files"]
+                let files: Vec<(usize, PictureRef)> = event.data["files"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|f| Some((f["cam"].as_u64()? as usize, f["file"].as_str()?.to_string()))).collect())
+                    .map(|a| a.iter().filter_map(|f| Some((f["cam"].as_u64()? as usize, PictureRef::of_event(f)?))).collect())
                     .unwrap_or_default();
                 // The two cameras, and the height picture of a depth camera after them.
                 let mut images: Vec<Option<image::RgbImage>> = vec![None; 3];
-                for (camera, file) in &files {
-                    let image = image::open(folder.join(file)).with_context(|| format!("cannot read the picture {file}"))?.to_rgb8();
+                for (camera, picture) in &files {
+                    let image = match pictures.load(picture) {
+                        Ok(image) => image,
+                        // A video cut short (the encoder died, or the program was killed): the pictures that are not
+                        // in it are missing, as if the camera had given none; a file that cannot be read is an error.
+                        Err(e) if picture.file.is_none() => {
+                            unreadable += 1;
+                            if unreadable == 1 {
+                                let _ = writeln!(
+                                    text,
+                                    "{:>8.1}s  a picture of a video cannot be read ({e:#}); the pictures that cannot are left out",
+                                    event.t
+                                );
+                            }
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     if let Some(place) = images.get_mut(*camera) {
                         *place = Some(image);
                     }
                 }
                 summary.pictures += files.len();
-                last_file = files.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>().join(" ");
+                last_file = files.iter().map(|(_, p)| p.name()).collect::<Vec<_>>().join(" ");
                 let before = tracker.position().clone();
                 let given: Vec<Option<&image::RgbImage>> = images.iter().map(Option::as_ref).collect();
                 let moves = match tracker.feed_views(&given, now) {
@@ -396,7 +428,7 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
                 if dropped > 0 {
                     let _ = writeln!(
                         text,
-                        "{:>8.1}s  note: {dropped} pictures or lines were dropped while recording (the disk or the encoding was too slow)",
+                        "{:>8.1}s  note: {dropped} pictures or lines were dropped while recording (the disk or the encoder was too slow, or the encoder failed)",
                         event.t
                     );
                 }
@@ -406,6 +438,9 @@ pub fn replay_folder(folder: &Path, overrides: &TrackerOverrides, verbose: bool)
     }
 
     let _ = writeln!(text);
+    if unreadable > 0 {
+        let _ = writeln!(text, "{unreadable} pictures of the videos could not be read and were left out.");
+    }
     let _ = writeln!(text, "{} pictures replayed; the replay ends in {}.", summary.pictures, fen_of(tracker.position()));
     let _ = writeln!(
         text,
@@ -534,6 +569,11 @@ mod tests {
 
     impl Session {
         fn new(dir: &Path) -> Session {
+            Session::with_ffmpeg(dir, None)
+        }
+
+        /// A recording whose pictures go into video files through this `ffmpeg`, when there is one.
+        fn with_ffmpeg(dir: &Path, ffmpeg: Option<PathBuf>) -> Session {
             let meta = SessionMeta {
                 format: FORMAT,
                 program: "test".into(),
@@ -549,10 +589,11 @@ mod tests {
                 picture: Picture::default(),
                 calibration2: None,
                 picture2: None,
+                video: None,
             };
             let begun = Instant::now();
             // A test camera is faster than any disk: nothing may be dropped.
-            let options = RecordOptions { backlog: 100_000, ..RecordOptions::new(dir.to_path_buf(), Duration::ZERO) };
+            let options = RecordOptions { backlog: 100_000, ffmpeg, ..RecordOptions::new(dir.to_path_buf(), Duration::ZERO) };
             Session { recorder: Recorder::begin(&options, meta, begun).unwrap(), begun, n: 0 }
         }
 
@@ -613,6 +654,31 @@ mod tests {
         assert!(report.text.contains("replay found e4"), "{}", report.text);
         assert!(report.text.contains("typed by hand during the game: e5; the replay found it by itself"), "{}", report.text);
         assert!(report.text.contains("typed by hand during the game: Nf3; the replay had not found it either"), "{}", report.text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_replay_reads_the_pictures_of_a_recording_kept_as_video() {
+        let dir = scratch("video");
+        let ffmpeg = crate::video::tests::fake_ffmpeg();
+        // What the replay uses to read a video (`--ffmpeg` in the program).
+        crate::video::set_explicit(ffmpeg.clone());
+        let steps = synthetic::game_steps(&["e4", "e5"]);
+        let fens = fens_after(&["e4", "e5"]);
+        let mut session = Session::with_ffmpeg(&dir, Some(ffmpeg));
+        session.show(&synthetic::start_grid(), 7);
+        session.show(&steps[0].after, 4);
+        session.note("detect", json!({"moves": ["e2e4"], "san": ["e4"], "fen": fens[1]}));
+        session.note("end", json!({"result": "*", "reason": "abandoned", "fen": fens[1]}));
+        let folder = session.recorder.folder().to_path_buf();
+        session.recorder.close();
+        assert!(folder.join("cam0.mkv").is_file(), "the pictures are in a video");
+        assert_eq!(std::fs::read_dir(folder.join("frames")).unwrap().count(), 0, "and in no file");
+
+        let report = replay_folder(&folder, &TrackerOverrides::default(), false).unwrap();
+        assert_eq!(report.summary.pictures, 11);
+        assert_eq!((report.summary.found, report.summary.wrong, report.summary.behind), (1, 0, 0), "{}", report.text);
+        assert!(report.text.contains("replay found e4"), "{}", report.text);
         std::fs::remove_dir_all(&dir).ok();
     }
 

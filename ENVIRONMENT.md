@@ -101,10 +101,46 @@ uses `%LOCALAPPDATA%\NicoChess\recordings`). In it:
   `--record-all` (instead of `--record`; the Windows package's `Start NicoChess (record all).bat` does it at 25
   pictures a second) keeps every picture the detection looks at, whatever is going on, with a longer queue for the
   disk: several megabytes a second at 1280x720, for a fast game that has to be replayed picture by picture. Roughly
-  100 KB each at 1280x720.
+  100 to 250 KB each at 1280x720 (the noise of a cheap camera makes JPEG big).
+- `cam0.mkv`, `cam1.mkv`, `cam2.mkv` instead of `frames/` when an `ffmpeg` is found (see below): one video for each
+  camera (`cam2` is the height picture of the depth camera), H.264 at 25 pictures a second as a label only, the real
+  time of each picture is in `events.jsonl`.
 - `events.jsonl`: what happened, in order, with `t` in seconds: `frame` (file and the tracker's status), `detect` (the
   moves found and the position after them), `unsure` (the candidates offered), `rejected`, `manual` (a move typed by
   hand), `undo`, `promotion`, `relearn`, `calibration`, `end`, `closed`.
+
+### Recording as video (much smaller): ffmpeg
+
+A JPEG file for every picture is big, and `--record-all` at 25 pictures a second with a depth camera writes several
+megabytes a second. When an `ffmpeg` program is found, the pictures are written as video instead: five to twenty
+times smaller (on the recordings of 2026-11-24, about 31 KB a picture of the camera and 8 KB of the depth view,
+against 250 and 83 KB as JPEG; [docs/video-recording.md](docs/video-recording.md) has the measurements), and the
+encoding costs about half a core of a PC. The program only starts `ffmpeg` and pipes the raw pictures to it
+(`src/video.rs`): nothing is linked, so the Windows package stays small and the Android and Linux builds do not change.
+
+- Where to get it: any build of `ffmpeg` with `libx264` (the "GPL" builds); on Windows the portable
+  `ffmpeg-n8.1-latest-win64-gpl-8.1.zip` of the BtbN builds
+  (https://github.com/BtbN/FFmpeg-Builds/releases) is enough: unzip it anywhere, no administrator rights, and use
+  `bin\ffmpeg.exe`. It is not part of the NicoChess package (about 170 MB): check the checksum file next to the
+  download.
+- Which one is used, in this order: `--ffmpeg <path>`, the variable `NICOCHESS_FFMPEG`, an `ffmpeg` (`ffmpeg.exe`)
+  next to `nicochess`, then the first on `PATH`. The program says at its start which it found, or that it found none
+  and writes JPEG files. `--no-video` records JPEG files even when one is found.
+- The encoder: `libx264`, preset `veryfast`, `-crf 23` for a camera and for the depth view (`src/video.rs`),
+  a key picture every 50 pictures, run at a lower priority with two threads; Matroska files (`.mkv`), which can be
+  read even when the program was killed.
+- Never silent: when the encoder is too slow its queue fills and the pictures are dropped and counted (the `closed` line
+  of `events.jsonl` says `dropped`, as for JPEG); when it cannot start or dies, the recording notes a `video_lost` line
+  and that camera goes on in JPEG files; the `closed` line lists `video_errors` and the folder keeps
+  `ffmpeg-camN.log` when `ffmpeg` said something.
+- Reading: `--replay`, `tools/groundtruth` (`keyframes`, `compare --replay`) start `ffmpeg` to decode the video, so
+  the same `ffmpeg` must be found when a recording in video is replayed (`--ffmpeg` also works with `--replay`); there
+  is a clear error when it is not.
+- A video is lossy: on the two recordings it was tried on the tracker decided exactly as it did on the JPEG pictures
+  (a replay of the original and of a copy that went through the codec gave the same report, give or take a point of
+  certainty; at `-crf 28` it no longer did), see [docs/video-recording.md](docs/video-recording.md). A replay of a
+  video recording is as faithful as one of JPEG pictures is, which is: not exact (a JPEG at 92 is lossy as well, and the
+  live tracker saw the camera's own picture).
 
 `--replay <folder>` needs no camera and starts no page. It runs the pictures through the current tracker at their
 recorded times, applies what the people did, and prints what the replay found beside what happened, with the picture

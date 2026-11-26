@@ -53,6 +53,12 @@ by picture. It takes several megabytes a second on the disk, so use it for one g
 and delete the folder afterwards. If the disk cannot keep up, the program says how many
 pictures were left out when the game ends.
 
+Smaller recordings (optional): with ffmpeg.exe in this folder, next to nicochess.exe, the
+pictures are kept as one video for each camera, 20 times smaller than JPEG files. ffmpeg is not
+part of this package (about 170 MB): get a "win64-gpl" build, for example from
+https://github.com/BtbN/FFmpeg-Builds/releases, check its checksum, and copy bin\ffmpeg.exe here.
+The same ffmpeg.exe is needed to replay such a recording. Without it the program keeps JPEG files.
+
 If it does not start
 --------------------
 - "forbidden by its access permissions" or "address already in use": the port is

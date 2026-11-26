@@ -42,6 +42,7 @@ pub mod server;
 pub mod store;
 pub mod synthetic;
 pub mod tracker;
+pub mod video;
 pub mod vision;
 
 #[cfg(test)]

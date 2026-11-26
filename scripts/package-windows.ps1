@@ -46,6 +46,11 @@ if ($text -match '(?i)vcruntime\d+\.dll') {
 }
 
 $out = Join-Path $root 'dist\NicoChess-windows'
+# A developer may keep an ffmpeg.exe in the package folder for tests (video recordings). It must never be packaged
+# (about 170 MB, and not ours): it is put aside while the package is made, then put back.
+$ffmpegKept = Join-Path $root 'dist\ffmpeg.exe.kept'
+$ffmpegHere = Join-Path $out 'ffmpeg.exe'
+if (Test-Path $ffmpegHere) { Move-Item -Force $ffmpegHere $ffmpegKept }
 if (Test-Path $out) { Remove-Item -Recurse -Force $out }
 New-Item -ItemType Directory -Force $out | Out-Null
 Copy-Item $exe (Join-Path $out 'nicochess.exe')
@@ -66,6 +71,16 @@ Add-Content -Path (Join-Path $out 'README.txt') -Encoding ASCII -Value "`r`nVers
 $zip = Join-Path $root 'dist\NicoChess-windows.zip'
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
+# The zip must hold no ffmpeg, whatever the folder held.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+try {
+    $stray = @($archive.Entries | Where-Object { $_.Name -like 'ffmpeg*' -or $_.Name -like 'ffprobe*' })
+} finally {
+    $archive.Dispose()
+}
+if ($stray.Count -gt 0) { throw "the package holds $($stray[0].Name): ffmpeg must not be packaged" }
+if (Test-Path $ffmpegKept) { Move-Item -Force $ffmpegKept $ffmpegHere }
 
 $size = [math]::Round((Get-Item $zip).Length / 1MB, 1)
 Write-Host ''

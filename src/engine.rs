@@ -2141,6 +2141,7 @@ impl Engine {
             picture: inner.cams[0].picture,
             calibration2: if self.second_enabled() { inner.cams[1].calibration } else { None },
             picture2: self.second_enabled().then_some(inner.cams[1].picture),
+            video: None,
         };
         inner.recorder = match Recorder::begin(options, meta, Instant::now()) {
             Ok(recorder) => {

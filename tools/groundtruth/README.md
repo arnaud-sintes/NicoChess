@@ -30,6 +30,11 @@ From the repository root (a recording is only read, never changed):
 `legal --play` plays the moves (UCI) from the position and prints their SAN and the position after them; it refuses a move
 that is not legal, so a reader cannot write an impossible sequence.
 
+A recording made with video (`cam0.mkv` instead of `frames/`, see ENVIRONMENT.md, "Recording as video") is read through
+`ffmpeg`, which must be found (`--ffmpeg <path>` on `keyframes`, or `NICOCHESS_FFMPEG`, or next to the program, or on
+PATH); `compare --replay` reads it the same way. The `index.json` then names a picture as `cam0.mkv#1234` (the video and the
+number of the picture in it) instead of a file.
+
 ### Reading blind
 
 A reader (a person, or a model in a session) must not see what the tracker decided, or the reading is no longer an

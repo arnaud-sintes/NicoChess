@@ -59,6 +59,11 @@ OPTIONS:
     --record-all             record, and keep every picture the detection looks at, quiet or not (with --fps 25
                              that is several megabytes a second: for a game that must be followed again picture
                              by picture, for example a blitz game). Use it instead of --record
+    --ffmpeg <PATH>          the ffmpeg program (a portable ffmpeg.exe is enough) that writes the recorded pictures
+                             as video, five to twenty times smaller than JPEG files, and reads them back for a
+                             replay. Without it: the one next to the program, the one named by NICOCHESS_FFMPEG, then
+                             the one on PATH; with none, the pictures are JPEG files
+    --no-video               record JPEG files even when ffmpeg is there
     --replay <DIR>           no camera, no page: run a recording (or all those in a folder) through the
                              detection again and compare it with what happened. The tuning options below
                              replace the recorded ones, to try them on real pictures
@@ -152,10 +157,21 @@ fn run() -> Result<()> {
     let record_every = record_every_option.unwrap_or(2.0);
     let replay: Option<PathBuf> = args.opt_value_from_str("--replay")?;
     let replay_verbose = args.contains("--replay-verbose");
+    let ffmpeg_option: Option<PathBuf> = args.opt_value_from_str("--ffmpeg")?;
+    let no_video = args.contains("--no-video");
 
     let rest = args.finish();
     if !rest.is_empty() {
         bail!("unknown arguments: {rest:?} (see --help)");
+    }
+    if let Some(path) = &ffmpeg_option {
+        if !path.is_file() {
+            bail!("--ffmpeg {}: there is no such file", path.display());
+        }
+        if no_video {
+            bail!("--ffmpeg and --no-video contradict each other");
+        }
+        nicochess::video::set_explicit(path.clone());
     }
     if let Some(path) = replay {
         return replay::run(&path, &overrides, replay_verbose);
@@ -250,11 +266,20 @@ fn run() -> Result<()> {
         game_timeout: Duration::from_secs(game_mins * 60),
         max_viewers,
         record: record.then(|| {
-            if record_all {
+            let ffmpeg = if no_video { None } else { nicochess::video::find_ffmpeg() };
+            match &ffmpeg {
+                Some(path) => eprintln!("record: the pictures are written as video through {}", path.display()),
+                None if no_video => eprintln!("record: the pictures are written as JPEG files (--no-video)"),
+                None => eprintln!(
+                    "record: no ffmpeg found (--ffmpeg, next to the program, NICOCHESS_FFMPEG or PATH): the pictures are written as JPEG files, about ten times bigger"
+                ),
+            }
+            let options = if record_all {
                 RecordOptions::keeping_all(record_dir)
             } else {
                 RecordOptions::new(record_dir, Duration::from_secs_f32(record_every))
-            }
+            };
+            options.with_ffmpeg(ffmpeg)
         }),
         remember_camera,
         second_device,

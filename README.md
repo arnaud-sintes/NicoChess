@@ -90,12 +90,15 @@ bandwidth of one hub; if not, use a smaller `--width`/`--height` or another port
 nicochess --record                      # a folder per game in ./recordings (Windows: Start NicoChess (record).bat)
 nicochess --replay recordings\2026-11-16_11-30-05 --replay-verbose
 nicochess --replay recordings --margin 9 --max-excess 80     # all the recordings, with other tuning values
+nicochess --record-all --ffmpeg C:\tools\ffmpeg\bin\ffmpeg.exe   # every picture, as video: five to twenty times smaller
 ```
 
 A recording has the pictures the detection was given (both cameras', when there are two), what it decided, and what the
 people did (typed moves, undos). A replay feeds them through the detection again and tells where it agrees with what
 happened, which moves it would have made someone type, and which it got wrong. This is how a bad session is looked into
-and how the tuning options are tried on real pictures ([ENVIRONMENT.md](ENVIRONMENT.md)).
+and how the tuning options are tried on real pictures ([ENVIRONMENT.md](ENVIRONMENT.md)). With an `ffmpeg` program
+(a portable one is enough, not part of the package) the pictures are written as H.264 video instead of JPEG files; the
+same `ffmpeg` is needed to replay such a recording.
 
 ## Status
 
@@ -171,7 +174,7 @@ The long version, with the threads and the files, is in [ARCHITECTURE.md](ARCHIT
 | `src/calibration.rs`, `src/boarddetect.rs`, `src/picture.rs` | Corners and the warp to the top-down board; finding the board by itself and following it; turn, brightness, contrast |
 | `src/vision.rs`, `src/tracker.rs` | The per-square models that keep learning; the stability gate, the evidence of one or two cameras and the match to a legal move |
 | `src/game.rs`, `src/clock.rs`, `src/store.rs`, `src/fsutil.rs`, `src/roles.rs` | The game record, SAN/UCI and PGN; the chess clock; one JSON file per game; atomic file writes; controller and viewers |
-| `src/record.rs`, `src/replay.rs` | Recording of games and their replay |
+| `src/record.rs`, `src/replay.rs`, `src/video.rs` | Recording of games (pictures as JPEG files, or as video through an external `ffmpeg`) and their replay |
 | `src/synthetic.rs` | A generated chessboard in perspective, for the demo, the tests and the benchmark (`examples/stress.rs`) |
 | `web/index.html` | The page (one file, built into the program) |
 | `android/` | The Android app: Kotlin shell (`android/app`) and the JNI library (`android/native`) |
